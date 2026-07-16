@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ryudb"
+version = "0.1.0"
+description = "RyuDB — a GPU-powered HTAP RDBMS (cuDF execution engine)"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "RyuDB" }]
+dependencies = [
+    "cudf>=26.06",
+    "sqlglot>=23",
+    "pyarrow>=14",
+]
+
+[project.optional-dependencies]
+bench = ["duckdb>=1.1", "pandas>=2"]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+ryudb = "ryudb.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ryudb*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

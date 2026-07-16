@@ -1,0 +1,123 @@
+"""Shared pytest fixtures: a small Parquet dataset + RyuDB and DuckDB engines.
+
+DuckDB is the correctness oracle: the same SQL is run on both and the sorted
+result frames are compared. The dataset mirrors a tiny TPC-H-like schema so the
+join/aggregate paths are exercised.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import cudf
+import duckdb
+import pandas as pd
+import pytest
+
+from ryudb import Catalog, Engine
+
+# A small but non-trivial dataset. Row counts are intentionally modest so tests
+# run in well under a second on the GPU.
+_ORDERS = [
+    (1, 10, 100.0, "1998-08-01"),
+    (2, 20, 200.0, "1998-09-01"),
+    (3, 10, 50.0, "1998-07-01"),
+    (4, 30, 300.0, "1998-10-01"),
+    (5, 20, 75.0, "1998-09-15"),
+]
+_LINEITEM = [
+    (1, 5.0, 50.0, "1998-08-10"),
+    (1, 10.0, 60.0, "1998-09-20"),
+    (2, 2.0, 30.0, "1998-08-30"),
+    (3, 1.0, 10.0, "1998-07-15"),
+    (3, 1.0, 20.0, "1998-07-16"),
+    (3, 1.0, 5.0, "1998-08-01"),
+    (4, 7.0, 90.0, "1998-10-05"),
+    (5, 3.0, 75.0, "1998-09-30"),
+]
+_NATION = [
+    (10, "USA"),
+    (20, "CANADA"),
+    (30, "MEXICO"),
+]
+
+
+@pytest.fixture(scope="session")
+def data_dir(tmp_path_factory):
+    d = tmp_path_factory.mktemp("ryudb_data")
+    (d / "orders").mkdir()
+    (d / "lineitem").mkdir()
+    (d / "nation").mkdir()
+
+    cudf.DataFrame(
+        {
+            "o_orderkey": [r[0] for r in _ORDERS],
+            "o_custkey": [r[1] for r in _ORDERS],
+            "o_totalprice": [r[2] for r in _ORDERS],
+            "o_orderdate": pd.to_datetime([r[3] for r in _ORDERS]),
+        }
+    ).to_pandas().to_parquet(d / "orders" / "o.parquet")
+
+    cudf.DataFrame(
+        {
+            "l_orderkey": [r[0] for r in _LINEITEM],
+            "l_quantity": [r[1] for r in _LINEITEM],
+            "l_extendedprice": [r[2] for r in _LINEITEM],
+            "l_shipdate": pd.to_datetime([r[3] for r in _LINEITEM]),
+        }
+    ).to_pandas().to_parquet(d / "lineitem" / "l.parquet")
+
+    cudf.DataFrame(
+        {
+            "n_nationkey": [r[0] for r in _NATION],
+            "n_name": [r[1] for r in _NATION],
+        }
+    ).to_pandas().to_parquet(d / "nation" / "n.parquet")
+
+    return d
+
+
+@pytest.fixture
+def engine(data_dir) -> Engine:
+    cat = Catalog(str(data_dir))
+    cat.register("orders", str(data_dir / "orders"))
+    cat.register("lineitem", str(data_dir / "lineitem"))
+    cat.register("nation", str(data_dir / "nation"))
+    return Engine(cat)
+
+
+@pytest.fixture
+def duck(data_dir) -> "duckdb.DuckDBPyConnection":
+    con = duckdb.connect()
+    con.execute(f"CREATE VIEW orders AS SELECT * FROM read_parquet('{data_dir}/orders/*.parquet')")
+    con.execute(f"CREATE VIEW lineitem AS SELECT * FROM read_parquet('{data_dir}/lineitem/*.parquet')")
+    con.execute(f"CREATE VIEW nation AS SELECT * FROM read_parquet('{data_dir}/nation/*.parquet')")
+    return con
+
+
+def as_sorted(df) -> list[tuple]:
+    """Normalize a frame to a sorted list of tuples for comparison."""
+    import pandas as pd
+
+    pdf = df.to_pandas() if hasattr(df, "to_pandas") and not isinstance(df, pd.DataFrame) else df
+    if len(pdf) == 0:
+        return []
+    pdf = pdf.sort_values(list(pdf.columns)).reset_index(drop=True)
+    rows = []
+    for _, row in pdf.iterrows():
+        rows.append(tuple(_clean(v) for v in row))
+    return rows
+
+
+def _clean(v):
+    """Round floats for stable comparison across GPU/CPU float differences."""
+    if isinstance(v, float):
+        return round(v, 6)
+    return v
+
+
+def assert_same(ryu_df, duck_df):
+    r = as_sorted(ryu_df)
+    d = as_sorted(duck_df)
+    assert r == d, f"RyuDB != DuckDB\n ryu={r}\n duck={d}"

@@ -1,0 +1,220 @@
+"""Benchmark RyuDB (GPU/cuDF) vs DuckDB (CPU) on TPC-H.
+
+Data is generated with DuckDB's `tpch` extension (dbgen) and written to Parquet,
+so both engines read the exact same columnar files. Each query is checked for
+correctness against DuckDB and then timed (min of N repeats after a warm-up).
+
+Usage:
+  python bench/run_bench.py --scale 1 --repeats 3
+  python bench/run_bench.py --scale 0.1   # quick smoke on a tiny dataset
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import statistics
+import sys
+import time
+from pathlib import Path
+
+import duckdb
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ryudb import Catalog, Engine  # noqa: E402
+
+TABLES = ["nation", "region", "part", "supplier", "partsupp", "customer", "orders", "lineitem"]
+
+# TPC-H and TPC-H-like queries that fit RyuDB's Phase-1 SQL subset
+# (no subqueries, no CASE, no IN, equi-joins only).
+QUERIES: dict[str, str] = {
+    "Q1_pricing_summary": """
+        SELECT l_returnflag, l_linestatus,
+               sum(l_quantity) AS sum_qty,
+               sum(l_extendedprice) AS sum_base_price,
+               sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+               count(*) AS count_order
+          FROM lineitem
+         WHERE l_shipdate <= date '1998-09-02'
+         GROUP BY l_returnflag, l_linestatus
+         ORDER BY l_returnflag, l_linestatus
+    """,
+    "Q6_filter_agg": """
+        SELECT sum(l_extendedprice * l_discount) AS revenue, count(*) AS n
+          FROM lineitem
+         WHERE l_shipdate >= date '1994-01-01'
+           AND l_shipdate < date '1995-01-01'
+           AND l_discount BETWEEN 0.05 AND 0.07
+           AND l_quantity < 24
+    """,
+    "Q3_shipping_priority": """
+        SELECT l_orderkey, sum(l_extendedprice * (1 - l_discount)) AS revenue,
+               o_orderdate, o_shippriority
+          FROM customer
+          JOIN orders   ON o_custkey = c_custkey
+          JOIN lineitem ON l_orderkey = o_orderkey
+         WHERE c_mktsegment = 'BUILDING'
+           AND o_orderdate < date '1995-03-15'
+           AND l_shipdate > date '1995-03-15'
+         GROUP BY l_orderkey, o_orderdate, o_shippriority
+         ORDER BY revenue DESC, o_orderdate
+         LIMIT 10
+    """,
+    "scan_agg_full": """
+        SELECT count(*) AS n, sum(l_extendedprice) AS s, avg(l_quantity) AS q,
+               min(l_discount) AS md, max(l_tax) AS mt
+          FROM lineitem WHERE l_quantity > 25
+    """,
+    "four_table_join_agg": """
+        SELECT n_name, sum(l_extendedprice) AS revenue
+          FROM lineitem
+          JOIN orders   ON l_orderkey = o_orderkey
+          JOIN customer ON o_custkey = c_custkey
+          JOIN nation   ON c_nationkey = n_nationkey
+         GROUP BY n_name
+         ORDER BY revenue DESC
+         LIMIT 10
+    """,
+}
+
+# Q6 uses BETWEEN, which RyuDB doesn't parse yet -> expand it for the GPU run.
+RYU_QUERIES: dict[str, str] = dict(QUERIES)
+RYU_QUERIES["Q6_filter_agg"] = """
+    SELECT sum(l_extendedprice * l_discount) AS revenue, count(*) AS n
+      FROM lineitem
+     WHERE l_shipdate >= date '1994-01-01'
+       AND l_shipdate < date '1995-01-01'
+       AND l_discount >= 0.05 AND l_discount <= 0.07
+       AND l_quantity < 24
+"""
+
+
+def generate_tpch(scale: float, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if (out_dir / "lineitem" / "0.parquet").exists():
+        print(f"[gen] {out_dir} already exists, skipping generation")
+        return
+    con = duckdb.connect()
+    try:
+        con.execute("INSTALL tpch; LOAD tpch;")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[gen] could not load DuckDB tpch extension: {exc}", file=sys.stderr)
+        raise
+    print(f"[gen] generating TPC-H SF={scale} with DuckDB dbgen ...")
+    con.execute(f"CALL dbgen(sf => {scale});")
+    for t in TABLES:
+        tdir = out_dir / t
+        tdir.mkdir(exist_ok=True)
+        con.execute(f"COPY (SELECT * FROM {t}) TO '{tdir}/0.parquet' (FORMAT PARQUET);")
+        print(f"[gen]   wrote {t}")
+    con.close()
+
+
+def make_engine(data_dir: Path) -> Engine:
+    cat = Catalog(str(data_dir))
+    for t in TABLES:
+        cat.register(t, str(data_dir / t))
+    return Engine(cat)
+
+
+def _to_pdf(df):
+    import pandas as pd
+    if isinstance(df, pd.DataFrame):
+        return df
+    if hasattr(df, "to_pandas"):
+        return df.to_pandas()
+    return pd.DataFrame(df)
+
+
+def frames_match(a, b) -> bool:
+    """Tolerance comparison: exact for strings/dates, allclose for numerics.
+
+    TPC-H values are money (2 decimals) summed over many rows; GPU float64 and
+    CPU decimal sums differ in low-order bits, so an exact equality check would
+    report false mismatches. We use rtol=1e-6 / atol=1e-2 (one cent).
+    """
+    import numpy as np
+    from decimal import Decimal
+
+    pa, pb = _to_pdf(a), _to_pdf(b)
+    if list(pa.columns) != list(pb.columns):
+        pa = pa.sort_index(axis=1)
+        pb = pb.sort_index(axis=1)
+    if len(pa) != len(pb):
+        return False
+    if len(pa) == 0:
+        return True
+    cols = list(pa.columns)
+    pa = pa.sort_values(cols).reset_index(drop=True)
+    pb = pb.sort_values(cols).reset_index(drop=True)
+    for c in cols:
+        va, vb = pa[c], pb[c]
+        # Decimal/object numeric columns -> float for tolerance compare
+        try:
+            fa = va.astype("float64").to_numpy()
+            fb = vb.astype("float64").to_numpy()
+            if not np.allclose(fa, fb, rtol=1e-6, atol=1e-2, equal_nan=True):
+                return False
+        except (ValueError, TypeError):
+            if not va.reset_index(drop=True).eq(vb.reset_index(drop=True)).all():
+                return False
+    return True
+
+
+def _time(fn, repeats: int) -> float:
+    times = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - t0)
+    return min(times)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="RyuDB vs DuckDB on TPC-H")
+    ap.add_argument("--scale", type=float, default=1.0, help="TPC-H scale factor")
+    ap.add_argument("--repeats", type=int, default=3, help="timed runs per query (min is reported)")
+    ap.add_argument("--data", default=None, help="data dir (default: data/tpch-sf{scale})")
+    ap.add_argument("--queries", nargs="*", default=None, help="subset of query names to run")
+    args = ap.parse_args()
+
+    data_dir = Path(args.data) if args.data else Path("data") / f"tpch-sf{args.scale}"
+    generate_tpch(args.scale, data_dir)
+
+    engine = make_engine(data_dir)
+    duck = duckdb.connect()
+    for t in TABLES:
+        duck.execute(f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{data_dir}/{t}/*.parquet')")
+
+    print(f"\nRyuDB (GPU/cuDF) vs DuckDB (CPU) — TPC-H SF={args.scale}, repeats={args.repeats}\n")
+    header = f"{'query':<26}{'ryudb (ms)':>14}{'duckdb (ms)':>14}{'speedup':>10}  check"
+    print(header)
+    print("-" * len(header))
+
+    names = args.queries or list(QUERIES)
+    for name in names:
+        duck_sql = QUERIES[name]
+        ryu_sql = RYU_QUERIES[name]
+        # correctness
+        try:
+            ryu_df = engine.sql(ryu_sql)
+            duck_df = duck.execute(duck_sql).fetchdf()
+            ok = frames_match(ryu_df, duck_df)
+        except Exception as exc:  # noqa: BLE001
+            print(f"{name:<26}{'ERROR':>14}{'':>14}{'':>10}  {exc}")
+            continue
+
+        # timing (warm-up first, then min of repeats)
+        engine.sql(ryu_sql)
+        duck.execute(duck_sql).fetchdf()
+        ryu_ms = _time(lambda: engine.sql(ryu_sql), args.repeats) * 1000
+        duck_ms = _time(lambda: duck.execute(duck_sql).fetchdf(), args.repeats) * 1000
+        speedup = duck_ms / ryu_ms if ryu_ms > 0 else float("inf")
+        print(f"{name:<26}{ryu_ms:>14.1f}{duck_ms:>14.1f}{speedup:>9.2f}x  {'OK' if ok else 'MISMATCH'}")
+
+    print("\nNote: RyuDB times include Parquet read + GPU execution. Speedup > 1x means the GPU won.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
