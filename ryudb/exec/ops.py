@@ -8,7 +8,6 @@ they compare against cuDF date32/datetime64 columns.
 
 from __future__ import annotations
 
-from datetime import date
 
 import cudf
 import pandas as pd
@@ -79,19 +78,19 @@ def _compare(op, left, right):
     l_series = isinstance(left, cudf.Series)
     r_series = isinstance(right, cudf.Series)
     if not l_series and not r_series:
-        l, r = left, right
+        lv, rv = left, right
         if op == "=":
-            return l == r
+            return lv == rv
         if op == "!=":
-            return l != r
+            return lv != rv
         if op == "<":
-            return l < r
+            return lv < rv
         if op == "<=":
-            return l <= r
+            return lv <= rv
         if op == ">":
-            return l > r
+            return lv > rv
         if op == ">=":
-            return l >= r
+            return lv >= rv
     # Ensure the Series is on the left for a clean `series <op> scalar` form.
     if r_series and not l_series:
         return _compare(_CMP_SWAP[op], right, left)
@@ -120,27 +119,27 @@ def _arith(op, left, right):
     return _series_arith(op, left, right)
 
 
-def _series_arith(op, l, r):
+def _series_arith(op, lv, rv):
     if op == "+":
-        return l + r
+        return lv + rv
     if op == "-":
-        return l - r
+        return lv - rv
     if op == "*":
-        return l * r
+        return lv * rv
     if op == "/":
-        return l / r
+        return lv / rv
     raise NotImplementedError(f"unsupported arithmetic operator {op}")
 
 
-def _py_arith(op, l, r):
+def _py_arith(op, lv, rv):
     if op == "+":
-        return l + r
+        return lv + rv
     if op == "-":
-        return l - r
+        return lv - rv
     if op == "*":
-        return l * r
+        return lv * rv
     if op == "/":
-        return l / r
+        return lv / rv
     raise NotImplementedError(f"unsupported arithmetic operator {op}")
 
 

@@ -12,8 +12,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
-import statistics
 import sys
 import time
 from pathlib import Path
@@ -134,7 +132,6 @@ def frames_match(a, b) -> bool:
     report false mismatches. We use rtol=1e-6 / atol=1e-2 (one cent).
     """
     import numpy as np
-    from decimal import Decimal
 
     pa, pb = _to_pdf(a), _to_pdf(b)
     if list(pa.columns) != list(pb.columns):

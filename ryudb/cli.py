@@ -42,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     engine = Engine(catalog)
 
     if args.exec_sql:
-        return _run_statement(engine, args.exec_sql, quiet=False)
+        return _run_script(engine, args.exec_sql)
     if args.file:
         with open(args.file) as fh:
             return _run_script(engine, fh.read())

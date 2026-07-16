@@ -193,7 +193,7 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
         items = ", ".join(f"{_estr(e)} AS {n}" for e, n in node.items)
         return f"{pad}Project({items})\n" + pretty(node.input, indent + 1)
     if isinstance(node, Join):
-        on = " AND ".join(f"{l}={r}" for l, r in zip(node.on_left, node.on_right))
+        on = " AND ".join(f"{lk}={rk}" for lk, rk in zip(node.on_left, node.on_right))
         return (
             f"{pad}Join({node.how} on {on})\n"
             + pretty(node.left, indent + 1) + "\n"

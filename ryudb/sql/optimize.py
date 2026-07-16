@@ -208,9 +208,9 @@ def select_join_sides(plan: PlanNode, stats: Stats) -> PlanNode:
         if isinstance(node, Scan):
             return float(stats.get(node.table, 10**9))
         if isinstance(node, Join):
-            l = est_rows(node.left)
-            r = est_rows(node.right)
-            return min(l * r, 10**15)
+            left_rows = est_rows(node.left)
+            right_rows = est_rows(node.right)
+            return min(left_rows * right_rows, 10**15)
         if hasattr(node, "input"):
             return est_rows(node.input)
         return 10**9
