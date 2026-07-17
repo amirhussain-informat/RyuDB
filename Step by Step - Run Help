@@ -1,0 +1,58 @@
+All verified against the real data. Here's the honest step-by-step — RyuDB is read-only in its current phase, so SELECT works fully, CREATE is a "register Parquet dir" command, and
+  INSERT/DELETE are not supported (they error out; Phase 2 will add writes).
+
+  Step 1 — Connect (start the GPU REPL)
+
+  All commands run in the WSL conda env, from the repo dir:
+
+  ┌──────┬──────────────┬───────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Step │   Command    │                                         What it does                                          │
+  ├──────┼──────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 1a   │ Open WSL     │ wsl -d NVIDIA-Workbench                                                                       │
+  ├──────┼──────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 1b   │ Activate env │ source ~/miniconda3/etc/profile.d/conda.sh && conda activate ryudb                            │
+  ├──────┼──────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 1c   │ Go to repo   │ cd ~/RyuDB                                                                                    │
+  ├──────┼──────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 1d   │ Start REPL   │ ryudb -d data/tpch-sf1.0 (interactive) or ryudb -d data/tpch-sf1.0 -e "SELECT ..." (one shot) │
+  └──────┴──────────────┴───────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ┌────────────────────────────────────────────────────────┬────────────────────────────────────────────┐
+  │                        Command                         │                   Result                   │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ CREATE TABLE lineitem FROM 'data/tpch-sf1.0/lineitem'; │ registered lineitem: 6001215 rows, 16 cols │
+  ├────────────────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ CREATE TABLE nation FROM 'data/tpch-sf1.0/nation';     │ registered nation: 25 rows, 4 cols         │
+  └────────────────────────────────────────────────────────┴────────────────────────────────────────────┘
+
+  REPL helpers: :tables (list tables), :schema nation (columns + row count), :explain SELECT ... (show the optimized plan).
+
+  Step 3 — SELECT (fully supported)
+
+  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬────────┐
+  │                                                                Query                                                                │ Works? │
+  ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────┤
+  │ SELECT n_name, n_regionkey FROM nation WHERE n_regionkey = 1 ORDER BY n_name;                                                       │ ✅     │
+  ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────┤
+  │ SELECT l_returnflag, count(*) AS n FROM lineitem WHERE l_shipdate <= date '1998-09-02' GROUP BY l_returnflag ORDER BY l_returnflag; │ ✅     │
+  ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────┤
+  │ Joins, SUM/AVG/MIN/MAX, date filters, arithmetic, LIMIT                                                                             │ ✅     │
+  └─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴────────┘
+
+  Supported: SELECT / WHERE / equi-JOIN / GROUP BY (COUNT,SUM,AVG,MIN,MAX) / ORDER BY / LIMIT / date filters / arithmetic.
+  Not yet: DISTINCT, HAVING, window functions, subqueries, CASE, IN, non-inner joins.
+
+  Step 4 — INSERT / DELETE / UPDATE (NOT supported — read-only)
+
+  ┌───────────────────────────────────────────┬──────────────────────────────────────────────┐
+  │                  Command                  │                    Result                    │
+  ├───────────────────────────────────────────┼──────────────────────────────────────────────┤
+  │ INSERT INTO nation VALUES (100, 'X', 1);  │ error: only SELECT is supported (got Insert) │
+  ├───────────────────────────────────────────┼──────────────────────────────────────────────┤
+  │ DELETE FROM nation WHERE n_nationkey = 1; │ error: only SELECT is supported (got Delete) │
+  ├───────────────────────────────────────────┼──────────────────────────────────────────────┤
+  │ UPDATE ...                                │ same error                                   │
+  └───────────────────────────────────────────┴──────────────────────────────────────────────┘
+
+  Workaround to change data — mutate the underlying Parquet, then re-register. Example with DuckDB:
