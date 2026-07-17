@@ -16,6 +16,8 @@ REPL dot-commands:
                      :alter NAME notnull COL | :alter NAME notnull- COL
                      :alter NAME unique c1[,c2,...]
                      :alter NAME default COL VALUE
+  :snapshot NAME capture the current committed state as a named snapshot
+  :restore NAME  restore the whole DB to a named snapshot (discards later commits)
   :explain SQL   print the optimized logical plan without running
   :help          show help
   :quit          exit
@@ -87,6 +89,19 @@ def _run_statement(engine: Engine, stmt: str, quiet: bool) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    # Transaction control / snapshot / restore return None (no result frame).
+    # This branch MUST precede the int check -- isinstance(None, int) is False,
+    # but _print_frame(None) would raise, and BEGIN/COMMIT/ROLLBACK/CREATE
+    # SNAPSHOT/RESTORE all return None.
+    if result is None:
+        kw = stmt.lstrip().split(None, 1)[0].upper() if stmt.strip() else ""
+        if kw == "CREATE" or kw == "RESTORE":
+            print("ok")
+        elif kw in ("BEGIN", "COMMIT", "ROLLBACK"):
+            print(f"{kw.lower()} ok")
+        else:
+            print("ok")
+        return 0
     # INSERT returns an int row count (the write path mutates the delta); SELECT
     # returns a cuDF frame to print.
     if isinstance(result, int):
@@ -166,6 +181,24 @@ def _dot_command(cmd: str, engine: Engine, catalog: Catalog) -> bool:
             print(f"error: {exc}")
     elif name == "alter":
         _alter_command(catalog, arg)
+    elif name == "snapshot":
+        if not arg:
+            print("usage: :snapshot NAME")
+        else:
+            try:
+                engine.snapshot(arg.strip())
+                print(f"snapshot {arg.strip()} captured")
+            except Exception as exc:  # noqa: BLE001
+                print(f"error: {exc}")
+    elif name == "restore":
+        if not arg:
+            print("usage: :restore NAME")
+        else:
+            try:
+                engine.restore(arg.strip())
+                print(f"restored to snapshot {arg.strip()}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"error: {exc}")
     elif name == "explain":
         if not arg:
             print("usage: :explain <sql>")

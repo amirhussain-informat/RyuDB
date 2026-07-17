@@ -162,7 +162,19 @@ class Insert:
     rows: list[list[Expr]] = field(default_factory=list)
 
 
-PlanNode = Scan | Filter | Project | Join | Aggregate | Sort | Limit | Insert
+@dataclass
+class TxnControl:
+    """Transaction-control leaf (Phase 2 step 5): BEGIN / COMMIT / ROLLBACK.
+
+    A non-relational leaf (no ``input``), like ``Insert``. The executor dispatches
+    on ``kind`` to the Engine's ``_begin``/``_commit``/``_rollback`` and returns
+    ``None`` (no result frame). Snapshot/restore are NOT plan nodes -- they are
+    non-standard SQL and bypass ``parse`` entirely via a regex pre-sniff in
+    ``Engine.sql``."""
+    kind: str  # "begin" | "commit" | "rollback"
+
+
+PlanNode = Scan | Filter | Project | Join | Aggregate | Sort | Limit | Insert | TxnControl
 
 
 def walk(node: PlanNode):
@@ -228,6 +240,8 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
     if isinstance(node, Insert):
         cols = ",".join(node.columns) if node.columns else "*"
         return f"{pad}Insert({node.table} cols={cols} rows={len(node.rows)})"
+    if isinstance(node, TxnControl):
+        return f"{pad}TxnControl({node.kind})"
     return f"{pad}<{type(node).__name__}>"
 
 
