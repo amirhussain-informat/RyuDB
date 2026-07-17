@@ -870,6 +870,23 @@ __device__ inline double page_col_val(const PageSrc &s, int c, int i) {
     return raw;
 }
 
+// Raw stored integer for row i (PLAIN load or DICT gather), sign-extended to
+// int64 with NO decimal/date/double fold. Used by the materialise kernel to
+// write typed frame columns (int32/int64/datetime64) without the precision loss
+// of page_col_val's double return (int64 > 2^53 would round). Uses the SAME
+// kind discriminator as page_col_val.
+__device__ inline long long page_col_raw64(const PageSrc &s, int c, int i) {
+    if (s.kind[c] == PK_PLAIN_RAW) {
+        const uint8_t *base = (const uint8_t *)s.buf[c] + plain_values_off(s.buf[c]);
+        const uint8_t *vp = base + (size_t)i * (s.phys[c] == PHYS_I32 ? 4 : 8);
+        return (s.phys[c] == PHYS_I32) ? (long long)load_i32_una(vp) : load_i64_una(vp);
+    }
+    // PK_DICT_NUMERIC_ARG: gather dict[index]
+    int idx = ((const int *)s.buf[c])[i];
+    return (s.phys[c] == PHYS_I32) ? (long long)((const int *)s.dict[c])[idx]
+                                   : ((const long long *)s.dict[c])[idx];
+}
+
 __device__ inline bool page_pass_pred(const Plan &p, const PageSrc &s, int i) {
     for (int j = 0; j < p.n_pred; j++) {
         double v = page_col_val(s, p.pred_col[j], i);
@@ -970,21 +987,65 @@ __global__ void page_hash_kernel(Plan p, PageSrc s, long long *key, double *acc,
     }
 }
 
+// Materialise-gather: write every bound column's decoded value for this row
+// group into a contiguous per-column device frame buffer (Python-owned cuDF
+// Series, passed in as raw ptrs) at the RG's global row offset, so the scan
+// path can populate Engine._scan_cache and warm repeats hit the GPU-resident
+// frame. d_out_kind single-sources the store width so host _frame_dtype and the
+// device store cannot diverge: 0=int32, 1=int64, 2=float64 (decimal scale folded
+// here), 3=datetime64[s] (int64 seconds = days*86400). Reuses page_col_raw64
+// (raw int, no precision loss) and the RG's already-wired PageSrc s.
+__global__ void materialise_kernel(PageSrc s, const long long *d_frame_ptrs,
+                                   const int *d_out_kind, const long long *d_row_off,
+                                   int rg, int n, int ncol) {
+    long long base = d_row_off[rg];
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        for (int c = 0; c < ncol; c++) {
+            long long raw = page_col_raw64(s, c, i);
+            int k = d_out_kind[c];
+            char *p = (char *)d_frame_ptrs[c];
+            if (k == 0) {
+                ((int *)p)[base + i] = (int)raw;
+            } else if (k == 2) {  // decimal -> float64
+                double v = (double)raw;
+                int sc = s.scale[c];
+                if (sc > 0) v /= pow10d(sc);
+                ((double *)p)[base + i] = v;
+            } else {  // int64 (k==1) or datetime64[s] (k==3)
+                ((long long *)p)[base + i] = (k == 3) ? raw * 86400LL : raw;
+            }
+        }
+    }
+}
+
 // Parallel RLE/bit-packed dict-index decode (two-pass). The index stream is a
 // sequence of runs; run headers are LEB128 varints with no outer length prefix.
 struct RunEntry { int out_start; int count; int is_rle; int value; int data_off; };
 
-// Pass 1 (single thread): walk the run headers, record each run's output range.
-// Reads the def-level length and the bit width straight from the page
-// (`[4B deflen][def RLE][1B bitwidth][index runs]`) so the host does not need a
-// D2H + sync per dict column. Writes the bit width to `out_bw` for pass 2.
-__global__ void scan_runs_kernel(const uint8_t *page, int num_values,
-                                 RunEntry *runs, int *nruns, int *overflow, int *out_bw) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+// Batched dict-index decode (Phase 5 step 2). The per-RG versions launched
+// scan_runs+apply_runs once per dict column per row group (~1467 serial launches
+// for Q6 SF10), and the single-thread scan_runs serialised to ~180 ms. These two
+// batched kernels collapse that into TWO launches: one block per dict data page.
+// `blockIdx.x` (scan) / `blockIdx.y` (apply) is the per-page slot `s`; each
+// slot has its own run table at `runs + s*PQ_RUNS_CAP`, count at `nruns[s]`,
+// bitwidth at `bw[s]`, and int32 index output at `idxbig + s*max_n`.
+
+// Pass 1 (one thread per dict page): walk that page's run headers into its
+// per-page run-table slot. Reads def-level length + bit width straight from the
+// page (`[4B deflen][def RLE][1B bitwidth][index runs]`) -- no D2H per page.
+__global__ void scan_runs_batched_kernel(const void *const *pages, const int *nvals,
+                                         RunEntry *runs, int *nruns, int *overflow,
+                                         int *bw, size_t total) {
+    if (threadIdx.x != 0) return;
+    size_t slot = blockIdx.x;
+    if (slot >= total) return;
+    const uint8_t *page = (const uint8_t *)pages[slot];
+    int num_values = nvals[slot];
+    RunEntry *myruns = runs + slot * (size_t)PQ_RUNS_CAP;
     int deflen = *(const int *)page;
     int bitwidth = page[4 + deflen];
     int idx_off = 4 + deflen + 1;
-    *out_bw = bitwidth;
+    bw[slot] = bitwidth;
     int pos = idx_off, cur = 0, r = 0;
     int vw = (bitwidth + 7) / 8;
     while (cur < num_values) {
@@ -1001,36 +1062,44 @@ __global__ void scan_runs_kernel(const uint8_t *page, int num_values,
             int val = 0;
             for (int b = 0; b < vw; b++) val |= ((int)page[pos + b]) << (8 * b);
             pos += vw;
-            runs[r].out_start = cur; runs[r].count = (int)cnt; runs[r].is_rle = 1;
-            runs[r].value = val; runs[r].data_off = 0;
+            myruns[r].out_start = cur; myruns[r].count = (int)cnt; myruns[r].is_rle = 1;
+            myruns[r].value = val; myruns[r].data_off = 0;
             cur += (int)cnt;
         } else {  // bit-packed run: cnt groups of 8 values; cnt*bitwidth bytes
-            int nvals = (int)cnt * 8;
+            int nvals_run = (int)cnt * 8;
             int nbytes = (int)cnt * bitwidth;
-            runs[r].out_start = cur; runs[r].count = nvals; runs[r].is_rle = 0;
-            runs[r].value = 0; runs[r].data_off = pos;
-            pos += nbytes; cur += nvals;
+            myruns[r].out_start = cur; myruns[r].count = nvals_run; myruns[r].is_rle = 0;
+            myruns[r].value = 0; myruns[r].data_off = pos;
+            pos += nbytes; cur += nvals_run;
         }
-        if (++r >= PQ_RUNS_CAP) { atomicExch(overflow, 1); *nruns = r; return; }
+        if (++r >= PQ_RUNS_CAP) { atomicExch(overflow, 1); nruns[slot] = r; return; }
     }
-    *nruns = r;
+    nruns[slot] = r;
 }
 
-// Pass 2 (parallel): each output value binary-searches the run covering it.
-// Reads the run count and bit width from the device ints written by pass 1
-// (stream-ordered before this kernel on the same stream, so no host sync).
-__global__ void apply_runs_kernel(const uint8_t *page, int num_values, const RunEntry *runs,
-                                  const int *nruns_p, const int *bw, int *out) {
-    int nruns = *nruns_p;
-    int bitwidth = *bw;
+// Pass 2 (2D grid: blockIdx.y = page slot, blockIdx.x covers that page's values):
+// each output value binary-searches its page's run table and writes the int32
+// dict index. Reads nruns/bitwidth from the per-page device ints written by
+// pass 1 (stream-ordered, no host sync). gridDim.x = ceil(max_n/THREADS) so the
+// grid-stride loop covers every page's n (<= max_n).
+__global__ void apply_runs_batched_kernel(const void *const *pages, const int *nvals,
+                                          const RunEntry *runs, const int *nruns_p,
+                                          const int *bw, int *idxbig, int max_n) {
+    size_t slot = blockIdx.y;
+    int num_values = nvals[slot];
+    const uint8_t *page = (const uint8_t *)pages[slot];
+    const RunEntry *myruns = runs + slot * (size_t)PQ_RUNS_CAP;
+    int *out = idxbig + slot * (size_t)max_n;
+    int nruns = nruns_p[slot];
+    int bitwidth = bw[slot];
     unsigned mask = (bitwidth >= 32) ? 0xffffffffu : ((1u << bitwidth) - 1u);
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_values; i += gridDim.x * blockDim.x) {
         int lo = 0, hi = nruns - 1, ans = 0;
         while (lo <= hi) {
             int mid = (lo + hi) / 2;
-            if (runs[mid].out_start <= i) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+            if (myruns[mid].out_start <= i) { ans = mid; lo = mid + 1; } else hi = mid - 1;
         }
-        const RunEntry &e = runs[ans];
+        const RunEntry &e = myruns[ans];
         if (e.is_rle) { out[i] = e.value; continue; }
         int local = i - e.out_start;
         int bit = local * bitwidth;
@@ -1082,6 +1151,7 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
                          py::array_t<int> tok_kind, py::array_t<int> tok_col,
                          py::array_t<double> tok_lit, py::array_t<int> tok_op,
                          py::array_t<double> acc_init,
+                         py::array_t<long long> frame_ptrs, py::array_t<int> out_kind,
                          int strategy, int n_groups, int capacity) {
     int nagg = (int)agg_kind.shape(0);
     int ngkey = (int)gkey_idx.shape(0);
@@ -1177,9 +1247,8 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
     struct HPage { int col; int role; size_t file_off; int comp; int uncomp; };
     std::vector<std::vector<HPage>> rg_pages(nrg);
     std::vector<int> rg_npages(nrg, 0);
-    std::vector<size_t> rg_uncomp(nrg, 0);
-    size_t max_comp = 0, max_total_uncomp = 0, max_uncomp_page = 0;
-    int max_pages = 0, max_n = 0;
+    size_t max_comp = 0, max_uncomp_page = 0;  // max_comp = per-RG aligned comp total (pin-ring slot)
+    int max_n = 0;
     // Page sub-buffers are carved out of one big device buffer, so each page's
     // offset is 8-byte aligned (page_col_val reads int/int64 at the page start
     // and at the def-level-derived values offset; an unaligned carve would
@@ -1202,7 +1271,6 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
                 int role = (pg.type == ryudb_pq::PT_DICT) ? 1 : 0;
                 rg_pages[rg].push_back({c, role, (size_t)pg.payload_off, pg.comp_size, pg.uncomp_size});
                 comp_total += align8((size_t)pg.comp_size);
-                rg_uncomp[rg] += align8((size_t)pg.uncomp_size);
                 max_uncomp_page = std::max(max_uncomp_page, (size_t)pg.uncomp_size);
             }
             if (overflow) break;
@@ -1210,10 +1278,61 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
         }
         if (overflow) break;
         rg_npages[rg] = (int)rg_pages[rg].size();
-        max_pages = std::max(max_pages, rg_npages[rg]);
         max_comp = std::max(max_comp, comp_total);
-        max_total_uncomp = std::max(max_total_uncomp, rg_uncomp[rg]);
     }
+
+    // --- flatten all row-group pages into one flat array with global aligned
+    // dbig/ubig offsets, so a SINGLE batched nvCOMP call can decompress every
+    // page at once. nvCOMP parallelizes across chunks; the old per-RG ~7-chunk
+    // calls left most of the 82 SMs idle (3861ms = 97% of SF10 Q6). dbig/ubig
+    // now span every page's aligned slot instead of one row group's. ---
+    size_t total_pages = 0;
+    for (int rg = 0; rg < nrg; rg++) total_pages += (size_t)rg_npages[rg];
+    std::vector<int> rg_start(nrg + 1, 0);
+    for (int rg = 0; rg < nrg; rg++) rg_start[rg + 1] = rg_start[rg] + rg_npages[rg];
+    // Per-RG global row offset (prefix sum of cn_h) for the materialise kernel:
+    // frame[c][row_off[rg] + i] is the global row for RG-local row i. int64: this
+    // is a TABLE-GLOBAL row offset, so it must hold total_rows (which exceeds
+    // INT32 at SF>=~500, ~2.1B rows) -- the per-RG cn_h[rg] stays int (< 2^31/RG).
+    std::vector<long long> row_off_h(nrg + 1, 0);
+    for (int rg = 0; rg < nrg; rg++) row_off_h[rg + 1] = row_off_h[rg] + cn_h[rg];
+    std::vector<HPage> all_pages(total_pages);
+    std::vector<size_t> g_comp_off(total_pages), g_up_off(total_pages);
+    size_t sum_comp = 0, sum_uncomp = 0;
+    for (int rg = 0; rg < nrg; rg++) {
+        for (int i = 0; i < rg_npages[rg]; i++) {
+            size_t gi = (size_t)rg_start[rg] + i;
+            all_pages[gi] = rg_pages[rg][i];
+            g_comp_off[gi] = sum_comp;    sum_comp   += align8((size_t)all_pages[gi].comp);
+            g_up_off[gi]   = sum_uncomp;  sum_uncomp += align8((size_t)all_pages[gi].uncomp);
+        }
+    }
+
+    // --- dict-job flatten: one decode job per (row group, dict column) data
+    // page. v1 guarantees exactly 1 data page per col chunk, so each such page
+    // gets a permanent index-array slot in d_idxbig and a permanent run-table
+    // slot in d_runs, decoded ONCE by the two batched kernels (instead of
+    // scan_runs+apply_runs launched per dict col per RG -- ~1467 serial launches
+    // for Q6 SF10). dict_slot[rg*ncol+c] maps a (RG, dict col) to its slot (-1
+    // for PLAIN cols); dict_data_upoff/dict_n_arr describe each job. ---
+    std::vector<int> dict_slot((size_t)nrg * ncol, -1);
+    std::vector<size_t> dict_data_upoff;
+    std::vector<int> dict_n_arr;
+    for (int rg = 0; rg < nrg; rg++) {
+        for (int c = 0; c < ncol; c++) {
+            if (ck_h[c] != PK_DICT_NUMERIC_ARG) continue;
+            for (int i = 0; i < rg_npages[rg]; i++) {
+                size_t gi = (size_t)rg_start[rg] + i;
+                if (all_pages[gi].col == c && all_pages[gi].role == 0) {  // the dict DATA page (indices)
+                    dict_slot[(size_t)rg * ncol + c] = (int)dict_data_upoff.size();
+                    dict_data_upoff.push_back(g_up_off[gi]);
+                    dict_n_arr.push_back(cn_h[rg]);
+                    break;  // v1: one data page per col chunk
+                }
+            }
+        }
+    }
+    size_t total_dict = dict_data_upoff.size();  // ~1467 for Q6 SF10
 #ifdef RYUDB_SCAN_PROFILE
     _tm.mark("preparse+plan");
 #endif
@@ -1232,9 +1351,10 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
     void **d_uptrs = nullptr; int *d_stat = nullptr;
     void *d_temp = nullptr;
     RunEntry *d_runs = nullptr; int *d_nruns = nullptr, *d_bw = nullptr;
+    const void **d_dict_data = nullptr; int *d_dict_n = nullptr;  // batched dict-decode job arrays
+    long long *d_frame_ptrs = nullptr; int *d_out_kind = nullptr; long long *d_row_off = nullptr;  // materialise-gather
     bool pinned_mmap = false;
     nvcompBatchedSnappyDecompressOpts_t opts = nvcompBatchedSnappyDecompressDefaultOpts;
-    std::vector<size_t> up_off(max_pages);
 
     if (overflow == 0) {
         check(cudaStreamCreate(&stream), "stream");
@@ -1253,139 +1373,201 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
             // is reused only after its H2D has completed.
             check(cudaMallocHost(&pin, (size_t)BATCH * max_comp), "malloc pin");
         }
-        check(cudaMalloc(&dbig, max_comp), "malloc dbig");
-        check(cudaMalloc(&ubig, max_total_uncomp), "malloc ubig");
-        if (max_n > 0) check(cudaMalloc(&d_idxbig, (size_t)ncol * max_n * sizeof(int)), "malloc idxbig");
-        check(cudaMalloc(&d_cptrs, sizeof(void *) * max_pages), "m cptrs");
-        check(cudaMalloc(&d_cbytes, sizeof(size_t) * max_pages), "m cbytes");
-        check(cudaMalloc(&d_ubytes, sizeof(size_t) * max_pages), "m ubytes");
-        check(cudaMalloc(&d_actual, sizeof(size_t) * max_pages), "m actual");
-        check(cudaMalloc(&d_uptrs, sizeof(void *) * max_pages), "m uptrs");
-        check(cudaMalloc(&d_stat, sizeof(int) * max_pages), "m stat");
-        check(cudaMalloc(&d_runs, sizeof(RunEntry) * PQ_RUNS_CAP), "malloc runs");
-        check(cudaMalloc(&d_nruns, sizeof(int)), "malloc nruns");
-        check(cudaMalloc(&d_bw, sizeof(int)), "malloc bw");
-        // nvCOMP temp sized to the max row group (GetTempSize is a host query).
-        size_t max_temp = 0;
-        for (int rg = 0; rg < nrg; rg++) {
-            size_t tb = 0;
-            if (nvcompBatchedSnappyDecompressGetTempSizeAsync(rg_npages[rg], max_uncomp_page,
-                    opts, &tb, rg_uncomp[rg]) == nvcompSuccess)
-                max_temp = std::max(max_temp, tb);
+        check(cudaMalloc(&dbig, sum_comp), "malloc dbig");
+        check(cudaMalloc(&ubig, sum_uncomp), "malloc ubig");
+        // Per-page dict-decode scratch: one index array + one run table per dict
+        // data page (slot s at d_idxbig + s*max_n / d_runs + s*PQ_RUNS_CAP).
+        if (total_dict > 0 && max_n > 0)
+            check(cudaMalloc(&d_idxbig, total_dict * (size_t)max_n * sizeof(int)), "malloc idxbig");
+        check(cudaMalloc(&d_cptrs, sizeof(void *) * total_pages), "m cptrs");
+        check(cudaMalloc(&d_cbytes, sizeof(size_t) * total_pages), "m cbytes");
+        check(cudaMalloc(&d_ubytes, sizeof(size_t) * total_pages), "m ubytes");
+        check(cudaMalloc(&d_actual, sizeof(size_t) * total_pages), "m actual");
+        check(cudaMalloc(&d_uptrs, sizeof(void *) * total_pages), "m uptrs");
+        check(cudaMalloc(&d_stat, sizeof(int) * total_pages), "m stat");
+        if (total_dict > 0) {
+            check(cudaMalloc(&d_runs, total_dict * (size_t)PQ_RUNS_CAP * sizeof(RunEntry)), "malloc runs");
+            check(cudaMalloc(&d_nruns, sizeof(int) * total_dict), "malloc nruns");
+            check(cudaMalloc(&d_bw, sizeof(int) * total_dict), "malloc bw");
+            check(cudaMalloc(&d_dict_data, sizeof(void *) * total_dict), "malloc dict_data");
+            check(cudaMalloc(&d_dict_n, sizeof(int) * total_dict), "malloc dict_n");
         }
+        // nvCOMP temp for the single batched call over ALL pages (host query).
+        size_t max_temp = 0;
+        if (nvcompBatchedSnappyDecompressGetTempSizeAsync(total_pages, max_uncomp_page,
+                opts, &max_temp, sum_uncomp) != nvcompSuccess)
+            max_temp = 0;
         if (max_temp) check(cudaMalloc(&d_temp, max_temp), "malloc temp");
 
-        // Per-RG host staging for the nvCOMP metadata arrays. Each row group
-        // gets its own hp/hc/hu/hup so the async H2D of RG N's metadata is not
-        // raced by the host overwriting the same vector in iteration RG N+1
-        // (cudaMemcpyAsync from a host source requires the source to remain
-        // valid until the copy completes -- a shared vector is a data race).
-        std::vector<std::vector<const void *>> hp(nrg);
-        std::vector<std::vector<size_t>> hc(nrg), hu(nrg);
-        std::vector<std::vector<void *>> hup(nrg);
-        for (int rg = 0; rg < nrg; rg++) {
-            hp[rg].resize(rg_npages[rg]);
-            hc[rg].resize(rg_npages[rg]);
-            hu[rg].resize(rg_npages[rg]);
-            hup[rg].resize(rg_npages[rg]);
+        // --- materialise-gather frame buffers. d_row_off is always allocated
+        // (cheap); d_frame_ptrs/d_out_kind only when the caller passed a
+        // non-empty frame_ptrs (the scan path populates _scan_cache). Empty ->
+        // no materialise launch, the path is identical to today. The frame
+        // buffers themselves are Python-owned cuDF columns -- NOT freed here. ---
+        check(cudaMalloc(&d_row_off, sizeof(long long) * (nrg + 1)), "malloc row_off");
+        check(cudaMemcpyAsync(d_row_off, row_off_h.data(), sizeof(long long) * (nrg + 1),
+                              cudaMemcpyHostToDevice, stream), "cp row_off");
+        {
+            auto fp = frame_ptrs.request();
+            if (fp.ndim > 0 && fp.shape[0] > 0) {
+                check(cudaMalloc(&d_frame_ptrs, sizeof(long long) * ncol), "malloc frame_ptrs");
+                check(cudaMemcpyAsync(d_frame_ptrs, fp.ptr, sizeof(long long) * ncol,
+                                      cudaMemcpyHostToDevice, stream), "cp frame_ptrs");
+                auto okd = out_kind.request();
+                check(cudaMalloc(&d_out_kind, sizeof(int) * ncol), "malloc out_kind");
+                check(cudaMemcpyAsync(d_out_kind, okd.ptr, sizeof(int) * ncol,
+                                      cudaMemcpyHostToDevice, stream), "cp out_kind");
+            }
         }
-        // Bound the number of pending stream operations: queuing all nrg row
-        // groups with no drain exhausts the driver's async-copy/launch
-        // descriptor pool and surfaces as cudaErrorMemoryAllocation at the next
-        // launch. Sync every BATCH row groups (device buffers reuse safely --
-        // stream-ordered; host staging is per-RG/per-ring-slot). BATCH keeps
-        // enough row groups in flight to overlap H2D with compute without
-        // stalling the GPU.
 
-        // ---------- per row group (stream-ordered, NO per-RG sync) ----------
+        // --- global nvCOMP metadata: one flat array over ALL row-group pages,
+        // built and H2D'd once. Replaces the per-RG hp/hc/hu/hup vectors: a
+        // single batched decompress needs one set of device-resident ptr/size
+        // arrays spanning every page, not 489 per-RG sets of ~7. ---
+        std::vector<const void *> hp(total_pages);
+        std::vector<size_t> hc(total_pages), hu(total_pages);
+        std::vector<void *> hup(total_pages);
+        for (int rg = 0; rg < nrg; rg++) {
+            for (int i = 0; i < rg_npages[rg]; i++) {
+                size_t gi = (size_t)rg_start[rg] + i;
+                const HPage &pg = all_pages[gi];
+                hp[gi]  = dbig + g_comp_off[gi];
+                hc[gi]  = (size_t)pg.comp;     // true size handed to nvCOMP
+                hu[gi]  = (size_t)pg.uncomp;   // capacity (<= align8 slot in ubig)
+                hup[gi] = ubig + g_up_off[gi];
+            }
+        }
+        check(cudaMemcpyAsync(d_cptrs, hp.data(),  sizeof(void *) * total_pages, cudaMemcpyHostToDevice, stream), "cp cptrs");
+        check(cudaMemcpyAsync(d_cbytes, hc.data(), sizeof(size_t) * total_pages, cudaMemcpyHostToDevice, stream), "cp cbytes");
+        check(cudaMemcpyAsync(d_ubytes, hu.data(), sizeof(size_t) * total_pages, cudaMemcpyHostToDevice, stream), "cp ubytes");
+        check(cudaMemcpyAsync(d_uptrs, hup.data(), sizeof(void *) * total_pages, cudaMemcpyHostToDevice, stream), "cp uptrs");
+
+        // --- H2D all compressed page payloads into dbig (stream-ordered; the
+        // single nvCOMP is queued after on the same stream, so no sync is needed
+        // between H2D and decompress). Sync every BATCH row groups only to keep
+        // the pin-ring slot reuse safe (gather path) and the launch queue
+        // bounded -- queuing ~3400 async copies with no drain exhausts the
+        // driver descriptor pool (cudaErrorMemoryAllocation). ---
         for (int rg = 0; rg < nrg && overflow == 0; rg++) {
-            int n = cn_h[rg], npages = rg_npages[rg];
-            const auto &pages = rg_pages[rg];
-
-            // Stage compressed payloads into dbig: per-page async H2D from the
-            // pinned mmap (no host gather), or a pinned gather copy otherwise.
-            // Offsets are 8-byte aligned (page carve alignment; see pre-parse).
-            auto align8 = [](size_t x) { return (x + 7u) & ~size_t(7); };
-            size_t comp_off = 0;
+            int npages = rg_npages[rg];
+            size_t base = (size_t)rg_start[rg];
             if (pinned_mmap) {
                 for (int i = 0; i < npages; i++) {
-                    check(cudaMemcpyAsync(dbig + comp_off, file_data + pages[i].file_off,
-                                          pages[i].comp, cudaMemcpyHostToDevice, stream), "cp comp");
-                    comp_off += align8((size_t)pages[i].comp);
+                    size_t gi = base + i;
+                    check(cudaMemcpyAsync(dbig + g_comp_off[gi], file_data + all_pages[gi].file_off,
+                                          all_pages[gi].comp, cudaMemcpyHostToDevice, stream), "cp comp");
                 }
             } else {
-                // Gather this row group's compressed pages into this RG's slot
-                // of the pin ring, then one async H2D into dbig. The slot is
-                // exclusive to in-flight row group rg % BATCH, so the async H2D
-                // reads stable host memory (no race with the next row group).
+                // Gather this RG's compressed pages into its pin-ring slot, then
+                // one async H2D into the RG's global dbig slice. The slot is
+                // exclusive to in-flight RG rg % BATCH; the batch sync below
+                // guarantees reuse only after the H2D has completed.
                 uint8_t *pinslot = (uint8_t *)pin + (size_t)(rg % BATCH) * max_comp;
+                size_t off = 0;
                 for (int i = 0; i < npages; i++) {
-                    memcpy(pinslot + comp_off, file_data + pages[i].file_off, pages[i].comp);
-                    comp_off += align8((size_t)pages[i].comp);
+                    size_t gi = base + i;
+                    memcpy(pinslot + off, file_data + all_pages[gi].file_off, all_pages[gi].comp);
+                    off += align8((size_t)all_pages[gi].comp);
                 }
-                check(cudaMemcpyAsync(dbig, pinslot, comp_off, cudaMemcpyHostToDevice, stream), "cp comp");
+                check(cudaMemcpyAsync(dbig + g_comp_off[base], pinslot, off,
+                                      cudaMemcpyHostToDevice, stream), "cp comp");
             }
+            if ((rg + 1) % BATCH == 0) check(cudaStreamSynchronize(stream), "batch h2d sync");
+        }
+#ifdef RYUDB_SCAN_PROFILE
+        check(cudaStreamSynchronize(stream), "prof h2d sync");
+        _tm.mark("h2d-comp");
+#endif
 
-            // Per-page nvCOMP metadata: compressed ptrs into dbig, uncomp ptrs
-            // sub-allocated from ubig (one big device buffer, no per-page malloc).
-            comp_off = 0; size_t uoff = 0;
-            for (int i = 0; i < npages; i++) {
-                hp[rg][i] = dbig + comp_off;
-                hc[rg][i] = (size_t)pages[i].comp;
-                hu[rg][i] = (size_t)pages[i].uncomp;
-                hup[rg][i] = ubig + uoff;
-                up_off[i] = uoff;
-                comp_off += align8((size_t)pages[i].comp);
-                uoff += align8((size_t)pages[i].uncomp);
-            }
-            check(cudaMemcpyAsync(d_cptrs, hp[rg].data(), sizeof(void *) * npages, cudaMemcpyHostToDevice, stream), "cp cptrs");
-            check(cudaMemcpyAsync(d_cbytes, hc[rg].data(), sizeof(size_t) * npages, cudaMemcpyHostToDevice, stream), "cp cbytes");
-            check(cudaMemcpyAsync(d_ubytes, hu[rg].data(), sizeof(size_t) * npages, cudaMemcpyHostToDevice, stream), "cp ubytes");
-            check(cudaMemcpyAsync(d_uptrs, hup[rg].data(), sizeof(void *) * npages, cudaMemcpyHostToDevice, stream), "cp uptrs");
-
-            if (nvcompBatchedSnappyDecompressAsync(d_cptrs, d_cbytes, d_ubytes, d_actual, npages,
+        // --- ONE batched Snappy decompress over every page, then a guard kernel
+        // that ORs the per-page statuses into d_overflow (stream-ordered, no
+        // host sync). This fills the GPU: ~3400 chunks instead of 489x7. ---
+        if (overflow == 0) {
+            if (nvcompBatchedSnappyDecompressAsync(d_cptrs, d_cbytes, d_ubytes, d_actual, total_pages,
                     d_temp, max_temp, d_uptrs, opts, (nvcompStatus_t *)d_stat, stream) != nvcompSuccess)
                 overflow = 1;
-            // Catch a decompress failure without a sync: a guard kernel ORs the
-            // per-page statuses into d_overflow, stream-ordered after decompress.
-            check_stat_kernel<<<1, 1, 0, stream>>>(d_stat, npages, d_overflow);
+            check_stat_kernel<<<1, 1, 0, stream>>>(d_stat, (int)total_pages, d_overflow);
+        }
+#ifdef RYUDB_SCAN_PROFILE
+        check(cudaStreamSynchronize(stream), "prof nvcomp sync");
+        _tm.mark("nvcomp");
+#endif
+
+        // --- ONE batched dict-index decode over all dict data pages (two launches
+        // instead of ~1467 serial scan_runs+apply_runs pairs). Each dict page gets
+        // a permanent index slot in d_idxbig; the per-RG page loop below just
+        // points PageSrc.buf at the pre-decoded slot. Stream-ordered before the
+        // page kernels, so no sync needed here. ---
+        if (overflow == 0 && total_dict > 0) {
+            std::vector<const void *> h_dict_data(total_dict);
+            for (size_t s = 0; s < total_dict; s++) h_dict_data[s] = ubig + dict_data_upoff[s];
+            check(cudaMemcpyAsync(d_dict_data, h_dict_data.data(), sizeof(void *) * total_dict, cudaMemcpyHostToDevice, stream), "cp dict_data");
+            check(cudaMemcpyAsync(d_dict_n, dict_n_arr.data(), sizeof(int) * total_dict, cudaMemcpyHostToDevice, stream), "cp dict_n");
+            scan_runs_batched_kernel<<<(int)total_dict, 1, 0, stream>>>(d_dict_data, d_dict_n, d_runs, d_nruns, d_overflow, d_bw, total_dict);
+            int blocks_per_job = (max_n + THREADS - 1) / THREADS; if (blocks_per_job > 65535) blocks_per_job = 65535;
+            apply_runs_batched_kernel<<<dim3(blocks_per_job, (int)total_dict), THREADS, 0, stream>>>(
+                d_dict_data, d_dict_n, d_runs, d_nruns, d_bw, (int *)d_idxbig, max_n);
+            check(cudaGetLastError(), "dict decode launch");
+        }
+#ifdef RYUDB_SCAN_PROFILE
+        check(cudaStreamSynchronize(stream), "prof dict sync");
+        _tm.mark("dict-decode");
+#endif
+
+        // ---------- per row group: page kernel only (stream-ordered) ----------
+        // Dict index arrays were decoded ONCE above (batched), each into its own
+        // permanent d_idxbig slot -- no per-RG dict decode, no d_runs reuse, no
+        // race. This loop just wires PageSrc (buf = pre-decoded slot or PLAIN
+        // page; dict = dict page) and launches the page kernel. Bound the queue
+        // with the every-BATCH sync; the final cudaDeviceSynchronize handles tail.
+        for (int rg = 0; rg < nrg && overflow == 0; rg++) {
+            int n = cn_h[rg], npages = rg_npages[rg];
+            size_t base = (size_t)rg_start[rg];
 
             // Build PageSrc per column. Dict cols get an on-device RLE/bit-packed
             // index decode (scan_runs writes bit width to d_bw, apply_runs reads
             // it -- stream-ordered, no D2H); PLAIN cols read values at the def-
-            // level-derived offset computed inline in the page kernel.
-            if (overflow == 0) {
-                for (int c = 0; c < ncol; c++) {
-                    const uint8_t *data_ptr = nullptr, *dict_ptr = nullptr;
-                    for (int i = 0; i < npages; i++) if (pages[i].col == c) {
-                        if (pages[i].role == 1) dict_ptr = ubig + up_off[i];
-                        else data_ptr = ubig + up_off[i];
-                    }
-                    if (ck_h[c] == PK_PLAIN_RAW) {
-                        buf_host[rg][c] = data_ptr; dict_host[rg][c] = nullptr;
-                    } else {  // PK_DICT_NUMERIC_ARG
-                        int *idx_arr = (int *)(d_idxbig + (size_t)c * max_n * sizeof(int));
-                        scan_runs_kernel<<<1, 1, 0, stream>>>(data_ptr, n, d_runs, d_nruns, d_overflow, d_bw);
-                        int blocks = (n + THREADS - 1) / THREADS; if (blocks > 65535) blocks = 65535;
-                        apply_runs_kernel<<<blocks, THREADS, 0, stream>>>(data_ptr, n, d_runs, d_nruns, d_bw, idx_arr);
-                        buf_host[rg][c] = idx_arr; dict_host[rg][c] = dict_ptr;
+            // level-derived offset computed inline in the page kernel. Each
+            // page's decompressed buffer is its global ubig slice.
+            for (int c = 0; c < ncol; c++) {
+                const uint8_t *data_ptr = nullptr, *dict_ptr = nullptr;
+                for (int i = 0; i < npages; i++) {
+                    size_t gi = base + i;
+                    if (all_pages[gi].col == c) {
+                        if (all_pages[gi].role == 1) dict_ptr = ubig + g_up_off[gi];
+                        else                         data_ptr = ubig + g_up_off[gi];
                     }
                 }
-                check(cudaMemcpyAsync(d_buf, buf_host[rg].data(), sizeof(void *) * ncol, cudaMemcpyHostToDevice, stream), "cp buf");
-                check(cudaMemcpyAsync(d_dict, dict_host[rg].data(), sizeof(void *) * ncol, cudaMemcpyHostToDevice, stream), "cp dict");
-                p.n = n;
-                int blocks = (n + THREADS - 1) / THREADS; if (blocks > 65535) blocks = 65535;
-                if (strategy == STRAT_DENSE) {
-                    size_t shbytes = sizeof(double) * n_groups * nagg;
-                    page_dense_kernel<<<blocks, THREADS, shbytes, stream>>>(p, s, acc, seen, n_groups, nagg);
-                } else {
-                    page_hash_kernel<<<blocks, THREADS, 0, stream>>>(p, s, key, acc, capacity, nagg, distinct, d_overflow);
+                if (ck_h[c] == PK_PLAIN_RAW) {
+                    buf_host[rg][c] = data_ptr; dict_host[rg][c] = nullptr;
+                } else {  // PK_DICT_NUMERIC_ARG: index array pre-decoded by the
+                          // batched scan_runs/apply_runs above -- just point at its slot.
+                    int slot = dict_slot[(size_t)rg * ncol + c];
+                    int *idx_arr = (int *)(d_idxbig + (size_t)slot * max_n * sizeof(int));
+                    buf_host[rg][c] = idx_arr; dict_host[rg][c] = dict_ptr;
                 }
-                check(cudaGetLastError(), "page launch");
             }
-            // Drain the stream every BATCH row groups so the pending-op queue
-            // stays bounded (see BATCH comment above). The final cudaDeviceSynchronize
-            // after the loop handles the tail.
+            check(cudaMemcpyAsync(d_buf, buf_host[rg].data(), sizeof(void *) * ncol, cudaMemcpyHostToDevice, stream), "cp buf");
+            check(cudaMemcpyAsync(d_dict, dict_host[rg].data(), sizeof(void *) * ncol, cudaMemcpyHostToDevice, stream), "cp dict");
+            p.n = n;
+            int blocks = (n + THREADS - 1) / THREADS; if (blocks > 65535) blocks = 65535;
+            if (strategy == STRAT_DENSE) {
+                size_t shbytes = sizeof(double) * n_groups * nagg;
+                page_dense_kernel<<<blocks, THREADS, shbytes, stream>>>(p, s, acc, seen, n_groups, nagg);
+            } else {
+                page_hash_kernel<<<blocks, THREADS, 0, stream>>>(p, s, key, acc, capacity, nagg, distinct, d_overflow);
+            }
+            check(cudaGetLastError(), "page launch");
+            // Materialise this RG's decoded columns into the frame buffer at its
+            // global row offset, so the scan path can cache the GPU-resident
+            // frame for warm repeats. Reuses this RG's PageSrc s (d_buf/d_dict
+            // copied earlier this same stream iteration; same-stream ordering
+            // makes the reads safe). Skipped when no frame_ptrs were passed.
+            if (d_frame_ptrs) {
+                materialise_kernel<<<blocks, THREADS, 0, stream>>>(
+                    s, d_frame_ptrs, d_out_kind, d_row_off, rg, n, ncol);
+                check(cudaGetLastError(), "materialise launch");
+            }
             if ((rg + 1) % BATCH == 0) check(cudaStreamSynchronize(stream), "batch sync");
         }  // end row-group loop
 
@@ -1461,7 +1643,8 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
     cudaFreeHost(pin); cudaFree(dbig); cudaFree(ubig); cudaFree(d_idxbig);
     cudaFree(d_cptrs); cudaFree(d_cbytes); cudaFree(d_ubytes); cudaFree(d_actual);
     cudaFree(d_uptrs); cudaFree(d_stat); cudaFree(d_temp);
-    cudaFree(d_runs); cudaFree(d_nruns); cudaFree(d_bw); cudaFree(d_overflow);
+    cudaFree(d_runs); cudaFree(d_nruns); cudaFree(d_bw); cudaFree(d_dict_data); cudaFree(d_dict_n); cudaFree(d_overflow);
+    cudaFree(d_frame_ptrs); cudaFree(d_out_kind); cudaFree(d_row_off);
     cudaFree(d_buf); cudaFree(d_dict);
     cudaFree((void *)d_kind); cudaFree((void *)d_phys);
     cudaFree((void *)d_scale); cudaFree((void *)d_isdate);

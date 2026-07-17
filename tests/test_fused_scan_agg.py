@@ -64,13 +64,11 @@ def _pdf(df):
     return df.to_pandas() if hasattr(df, "to_pandas") else df
 
 
-@pytest.fixture(autouse=True)
-def _enable_scan_kernel(monkeypatch):
-    """The cold Parquet reader is opt-in (RYUDB_SCAN_KERNEL) because at SF10 it
-    is currently slower than the cuDF materialising fallback. These tests
-    exercise the reader itself, so enable it for the whole module; the
-    multi-key test then proves deferral *under* the enabled flag."""
-    monkeypatch.setenv("RYUDB_SCAN_KERNEL", "1")
+# Phase 5 step 3: the RYUDB_SCAN_KERNEL opt-in gate is dropped -- the cold
+# Parquet reader is the DEFAULT cold path (taken on a _scan_cache miss; each
+# test below clears the caches first, so the scan path is exercised). These
+# tests verify the reader itself; the multi-key test proves deferral still
+# holds for unsupported shapes.
 
 
 def _match(a, b):

@@ -1284,6 +1284,31 @@ def _col_type_meta(t):
     return None
 
 
+def _frame_out_kind(phys: int, scale: int, is_date: int) -> int:
+    """Store-width code consumed by ``materialise_kernel`` (mirrors fused.cu):
+    3 = datetime64[s] (int64 seconds = days*86400), 2 = float64 (decimal scale
+    folded on the device), 0 = int32, 1 = int64. Single-sources the store width
+    so the host frame dtype and the kernel store cannot diverge."""
+    if is_date:
+        return 3
+    if scale > 0:
+        return 2
+    if phys == _PHYS_I32:
+        return 0
+    return 1
+
+
+def _frame_alloc_dtype(out_kind: int) -> np.dtype:
+    """numpy dtype of the device buffer the kernel writes into. A date column
+    (out_kind 3) is written as int64 seconds and ``astype``'d to
+    ``datetime64[s]`` after the call, so its alloc dtype is int64."""
+    if out_kind == 0:
+        return np.dtype("int32")
+    if out_kind == 2:
+        return np.dtype("float64")
+    return np.dtype("int64")  # 1 (int64) or 3 (date -> int64 seconds)
+
+
 def fused_scan_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     """Try to run `Aggregate -> Filter -> Scan` straight off the Parquet pages
     (cold reader) without materialising the cuDF frame. Returns a cuDF DataFrame,
@@ -1500,6 +1525,47 @@ def fused_scan_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
             acc_init = np.empty(0, dtype=np.float64)
 
         ncol = len(col_kind)
+
+        # --- Phase 5 step 3: populate Engine._scan_cache from the scan path. When
+        # the bound column set equals the Scan projection, allocate one typed
+        # non-nullable device buffer per bound column and hand each buffer's data
+        # ptr to the kernel. materialise_kernel writes every decoded value at the
+        # RG's global row offset; on success we cache the frame under the SAME key
+        # _scan uses so warm repeats hit the GPU-resident frame. proj a strict
+        # superset of the bound set -> skip (never cache a short frame); proj None
+        # -> skip.
+        #
+        # Order matters: the kernel writes the numba buffers on the scan path's
+        # custom stream, and the C++ entry syncs before returning. We build the
+        # cuDF Series from each buffer ONLY AFTER the call, so any copy as_column
+        # performs reads already-correct, sync-visible buffer data -- there is no
+        # async copy racing the kernel (which previously clobbered writes with
+        # stale recycled-buffer data, seen as scattered NaN). column_empty is
+        # all-null and would mask the kernel's writes, so the numba->as_column
+        # path (non-nullable) is used. frame_bufs keeps the buffers alive through
+        # the call (the kernel's write targets).
+        import cudf
+        import cudf.core.column as _cc
+        frame_ptrs: list[int] = []
+        frame_out_kind: list[int] = []
+        frame_bufs: list = []
+        frame_meta: list[tuple[str, int]] = []
+        idx_name: dict[int, str] = {}
+        populate = False
+        proj = filt.input.columns
+        if engine.cache_enabled and proj is not None and set(name_idx) == set(proj):
+            assert len(chunk_nvals) == nrg * ncol, (len(chunk_nvals), nrg, ncol)
+            total_rows = int(sum(chunk_nvals[:nrg]))  # col-major: col 0's per-RG counts
+            idx_name = {v: k for k, v in name_idx.items()}
+            populate = True
+            for c in range(ncol):
+                ok = _frame_out_kind(col_phys[c], col_scale[c], col_is_date[c])
+                buf = cuda.device_array(total_rows, dtype=_frame_alloc_dtype(ok))
+                frame_bufs.append(buf)
+                frame_ptrs.append(int(buf.__cuda_array_interface__["data"][0]))
+                frame_out_kind.append(ok)
+                frame_meta.append((idx_name[c], ok))
+
         overflow, n_out, keys_list, aggs_list = _kernels.fused_scan_agg(
             path, int(ncol), int(nrg),
             np.array(chunk_off, dtype=np.int64),
@@ -1519,7 +1585,10 @@ def fused_scan_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
             np.array(tok_col, dtype=np.int32),
             np.array(tok_lit, dtype=np.float64),
             np.array(tok_op, dtype=np.int32),
-            acc_init, int(strategy), int(n_groups), int(capacity),
+            acc_init,
+            np.array(frame_ptrs, dtype=np.int64),
+            np.array(frame_out_kind, dtype=np.int32),
+            int(strategy), int(n_groups), int(capacity),
         )
     except _Defer as _e:
         import os as _os
@@ -1541,6 +1610,26 @@ def fused_scan_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
         if _os.environ.get("RYUDB_SCAN_DEBUG"):
             print("[scan_agg] kernel overflow =", overflow)
         return None  # decompress/decode/hash-table error -> cuDF fallback
+
+    # Cache the materialised frame so warm repeats hit the GPU-resident frame
+    # instead of re-reading Parquet. overflow == 0 here, so every RG wrote its
+    # full row range into the per-column numba buffers (the kernel's write
+    # targets, now sync-visible). Build the cuDF Series from those buffers NOW --
+    # any copy as_column performs reads correct data (no race with the kernel,
+    # which already completed under the C++ entry's final sync). Date columns
+    # (out_kind 3) were written as int64 seconds -> astype datetime64[s] to match
+    # the date dtype family storage.scan produces; the warm path is unit-agnostic
+    # via _to_int64_seconds. Never reached when populate is False (no buffers).
+    if populate:
+        cols_out: dict[str, "cudf.Series"] = {}
+        for c, (name, ok) in enumerate(frame_meta):
+            series = cudf.Series._from_column(_cc.as_column(frame_bufs[c]))
+            if ok == 3:
+                series = series.astype("datetime64[s]")
+            cols_out[name] = series
+        engine._scan_cache[(filt.input.table, frozenset(proj))] = cudf.DataFrame(
+            {n: cols_out[n] for n in sorted(proj)}
+        )
 
     is_global = ngkey == 0
     if is_global and n_out == 0:

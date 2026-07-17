@@ -7,8 +7,6 @@ RangeIndex so that Series and scalar broadcasts line up in Project/Aggregate.
 
 from __future__ import annotations
 
-import os
-
 import cudf
 
 from ..catalog import Catalog
@@ -171,20 +169,25 @@ class Engine:
         # copying ~98% of 60M rows and cuts compute roughly in half.
         in_node = node.input
         if isinstance(in_node, Filter):
-            # Phase 5: the cold Parquet reader runs the whole Aggregate -> Filter
-            # -> Scan straight off the Parquet pages (nvCOMP Snappy -> decode ->
-            # filter -> accumulate) WITHOUT materialising the 60M-row cuDF frame.
-            # It is CORRECT and safely defers (None -> path below; correctness
-            # never depends on it), but at SF10 it is currently SLOWER than the
-            # cuDF materialising fallback: nvCOMP is invoked once per row group
-            # with ~7 chunks each, which underutilises the 82-SM GPU, and the
-            # dict-index decode is single-threaded per row group (see
-            # BENCHMARK.md). So it is OPT-IN via RYUDB_SCAN_KERNEL until a single
-            # batched nvCOMP call + parallel dict decode make it the cold winner.
-            if os.environ.get("RYUDB_SCAN_KERNEL"):
-                res = fused_scan_aggregate(node, self)
-                if res is not None:
-                    return res
+            # Phase 5 step 3: the cold Parquet reader runs the whole Aggregate ->
+            # Filter -> Scan straight off the Parquet pages (nvCOMP Snappy ->
+            # decode -> filter -> accumulate) WITHOUT materialising the 60M-row
+            # cuDF frame, and on success populates _scan_cache (keyed identically
+            # to _scan) so warm repeats hit the GPU-resident frame. It is the
+            # DEFAULT cold path now (the RYUDB_SCAN_KERNEL opt-in gate is dropped):
+            # try it only on a cache miss -- a hit means a prior cold run already
+            # cached the frame, so skip straight to the materialising path below
+            # which reads that cached frame. Returns None for unsupported shapes
+            # and on any C++/metadata fault (correctness never depends on it) ->
+            # cuDF fallback below, which also populates the cache via _scan.
+            scan_node = in_node.input
+            if isinstance(scan_node, Scan):
+                _skey = (scan_node.table,
+                         frozenset(scan_node.columns) if scan_node.columns else None)
+                if _skey not in self._scan_cache:
+                    res = fused_scan_aggregate(node, self)
+                    if res is not None:
+                        return res
             child = self._exec(in_node.input)
             # Phase 3b/4: try the fused C++/CUDA filter+groupby+aggregate kernel
             # first -- it now handles grouped AND global aggregates, and the
