@@ -206,6 +206,63 @@ on the custom stream and clobbered them with stale recycled-buffer data (scatter
 NaN, only under prior GPU load). Fix: build the cuDF Series from the numba buffers
 **after** the kernel call (post-sync), so any copy reads already-correct data.
 
+### Phase 5 step 4: async/background materialise (this round)
+
+Step 3's synchronous materialise blocks the cold return (the gather runs on the
+scan stream before the host returns the aggregate), eroding the pre-step-3 cold
+win. Step 4 moves the gather to a **non-blocking side CUDA stream** so the cold
+query returns the aggregate *before* the gather finishes; the first warm read
+waits on a recorded event (`E_mat`) only if the gather hasn't completed.
+
+Design (see `ryudb/kernels/fused.cu` + `ryudb/exec/fused.py` + `executor.py`):
+the per-RG scan loop is unchanged (page kernels on `stream`, periodic 16-RG
+syncs). After the loop, stable per-RG pointer arrays (`d_buf_all`/`d_dict_all`,
+one H2D each) are uploaded on `stream`; `E_page` captures all scan writes; the
+`materialise_kernel` launches per-RG on `stream2` (non-blocking, so the
+default-stream read-out doesn't wait for it), then `E_mat` is recorded. The cold
+return syncs **only** `stream` (and the default stream for `compact_kernel`) —
+not `stream2` — so the host returns while the gather runs. Every device
+allocation the gather reads (`ubig`, `d_idxbig`, `d_buf_all`, `d_dict_all`,
+`d_row_off`, `d_frame_ptrs`, `d_out_kind`, `d_kind/d_phys/d_scale`) is moved into
+a `PendingMatCtx` registry keyed by a returned `pending_id`; `fused_scan_finalize
+(id)` is the **sole freer** (called on the first warm read or on
+`clear_scan_cache`). The Python side stores a `_PendingFrame` in `_scan_cache`
+and lazily builds the cuDF Series in `.get()` **after** the `E_mat` sync —
+preserving the step-3 `as_column` race fix. Kill switch
+`RYUDB_ASYNC_MATERIALISE=0` restores the synchronous path (`pending_id==0`).
+
+Measured at SF10 (min of 3, async path = default):
+
+| query | ryu cold (async) | ryu cold (sync kill-switch) | ryu warm | duckdb | warm x |
+|---|---|---|---|---|---|
+| Q6 filter + global agg | 298.8 | 307.9 | **23.2** | 58.9 | **2.54x** ✓ |
+| scan + 5 aggs (global) | 349.9 | 361.4 | **34.1** | 58.6 | **1.72x** ✓ |
+| Q high-card orderkey | 924.8 | 960.9 | **687.6** | 1204.3 | **1.75x** ✓ |
+
+**Warm is fully preserved** (23.2 / 34.1 / 687.6 vs step-3's 23.8 / 34.6 / 685.3
+— noise; all three still beat DuckDB warm). Cold drops vs the sync kill-switch
+on every query (-9 / -12 / -36 ms), confirming the gather is genuinely off the
+scan stream and the cold return is no longer blocked by it. 64 tests pass (incl.
+4 in `test_scan_cache_populate.py`: cold stores a `_PendingFrame`, warm `.get()`
+matches `storage.scan` + DuckDB, `clear_scan_cache` finalizes pending, kill
+switch → `pending_id==0` + ready DataFrame), 3× clean.
+
+**Honest result — the cold recovery is partial, not the full pre-step-3 win.**
+The plan expected cold back to ~230 / ~270 / ~880; measured 299 / 350 / 925.
+Empirically the synchronous gather only costs ~9–36 ms of cold (the sync-vs-async
+delta), far less than the ~70–95 ms estimated — most of the cold time is the
+scan + nvCOMP decode + accumulate itself, not the gather. So hiding the gather
+behind the inter-query gap recovers a modest 3–4 %. The win is larger in a real
+interactive workload (the gather hides behind user think time, which the tight
+bench loop doesn't model) and for the biggest gather (`high_card`, -36 ms). A
+bigger cold win would need overlapping the gather with the scan itself (per-RG
+side-stream launches with per-RG events during the loop) — a riskier change left
+as the next follow-up. The `cudaMalloc(d_buf_all/d_dict_all)` on the post-loop
+host critical path is a smaller residual; pre-allocating those before the loop is
+a low-risk future tweak. Correctness never depends on the async path: a failed
+`cudaStreamCreate`/`cudaEventCreate` falls back to the sync materialise; a
+`_PendingFrame.get()` failure drops the cache and falls through to `storage.scan`.
+
 Also fixed this round: PLAIN values are read with **byte-wise unaligned loads**
 (Parquet `values_off = 4 + deflen` is data-dependent and not 8-byte aligned, so
 `((const long long*)base)[i]` faulted with `cudaErrorMisalignedAddress` on the
