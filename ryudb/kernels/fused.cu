@@ -35,7 +35,7 @@ static constexpr int TK_COL = 0, TK_LIT = 1, TK_OP = 2;
 // token op codes
 static constexpr int TOP_ADD = 1, TOP_SUB = 2, TOP_MUL = 3, TOP_DIV = 4;
 // agg kinds
-static constexpr int AGG_COUNT = 0, AGG_SUM = 1;
+static constexpr int AGG_COUNT = 0, AGG_SUM = 1, AGG_MIN = 2, AGG_MAX = 3, AGG_AVG = 4;
 // strategies
 static constexpr int STRAT_DENSE = 0, STRAT_HASH = 1;
 
@@ -111,11 +111,52 @@ __device__ inline double eval_agg(const Plan &p, int i, int agg) {
 }
 
 // ---------------- DENSE ----------------
+//
+// Per-group accumulator slot init/semantics depend on the agg kind:
+//   COUNT/SUM/AVG -> 0.0 (additive; AVG stores a running sum, divided at read-out)
+//   MIN -> +inf   (reduced by atomic_min_d)
+//   MAX -> -inf   (raised by atomic_max_d)
+// `nagg` here is the INTERNAL slot count (visible aggs + one hidden per-group
+// passing-row-count slot when any AVG is present, kind=AGG_COUNT). The hidden
+// slot is the denominator for AVG and is not emitted as an output column.
+static __device__ inline double init_for_kind(int kind) {
+    if (kind == AGG_MIN) return __longlong_as_double(0x7ff0000000000000ULL);   // +inf
+    if (kind == AGG_MAX) return __longlong_as_double(0xfff0000000000000ULL);   // -inf
+    return 0.0;
+}
+
+// CUDA has no double atomicMin/atomicMax; use a compare-and-swap loop on the
+// 64-bit bit pattern. Works on both global and shared memory.
+static __device__ inline double atomic_min_d(double *addr, double val) {
+    unsigned long long *a = (unsigned long long *)addr;
+    unsigned long long old = *a, assumed;
+    do {
+        assumed = old;
+        double cur = __longlong_as_double(assumed);
+        double nv = (val < cur) ? val : cur;
+        old = atomicCAS(a, assumed, __double_as_longlong(nv));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+
+static __device__ inline double atomic_max_d(double *addr, double val) {
+    unsigned long long *a = (unsigned long long *)addr;
+    unsigned long long old = *a, assumed;
+    do {
+        assumed = old;
+        double cur = __longlong_as_double(assumed);
+        double nv = (val > cur) ? val : cur;
+        old = atomicCAS(a, assumed, __double_as_longlong(nv));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+
 __global__ void dense_kernel(Plan p, double *acc, int *seen, int n_groups, int nagg) {
     extern __shared__ double sh[];
     int t = threadIdx.x;
     int nga = n_groups * nagg;
-    for (int k = t; k < nga; k += blockDim.x) sh[k] = 0.0;
+    // Per-slot init by agg kind (slot a = k % nagg).
+    for (int k = t; k < nga; k += blockDim.x) sh[k] = init_for_kind(p.agg_kind[k % nagg]);
     __syncthreads();
     for (int i = blockIdx.x * blockDim.x + t; i < p.n; i += gridDim.x * blockDim.x) {
         if (!pass_pred(p, i)) continue;
@@ -124,13 +165,27 @@ __global__ void dense_kernel(Plan p, double *acc, int *seen, int n_groups, int n
             g += ((const long long *)p.cols[p.gkey_idx[j]])[i] * p.gkey_stride[j];
         if (g < 0 || g >= n_groups) continue;
         for (int a = 0; a < p.nagg; a++) {
-            double val = p.agg_kind[a] == AGG_COUNT ? 1.0 : eval_agg(p, i, a);
-            atomicAdd(&sh[g * nagg + a], val);
+            int kind = p.agg_kind[a];
+            double *slot = &sh[g * nagg + a];
+            if (kind == AGG_MIN) {
+                atomic_min_d(slot, eval_agg(p, i, a));
+            } else if (kind == AGG_MAX) {
+                atomic_max_d(slot, eval_agg(p, i, a));
+            } else {
+                double val = kind == AGG_COUNT ? 1.0 : eval_agg(p, i, a);
+                atomicAdd(slot, val);  // SUM, AVG (running sum), hidden COUNT
+            }
         }
         atomicMax(&seen[g], 1);
     }
     __syncthreads();
-    for (int k = t; k < nga; k += blockDim.x) atomicAdd(&acc[k], sh[k]);
+    // Cross-block reduce: MIN/MAX reduce by min/max, the rest by add.
+    for (int k = t; k < nga; k += blockDim.x) {
+        int kind = p.agg_kind[k % nagg];
+        if (kind == AGG_MIN) atomic_min_d(&acc[k], sh[k]);
+        else if (kind == AGG_MAX) atomic_max_d(&acc[k], sh[k]);
+        else atomicAdd(&acc[k], sh[k]);
+    }
 }
 
 // ---------------- HASH (single int64 group key, lock-free) ----------------
@@ -226,6 +281,8 @@ static T *np_dev(py::array_t<T> arr) {
 //   agg_kind            : int32 (nagg)  0=COUNT,1=SUM
 //   agg_tok_start,agg_tok_len : int32 (nagg)
 //   tok_kind : int32 (ntok)  tok_col : int32 (ntok)  tok_lit : float64 (ntok)  tok_op : int32 (ntok)
+//   acc_init : float64 (n_groups*nagg for DENSE; empty for HASH) per-slot init
+//              (+inf for MIN, -inf for MAX, 0 otherwise). Empty -> memset 0.
 //   strategy  : int (0=DENSE,1=HASH)
 //   n_groups  : int (DENSE)   capacity : int (HASH, power of two)
 //
@@ -234,6 +291,9 @@ static T *np_dev(py::array_t<T> arr) {
 //   overflow != 0 means the hash table filled -> caller falls back to cuDF.
 //   keys[i] is the int64 code/value column for group key i (n_out rows);
 //   aggs[a] is the float64 accumulator column for aggregate a (n_out rows).
+//   nagg is the INTERNAL slot count: visible aggs followed by one hidden
+//   AGG_COUNT slot when any AVG is present (the per-group passing-row count,
+//   used as the AVG denominator at read-out; not emitted as an output column).
 py::tuple fused_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes,
                     py::array_t<int> gkey_idx, py::array_t<long long> gkey_stride,
                     py::array_t<int> pred_col, py::array_t<int> pred_op,
@@ -241,6 +301,7 @@ py::tuple fused_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes
                     py::array_t<int> agg_tok_start, py::array_t<int> agg_tok_len,
                     py::array_t<int> tok_kind, py::array_t<int> tok_col,
                     py::array_t<double> tok_lit, py::array_t<int> tok_op,
+                    py::array_t<double> acc_init,
                     int strategy, int n_groups, int capacity, int n_rows) {
     int ncol = (int)col_ptrs.shape(0);
     int nagg = (int)agg_kind.shape(0);
@@ -292,7 +353,16 @@ py::tuple fused_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes
         int *seen = nullptr;
         check(cudaMalloc(&acc, sizeof(double) * nga), "malloc acc dense");
         check(cudaMalloc(&seen, sizeof(int) * n_groups), "malloc seen");
-        check(cudaMemset(acc, 0, sizeof(double) * nga), "memset acc");
+        // Initialise accumulators per agg kind (+inf/-inf for MIN/MAX, 0 else).
+        // acc_init is n_groups*nagg; if empty (shouldn't happen for DENSE) fall
+        // back to a zero memset.
+        auto init_info = acc_init.request();
+        if (init_info.ndim > 0 && init_info.shape[0] > 0) {
+            check(cudaMemcpy(acc, init_info.ptr, sizeof(double) * nga, cudaMemcpyHostToDevice),
+                  "cp acc_init");
+        } else {
+            check(cudaMemset(acc, 0, sizeof(double) * nga), "memset acc");
+        }
         check(cudaMemset(seen, 0, sizeof(int) * n_groups), "memset seen");
         size_t shbytes = sizeof(double) * nga;
         dense_kernel<<<blocks, THREADS, shbytes>>>(p, acc, seen, n_groups, nagg);

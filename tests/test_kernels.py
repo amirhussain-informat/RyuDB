@@ -41,6 +41,7 @@ def hc_dir(tmp_path_factory):
         "l_quantity": rng.uniform(1, 50, size=n),
         "l_extendedprice": rng.uniform(10, 100, size=n),
         "l_discount": rng.uniform(0, 0.5, size=n),
+        "l_tax": rng.uniform(0, 0.2, size=n),
         "l_shipdate": pd.to_datetime(
             rng.choice(pd.date_range("1998-01-01", "1998-12-31"), size=n)
         ),
@@ -79,7 +80,7 @@ def _match(a, b):
     for c in cols:
         try:
             assert np.allclose(pa[c].astype(float).values, pb[c].astype(float).values,
-                                rtol=1e-6, atol=1e-2)
+                                rtol=1e-6, atol=1e-2, equal_nan=True)
         except (ValueError, TypeError):
             assert list(pa[c]) == list(pb[c])
 
@@ -190,3 +191,90 @@ def test_fallback_when_extension_disabled(hc_engine, hc_duck):
         _match(hc_engine.sql(HC_ORDERKEY), hc_duck.execute(HC_ORDERKEY).fetchdf())
     finally:
         fused._kernels.is_available = saved
+
+
+# --- Phase 4: fused global aggregate + MIN/MAX/AVG -------------------------- #
+
+GLOBAL_AGG = """
+    SELECT count(*) AS n, sum(l_extendedprice) AS s, avg(l_quantity) AS q,
+           min(l_discount) AS md, max(l_tax) AS mt
+      FROM lineitem
+     WHERE l_quantity > 25
+"""
+
+GLOBAL_AGG_EMPTY = """
+    SELECT count(*) AS n, sum(l_extendedprice) AS s, avg(l_quantity) AS q,
+           min(l_discount) AS md, max(l_tax) AS mt
+      FROM lineitem
+     WHERE l_quantity > 100000
+"""
+
+GROUPED_MINMAXAVG = """
+    SELECT l_returnflag, l_linestatus,
+           min(l_quantity) AS qmin, max(l_quantity) AS qmax,
+           avg(l_extendedprice) AS eavg, sum(l_discount) AS dsum, count(*) AS n
+      FROM lineitem
+     WHERE l_shipdate <= date '1998-09-02'
+     GROUP BY l_returnflag, l_linestatus
+     ORDER BY l_returnflag, l_linestatus
+"""
+
+HASH_MIN_GUARD = """
+    SELECT l_orderkey, min(l_quantity) AS qmin, max(l_extendedprice) AS emax
+      FROM lineitem
+     WHERE l_shipdate <= date '1998-09-02'
+     GROUP BY l_orderkey
+"""
+
+
+def test_global_aggregate_matches_duckdb(hc_engine, hc_duck):
+    """A global aggregate (no GROUP BY) with count/sum/avg/min/max runs through
+    the fused C++ DENSE path (n_groups=1) and matches DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    agg = _agg_node(GLOBAL_AGG, hc_engine)
+    child = hc_engine._exec(agg.input.input)
+    res = fused.fused_aggregate(agg, child, hc_engine)
+    assert res is not None, "global agg should hit the C++ DENSE path"
+    assert len(res) == 1
+    _match(hc_engine.sql(GLOBAL_AGG), hc_duck.execute(GLOBAL_AGG).fetchdf())
+
+
+def test_global_aggregate_empty_matches_duckdb(hc_engine, hc_duck):
+    """A global aggregate over zero matching rows returns ONE row with count=0
+    and NULL (NaN) for sum/avg/min/max -- SQL semantics, matching DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    agg = _agg_node(GLOBAL_AGG_EMPTY, hc_engine)
+    child = hc_engine._exec(agg.input.input)
+    res = fused.fused_aggregate(agg, child, hc_engine)
+    assert res is not None
+    assert len(res) == 1
+    pdf = res.to_pandas()
+    assert int(pdf["n"].iloc[0]) == 0
+    assert np.isnan(float(pdf["s"].iloc[0]))
+    _match(hc_engine.sql(GLOBAL_AGG_EMPTY), hc_duck.execute(GLOBAL_AGG_EMPTY).fetchdf())
+
+
+def test_grouped_minmaxavg_matches_duckdb(hc_engine, hc_duck):
+    """Low-cardinality grouped aggregate with min/max/avg/sum/count runs through
+    the C++ DENSE path and matches DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    agg = _agg_node(GROUPED_MINMAXAVG, hc_engine)
+    child = hc_engine._exec(agg.input.input)
+    res = fused.fused_aggregate(agg, child, hc_engine)
+    assert res is not None, "grouped min/max/avg should hit the C++ DENSE path"
+    _match(hc_engine.sql(GROUPED_MINMAXAVG), hc_duck.execute(GROUPED_MINMAXAVG).fetchdf())
+
+
+def test_hash_min_max_guard_defers(hc_engine, hc_duck):
+    """MIN/MAX over a high-cardinality numeric GROUP BY (HASH path) is NOT
+    supported by the C++ hash kernel -> fused_aggregate returns None and the
+    query falls back to cuDF, still matching DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    agg = _agg_node(HASH_MIN_GUARD, hc_engine)
+    child = hc_engine._exec(agg.input.input)
+    assert fused.fused_aggregate(agg, child, hc_engine) is None
+    _match(hc_engine.sql(HASH_MIN_GUARD), hc_duck.execute(HASH_MIN_GUARD).fetchdf())

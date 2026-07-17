@@ -55,7 +55,7 @@ _DT_INT64, _DT_FLOAT64 = 0, 1
 _OP = {"=": 0, "!=": 1, "<": 2, "<=": 3, ">": 4, ">=": 5}
 _TOP = {"+": 1, "-": 2, "*": 3, "/": 4}
 _TK_COL, _TK_LIT, _TK_OP = 0, 1, 2
-_AGG_COUNT, _AGG_SUM = 0, 1
+_AGG_COUNT, _AGG_SUM, _AGG_MIN, _AGG_MAX, _AGG_AVG = 0, 1, 2, 3, 4
 _STRAT_DENSE, _STRAT_HASH = 0, 1
 # Hash-table accumulator memory budget (bytes) and slot cap. Sized from row count
 # (catalog has no NDV): capacity = next_pow2(min(n, 2**25, BUDGET//(nagg*8))).
@@ -78,6 +78,10 @@ def fused_aggregate(node: Aggregate, child, engine=None) -> "cudf.DataFrame | No
 
     n = len(child)
     if n == 0:
+        # A global aggregate (no GROUP BY) still returns one row with COUNT=0 and
+        # NULL for the other aggs; a grouped aggregate returns zero rows.
+        if not spec["group_keys"]:
+            return _global_null_result(spec)
         return _empty_result(spec)
 
     # Phase 3b: prefer the C++/CUDA backend (nvcc+pybind11) when built. It handles
@@ -98,6 +102,12 @@ def fused_aggregate(node: Aggregate, child, engine=None) -> "cudf.DataFrame | No
     # walk the subtree for a Scan). Falls back to None -> no caching. (`table` was
     # already computed above for the C++ path; reuse it here.)
     # ---- data prep ------------------------------------------------------- #
+    # The Numba dense kernel only supports grouped COUNT(*) and SUM; AVG/MIN/MAX
+    # and the global-aggregate shape are handled by the C++ path above. If we get
+    # here with an unsupported shape, bail so the executor falls back to cuDF.
+    if not spec["group_keys"] or any(af.func in ("AVG", "MIN", "MAX") for af, _ in spec["aggs"]):
+        return None
+
     # Factorise each group-key column to int codes; compute row-major strides
     # (last key varies fastest, stride 1). Use the engine's code cache when
     # available so warm repeats skip cuDF's 460 ms hash-factorize.
@@ -180,23 +190,29 @@ def _match(node: Aggregate, child) -> "dict | None":
 
     group_keys = node.group_keys
     aggs = node.aggs
-    if not group_keys:
-        return None  # global aggregate handled elsewhere
+    # NOTE: empty group_keys is allowed -- a global aggregate (single group).
 
     # Group keys must be plain columns present in the frame.
     for ge, _gn in group_keys:
         if not isinstance(ge, Col) or ge.name not in child.columns:
             return None
 
-    # Aggregates: COUNT(*) or SUM(arithmetic expr over numeric cols/lits).
+    # Aggregates: COUNT(*), or SUM/AVG/MIN/MAX over a numeric arithmetic expr.
+    # COUNT(col) is deferred (the kernel counts passing rows, not non-nulls).
+    # AVG/MIN/MAX require their arg columns to be non-null: the kernel reads raw
+    # device values and does not skip nulls, and AVG = sum / passing-row-count is
+    # only correct when the arg is non-null on every passing row. Nullable args
+    # defer to cuDF (which skips nulls correctly).
     for af, _n in aggs:
         if af.func == "COUNT" and isinstance(af.arg, Star):
             continue
-        if af.func == "SUM":
+        if af.func in ("SUM", "AVG", "MIN", "MAX"):
             if not _is_numeric_expr(af.arg, child):
                 return None
+            if af.func in ("AVG", "MIN", "MAX") and not _arg_cols_nonnull(af.arg, child):
+                return None
             continue
-        return None  # COUNT(col), AVG, MIN, MAX -> fall back
+        return None  # COUNT(col) and anything else -> fall back
 
     # Predicate: conjunction of Col OP literal comparisons (numeric/datetime).
     if not _is_supported_predicate(pred, child):
@@ -221,6 +237,14 @@ def _match(node: Aggregate, child) -> "dict | None":
         "predicate": pred,
         "cols_used": sorted(cols_used),
     }
+
+
+def _arg_cols_nonnull(e, child) -> bool:
+    """True if every column referenced by `e` has no nulls (kernel skips nothing)."""
+    for name in e.columns():
+        if name not in child.columns or child[name].null_count != 0:
+            return False
+    return True
 
 
 def _is_numeric_expr(e, child) -> bool:
@@ -470,6 +494,20 @@ def _empty_result(spec):
     return cudf.DataFrame(data)
 
 
+def _global_null_result(spec):
+    """One-row result for a global aggregate over zero matching rows: COUNT(*)=0
+    and NULL (NaN) for every other aggregate (SQL semantics)."""
+    import cudf
+
+    data: dict = {}
+    for af, n in spec["aggs"]:
+        if af.func == "COUNT" and isinstance(af.arg, Star):
+            data[n] = cudf.Series([0], dtype=np.int64)
+        else:
+            data[n] = cudf.Series([np.nan], dtype=np.float64)
+    return cudf.DataFrame(data)
+
+
 # --------------------------------------------------------------------------- #
 # C++/CUDA backend (nvcc + pybind11): descriptor lowering + frame assembly
 # --------------------------------------------------------------------------- #
@@ -558,6 +596,11 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
     n = len(child)
     nagg = len(spec["aggs"])
     ngkey = len(spec["group_keys"])
+    # AVG stores a running sum + needs a hidden per-group passing-row count slot
+    # (the denominator). nagg_eff is the true internal slot count, used for the
+    # dense-accumulator shared-memory gate.
+    has_avg = any(af.func == "AVG" for af, _ in spec["aggs"])
+    nagg_eff = nagg + (1 if has_avg else 0)
 
     # Column binding: name -> index for predicate/agg-arg cols; group-key arrays
     # get their own indices appended (they may bind codes, not the raw column).
@@ -605,7 +648,14 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
 
     all_numeric = all(_numeric_key(ge) for ge, _ in spec["group_keys"])
 
-    if all_numeric:
+    if ngkey == 0:
+        # Global aggregate (no GROUP BY): a single group, no keys. Always DENSE
+        # with n_groups=1. (all([]) is True, so without this guard the empty-keys
+        # case would wrongly enter the HASH branch and hit the ngkey!=1 check.)
+        strategy = _STRAT_DENSE
+        n_groups = 1
+        capacity = 0
+    elif all_numeric:
         # HASH direct: bind the group key as an int64 array (datetime -> seconds).
         # The C++ hash kernel handles a SINGLE int64 group key only (it reads
         # p.gkey_idx[0] and uses atomicCAS-on-key). Multi-column numeric GROUP BY
@@ -652,8 +702,8 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
         for j in range(len(sizes)):
             gkey_stride.append(int(np.prod(sizes[j + 1:], dtype=np.int64)))
         n_groups = int(np.prod(sizes, dtype=np.int64)) if sizes else 1
-        if n_groups * nagg > MAX_ACC_CELLS:
-            return None  # string high-card -> defer to cuDF
+        if n_groups * nagg_eff > MAX_ACC_CELLS:
+            return None  # too many accumulator cells (incl. hidden AVG count) -> cuDF
         strategy = _STRAT_DENSE
 
     # --- predicate (conjunction only) ---
@@ -665,6 +715,12 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
     pred_lit = np.array([p[2] for p in pred], dtype=np.float64)
 
     # --- aggregates ---
+    # Kind per visible agg. AVG stores a running SUM in its slot and is divided by
+    # a hidden per-group passing-row-count slot at read-out; in-kernel AVG behaves
+    # exactly like SUM. The hidden count slot (one, when any AVG is present) is
+    # appended after the visible aggs as an AGG_COUNT with empty tokens.
+    _AGG_KIND = {"COUNT": _AGG_COUNT, "SUM": _AGG_SUM, "AVG": _AGG_AVG,
+                 "MIN": _AGG_MIN, "MAX": _AGG_MAX}
     agg_kind: list[int] = []
     agg_tok_start: list[int] = []
     agg_tok_len: list[int] = []
@@ -679,7 +735,6 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
             agg_tok_start.append(start)
             agg_tok_len.append(0)
             continue
-        # SUM(expr)
         toks = _to_postfix(af.arg, bind_named)
         for k, a, b in toks:
             tok_kind.append(k)
@@ -692,9 +747,25 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
             else:
                 tok_col.append(a)
                 tok_op.append(0)
-        agg_kind.append(_AGG_SUM)
+        agg_kind.append(_AGG_KIND[af.func])
         agg_tok_start.append(start)
         agg_tok_len.append(len(toks))
+
+    # The HASH path supports SUM/COUNT only (no per-slot inf/-inf init for it).
+    # MIN/MAX/AVG over a high-card numeric key defer to cuDF.
+    if strategy == _STRAT_HASH and any(
+        k in (_AGG_MIN, _AGG_MAX, _AGG_AVG) for k in agg_kind
+    ):
+        return None
+
+    # Hidden per-group passing-row count slot: the AVG denominator. One slot,
+    # appended after the visible aggs; not emitted as an output column.
+    hidden_count_idx = None
+    if has_avg:
+        hidden_count_idx = len(agg_kind)
+        agg_kind.append(_AGG_COUNT)
+        agg_tok_start.append(len(tok_kind))
+        agg_tok_len.append(0)
 
     col_ptrs_np = np.array(col_ptrs, dtype=np.int64)
     col_dtypes_np = np.array(col_dtypes, dtype=np.int32)
@@ -708,16 +779,39 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
     agg_tok_start_np = np.array(agg_tok_start, dtype=np.int32)
     agg_tok_len_np = np.array(agg_tok_len, dtype=np.int32)
 
+    # Per-slot accumulator init: +inf for MIN, -inf for MAX, 0 otherwise. DENSE
+    # only (HASH is SUM/COUNT-only and zero-inits). Length n_groups * nagg_internal
+    # with slot a as the inner index (matches acc[g * nagg_internal + a]).
+    if strategy == _STRAT_DENSE:
+        per_slot = np.array(
+            [np.inf if k == _AGG_MIN else -np.inf if k == _AGG_MAX else 0.0
+             for k in agg_kind], dtype=np.float64,
+        )
+        acc_init = np.tile(per_slot, n_groups)
+    else:
+        acc_init = np.empty(0, dtype=np.float64)
+
     overflow, n_out, keys_list, aggs_list = _kernels.fused_agg(
         col_ptrs_np, col_dtypes_np, gkey_idx_np, gkey_stride_np,
         pred_col, pred_op, pred_lit, agg_kind_np, agg_tok_start_np, agg_tok_len_np,
-        tok_kind_np, tok_col_np, tok_lit_np, tok_op_np,
+        tok_kind_np, tok_col_np, tok_lit_np, tok_op_np, acc_init,
         int(strategy), int(n_groups), int(capacity), int(n),
     )
     if overflow != 0:
         return None  # hash table filled -> cuDF fallback
 
+    # Global aggregate (no GROUP BY): always exactly one output row. If the filter
+    # matched zero rows the kernel returns n_out=0 -> synthesize one row with
+    # COUNT=0 and NULL (NaN) for the other aggs.
+    is_global = ngkey == 0
+    if is_global and n_out == 0:
+        return _global_null_result(spec)
+
     # --- assemble cuDF frame ---
+    hidden_count = (
+        np.asarray(aggs_list[hidden_count_idx], dtype=np.float64)
+        if hidden_count_idx is not None else None
+    )
     data: dict = {}
     for j, (_ge, gn) in enumerate(spec["group_keys"]):
         codes = np.asarray(keys_list[j], dtype=np.int64)
@@ -731,6 +825,10 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
             data[gn] = cudf.Series(codes)
     for a, (af, n) in enumerate(spec["aggs"]):
         vals = np.asarray(aggs_list[a], dtype=np.float64)
+        if af.func == "AVG":
+            # Running sum / per-group passing-row count (non-null arg guaranteed).
+            with np.errstate(invalid="ignore", divide="ignore"):
+                vals = vals / hidden_count
         if af.func == "COUNT" and isinstance(af.arg, Star):
             data[n] = cudf.Series(vals.astype(np.int64))
         else:

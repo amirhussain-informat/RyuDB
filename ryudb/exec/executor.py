@@ -143,18 +143,6 @@ class Engine:
         aggs = node.aggs
         by_names = [gn for _, gn in group_keys]
 
-        # Scalar/global aggregate (no GROUP BY): one output row.
-        if not group_keys:
-            df = self._exec(node.input)
-            row: dict[str, list] = {}
-            for af, n in aggs:
-                if af.func == "COUNT" and isinstance(af.arg, Star):
-                    row[n] = [int(len(df))]
-                else:
-                    col = eval_expr(af.arg, df)
-                    row[n] = [_scalar_agg(af.func, col)]
-            return cudf.DataFrame(row)
-
         # No-gather optimization: when a Filter sits directly below the Aggregate
         # and every group key is a non-nullable column, fold the predicate into the
         # groupby by nulling the group keys of failing rows (groupby dropna drops
@@ -163,12 +151,20 @@ class Engine:
         in_node = node.input
         if isinstance(in_node, Filter):
             child = self._exec(in_node.input)
-            # Phase-3a: try a single fused filter+groupby+aggregate CUDA kernel
-            # (Numba). Returns None for unsupported shapes -> cuDF fallback below.
+            # Phase 3b/4: try the fused C++/CUDA filter+groupby+aggregate kernel
+            # first -- it now handles grouped AND global aggregates, and the
+            # SUM/AVG/MIN/MAX/COUNT(*) kinds. Returns None for unsupported shapes
+            # (no Filter match, OR predicate, COUNT(col), nullable AVG/MIN/MAX
+            # args, multi-col numeric GROUP BY, ...) -> cuDF fallback below.
             res = fused_aggregate(node, child, self)
             if res is not None:
                 return res
             mask = eval_expr(in_node.predicate, child)
+            if not group_keys:
+                # Global aggregate, fused-ineligible -> scalar reductions on the
+                # filtered frame.
+                df = child[mask] if isinstance(mask, cudf.Series) else (child if mask else child.iloc[0:0])
+                return self._scalar_global_agg(df, aggs)
             if isinstance(mask, cudf.Series) and self._keys_nonnull(child, group_keys):
                 # no-gather path mutates `work`: copy the cached pristine frame so
                 # the scan/code caches are never corrupted.
@@ -177,8 +173,24 @@ class Engine:
             df = child[mask] if isinstance(mask, cudf.Series) else (child if mask else child.iloc[0:0])
             return self._fused_agg(df, df, group_keys, aggs, by_names, dropna=False, mask=None)
 
+        # No Filter below the Aggregate.
+        if not group_keys:
+            return self._scalar_global_agg(self._exec(in_node), aggs)
         df = self._exec(in_node)
         return self._fused_agg(df, df, group_keys, aggs, by_names, dropna=False, mask=None)
+
+    def _scalar_global_agg(self, df: cudf.DataFrame, aggs) -> cudf.DataFrame:
+        """Scalar/global aggregate (no GROUP BY): one output row via cuDF
+        reductions. This is the fallback for fused-ineligible global aggregates
+        (and for `Aggregate -> Scan` shapes with no Filter)."""
+        row: dict[str, list] = {}
+        for af, n in aggs:
+            if af.func == "COUNT" and isinstance(af.arg, Star):
+                row[n] = [int(len(df))]
+            else:
+                col = eval_expr(af.arg, df)
+                row[n] = [_scalar_agg(af.func, col)]
+        return cudf.DataFrame(row)
 
     def _keys_nonnull(self, df: cudf.DataFrame, group_keys) -> bool:
         # Only fold when every group key is a plain column reference with no nulls;
