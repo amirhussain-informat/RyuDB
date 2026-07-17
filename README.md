@@ -2,7 +2,7 @@
 
 
 
-<img width="1254" height="1254" alt="ChatGPT Image Jul 18, 2026, 12_43_38 AM" src="https://github.com/user-attachments/assets/1d06adc7-1bb7-4327-81ff-3c07844fdaba" />![Uploading ChatGPT Image Jul 18, 2026, 12_43_38 AM.png…]
+<img width="1254" height="1254" alt="ChatGPT Image Jul 18, 2026, 12_43_38 AM" src="https://github.com/user-attachments/assets/1d06adc7-1bb7-4327-81ff-3c07844fdaba" />
 
 
 
