@@ -10,6 +10,7 @@ from __future__ import annotations
 import cudf
 
 from ..catalog import Catalog
+from ..delta import DeltaStore
 from ..sql.optimize import optimize
 from ..sql.parse import parse
 from ..sql.plan import (
@@ -58,6 +59,10 @@ class Engine:
         # runs is valid because uniqueness is deterministic for identical data.
         self._pk_cache: dict[tuple[str, str], bool] = {}
         self.cache_enabled: bool = True
+        # In-memory delta-store for the immutable-base write path (Phase 2).
+        # Empty by default; reads merge live batches onto the base in _scan.
+        # Step 2 leaves this empty (reads unchanged); step 3 appends INSERTs.
+        self.delta: DeltaStore = DeltaStore()
 
     def clear_scan_cache(self) -> None:
         """Clear the GPU-resident frame cache (forces a re-read on next scan).
@@ -137,13 +142,48 @@ class Engine:
                     self._scan_cache.pop(key, None)
                 else:
                     self._scan_cache[key] = v
-                    return v
+            if v is not None and not isinstance(v, _PendingFrame):
+                base = v
             else:
-                return v
-        df = scan(self.catalog.get(table), columns)
-        if self.cache_enabled:
-            self._scan_cache[key] = df
-        return df
+                base = scan(self.catalog.get(table), columns)
+                if self.cache_enabled:
+                    self._scan_cache[key] = base
+        else:
+            base = scan(self.catalog.get(table), columns)
+            if self.cache_enabled:
+                self._scan_cache[key] = base
+        # Phase 2 delta merge: concatenate any unflushed batches onto the base.
+        # The cache stays base-only (the merged frame is never written back), so
+        # the live delta is re-merged each read and a future append is visible
+        # with no invalidation. Empty delta -> return base unchanged (zero cost).
+        if self.delta.has_unflushed(table):
+            return self._merge_delta(base, table)
+        return base
+
+    def _merge_delta(self, base: cudf.DataFrame, table: str) -> cudf.DataFrame:
+        """Return base ∪ delta for ``table`` as a fresh frame (base untouched).
+
+        Each batch is cast column-wise to ``base[col].dtype`` before concat. This
+        single rule reconciles the datetime-unit divergence (cold-cache base is
+        ``datetime64[s]`` while ``storage.scan`` is ``[ms]``) and any int-width
+        difference, so concat never fails on dtype mismatch. Column order follows
+        ``base`` (already projected/sorted by ``storage.scan`` or the cold cache).
+        Batches are assumed full-schema; a missing projected column raises
+        KeyError -- a useful failure for a malformed INSERT once the write path
+        exists.
+        """
+        batches = self.delta.batches(table)
+        if not batches:
+            return base
+        cols = list(base.columns)
+        parts = [base]
+        for b in batches:
+            sub = b[cols]
+            for c in cols:
+                if sub[c].dtype != base[c].dtype:
+                    sub[c] = sub[c].astype(base[c].dtype)
+            parts.append(sub)
+        return cudf.concat(parts, axis=0).reset_index(drop=True)
 
     def sql(self, sql: str) -> cudf.DataFrame:
         plan = parse(sql, self.catalog.schema_dict())
