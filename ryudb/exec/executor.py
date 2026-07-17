@@ -102,6 +102,25 @@ class Engine:
         self._code_cache.clear()
         self._pk_cache.clear()
 
+    def _invalidate_table_caches(self, table: str) -> None:
+        """Drop this table's _code_cache/_pk_cache entries (autocommit hook).
+
+        INSERTs append rows to the delta, so the base-only factorize codes
+        (`_code_cache`) and PK-uniqueness facts (`_pk_cache`) -- both keyed by
+        just `(table, col)`, the data identity NOT in the key -- go stale: cached
+        codes are row-aligned to the pre-INSERT series length (a longer merged
+        series reads them OOB), and a cached `True` survives a duplicate-PK
+        INSERT (the fused star-join would then collapse joins). Every code/pk
+        series is obtained via `_scan(table)` for the SAME table in the key, so
+        dropping only `(table, *)` is necessary and sufficient. The scan cache is
+        base-only + live-merged in `_scan`, so it is NOT touched here. Step 5's
+        transactional commit() will reuse this hook.
+        """
+        for k in [k for k in self._code_cache if k[0] == table]:
+            del self._code_cache[k]
+        for k in [k for k in self._pk_cache if k[0] == table]:
+            del self._pk_cache[k]
+
     def is_unique_key(self, table: str, col: str, series) -> bool:
         """Return cached (table, col) uniqueness -- a dimension join key must be
         a primary key for the fused star-join path (a non-unique key would
@@ -258,6 +277,11 @@ class Engine:
                 pdf[c] = pd.array(arr, dtype=dt)
         frame = cudf.DataFrame(pd.DataFrame(pdf))
         self.delta.append(node.table, frame)
+        # Autocommit: the delta is now live. The base-only factorize codes /
+        # PK-uniqueness caches for this table are stale (length mismatch / a
+        # possible duplicate PK), so drop them -- the next SELECT re-factorizes /
+        # re-checks uniqueness on the merged series. Other tables stay cached.
+        self._invalidate_table_caches(node.table)
         return len(frame)
 
     def sql(self, sql: str) -> "cudf.DataFrame | int":
