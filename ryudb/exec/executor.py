@@ -8,15 +8,17 @@ RangeIndex so that Series and scalar broadcasts line up in Project/Aggregate.
 from __future__ import annotations
 
 import cudf
+import pandas as pd
 
 from ..catalog import Catalog
 from ..delta import DeltaStore
 from ..sql.optimize import optimize
-from ..sql.parse import parse
+from ..sql.parse import ParseError, parse
 from ..sql.plan import (
     Aggregate,
     Col,
     Filter,
+    Insert,
     Join,
     Limit,
     PlanNode,
@@ -28,11 +30,12 @@ from ..sql.plan import (
 from ..storage import scan
 from .fused import (
     _PendingFrame,
+    _arrow_match_dtype,
     fused_aggregate,
     fused_join_aggregate,
     fused_scan_aggregate,
 )
-from .ops import eval_expr
+from .ops import _literal, eval_expr
 
 _AGG_METHOD = {"SUM": "sum", "AVG": "mean", "MIN": "min", "MAX": "max", "COUNT": "count"}
 
@@ -185,28 +188,107 @@ class Engine:
             parts.append(sub)
         return cudf.concat(parts, axis=0).reset_index(drop=True)
 
-    def sql(self, sql: str) -> cudf.DataFrame:
+    def _insert(self, node: Insert) -> int:
+        """Append ``INSERT ... VALUES`` rows to the table's delta (Phase 2 step 3).
+
+        Resolves the full schema from the catalog, fills DEFAULTs for omitted
+        columns, enforces NOT NULL, builds a typed cuDF batch whose columns cast
+        cleanly to the base at merge time, and appends it to ``self.delta``. The
+        next SELECT re-merges the live delta in ``_scan`` -- this is autocommit
+        (no txn layer yet). PK/UNIQUE uniqueness is NOT enforced here (deferred
+        to step 4+); only NOT NULL + DEFAULT + type coercion. Returns the row
+        count appended.
+        """
+        info = self.catalog.get(node.table)
+        if info is None:
+            raise RuntimeError(f"unknown table: {node.table}")
+        all_cols = list(info.columns)
+        cols = list(node.columns) if node.columns is not None else list(all_cols)
+        unknown = [c for c in cols if c not in all_cols]
+        if unknown:
+            raise ParseError(f"unknown columns in {node.table}: {unknown}")
+        if len(set(cols)) != len(cols):
+            raise ParseError(f"INSERT column list has duplicates: {cols}")
+        for i, row in enumerate(node.rows):
+            if len(row) != len(cols):
+                raise ParseError(
+                    f"INSERT row {i} has {len(row)} values for {len(cols)} columns"
+                )
+
+        not_null = info.constraints.not_null
+        defaults = info.constraints.defaults
+        types = info.types
+
+        # Per-column python value lists in full-schema order (provided value,
+        # else DEFAULT, else NULL), with NOT NULL enforced on the resolved value.
+        data: dict[str, list] = {c: [] for c in all_cols}
+        provided_idx = {c: i for i, c in enumerate(cols)}
+        for row in node.rows:
+            pyvals = [_literal(cell) for cell in row]
+            for c in all_cols:
+                if c in provided_idx:
+                    v = pyvals[provided_idx[c]]
+                elif c in defaults:
+                    v = defaults[c]
+                else:
+                    v = None
+                if v is None and c in not_null:
+                    raise RuntimeError(
+                        f"NOT NULL violation: {node.table}.{c} (row {len(data[c])})"
+                    )
+                data[c].append(v)
+
+        # Build a typed pandas frame, then move to cuDF. The dtypes follow the
+        # base column families via _arrow_match_dtype (decimal->float64 matching
+        # storage._coerce_decimals, int->int64, date->datetime64[s]); since
+        # _merge_delta casts each delta column to base[c].dtype anyway, the exact
+        # unit/width here only needs to be value-preserving. Decimals are passed
+        # as float (base is float64) -- never Decimal -- so astype is trivial.
+        pdf = {}
+        for c in all_cols:
+            arr = data[c]
+            dt = _arrow_match_dtype(types[c])
+            if "datetime" in str(dt):
+                pdf[c] = pd.to_datetime(arr, errors="coerce")
+            elif str(dt).startswith("int"):
+                # Nullable Int64 so a NULL (on a nullable col) is pd.NA, not a
+                # coercion error; _merge_delta casts to base int64 at read time.
+                pdf[c] = pd.array(arr, dtype="Int64")
+            else:
+                pdf[c] = pd.array(arr, dtype=dt)
+        frame = cudf.DataFrame(pd.DataFrame(pdf))
+        self.delta.append(node.table, frame)
+        return len(frame)
+
+    def sql(self, sql: str) -> "cudf.DataFrame | int":
         plan = parse(sql, self.catalog.schema_dict())
-        plan = optimize(
-            plan,
-            self.catalog.schema_dict(),
-            self.catalog.stats_dict(),
-        )
+        # INSERT is a write leaf with no predicate/projection/join to optimize;
+        # bypass the optimizer (the rules are pass-through-safe today, but a
+        # future Select-shaped rule could choke on an Insert root).
+        if not isinstance(plan, Insert):
+            plan = optimize(
+                plan,
+                self.catalog.schema_dict(),
+                self.catalog.stats_dict(),
+            )
         return self.execute(plan)
 
     def explain(self, sql: str) -> str:
         from ..sql.plan import pretty
 
         plan = parse(sql, self.catalog.schema_dict())
-        plan = optimize(plan, self.catalog.schema_dict(), self.catalog.stats_dict())
+        if not isinstance(plan, Insert):
+            plan = optimize(plan, self.catalog.schema_dict(), self.catalog.stats_dict())
         return pretty(plan)
 
     def execute(self, plan: PlanNode) -> cudf.DataFrame:
         return self._exec(plan)
 
-    def _exec(self, node: PlanNode) -> cudf.DataFrame:
+    def _exec(self, node: PlanNode) -> "cudf.DataFrame | int":
         if isinstance(node, Scan):
             return self._scan(node.table, node.columns)
+        if isinstance(node, Insert):
+            return self._insert(node)
         if isinstance(node, Filter):
             df = self._exec(node.input)
             mask = eval_expr(node.predicate, df)

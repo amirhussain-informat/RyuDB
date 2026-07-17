@@ -145,7 +145,24 @@ class Limit:
     offset: int = 0
 
 
-PlanNode = Scan | Filter | Project | Join | Aggregate | Sort | Limit
+@dataclass
+class Insert:
+    """Write node: append literal value rows to a table's delta (Phase 2 step 3).
+
+    A leaf (no ``input``), like ``Scan``. ``columns`` is the user-supplied column
+    list (``None`` => INSERT without a column list => use the table's catalog
+    column order); ``rows`` is one ``list[Expr]`` per value row, each cell a
+    ``Lit`` lowered by the parser. The executor resolves the full schema, fills
+    DEFAULTs, enforces NOT NULL, builds a typed cuDF batch, and appends it to the
+    delta. PK/UNIQUE enforcement is deferred (step 4+).
+    """
+
+    table: str
+    columns: list[str] | None = None
+    rows: list[list[Expr]] = field(default_factory=list)
+
+
+PlanNode = Scan | Filter | Project | Join | Aggregate | Sort | Limit | Insert
 
 
 def walk(node: PlanNode):
@@ -208,6 +225,9 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
         return f"{pad}Sort({k})\n" + pretty(node.input, indent + 1)
     if isinstance(node, Limit):
         return f"{pad}Limit({node.n} offset={node.offset})\n" + pretty(node.input, indent + 1)
+    if isinstance(node, Insert):
+        cols = ",".join(node.columns) if node.columns else "*"
+        return f"{pad}Insert({node.table} cols={cols} rows={len(node.rows)})"
     return f"{pad}<{type(node).__name__}>"
 
 

@@ -83,11 +83,16 @@ def _run_statement(engine: Engine, stmt: str, quiet: bool) -> int:
             return 1
         return 0
     try:
-        df = engine.sql(stmt)
+        result = engine.sql(stmt)
     except Exception as exc:  # noqa: BLE001
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    _print_frame(df)
+    # INSERT returns an int row count (the write path mutates the delta); SELECT
+    # returns a cuDF frame to print.
+    if isinstance(result, int):
+        print(f"inserted {result} rows")
+        return 0
+    _print_frame(result)
     return 0
 
 

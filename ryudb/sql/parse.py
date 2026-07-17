@@ -28,6 +28,7 @@ from .plan import (
     Col,
     Expr,
     Filter,
+    Insert,
     Join,
     Limit,
     Lit,
@@ -54,7 +55,7 @@ class ParseError(ValueError):
 
 
 def parse(sql: str, schema: dict[str, list[str]] | None = None) -> object:
-    """Parse a single SELECT statement into a logical plan node.
+    """Parse a single SELECT or INSERT statement into a logical plan node.
 
     `schema` (table -> columns) is used to route unqualified join columns to the
     correct side of a join. When omitted, only table-qualified columns route.
@@ -63,9 +64,53 @@ def parse(sql: str, schema: dict[str, list[str]] | None = None) -> object:
     if len(statements) != 1:
         raise ParseError(f"expected exactly one statement, got {len(statements)}")
     stmt = statements[0]
-    if not isinstance(stmt, exp.Select):
-        raise ParseError(f"only SELECT is supported (got {type(stmt).__name__})")
-    return _build_select(stmt, schema)
+    if isinstance(stmt, exp.Select):
+        return _build_select(stmt, schema)
+    if isinstance(stmt, exp.Insert):
+        return _build_insert(stmt)
+    raise ParseError(f"only SELECT/INSERT is supported (got {type(stmt).__name__})")
+
+
+def _build_insert(stmt: exp.Insert) -> Insert:
+    """Lower ``INSERT INTO t [(cols)] VALUES (...),(...)`` into an Insert node.
+
+    sqlglot wraps the target in ``exp.Schema`` when a column list is present and
+    leaves it as a bare ``exp.Table`` otherwise; the value rows live in
+    ``stmt.expression`` as an ``exp.Values`` (one ``exp.Tuple`` per row). Each cell
+    is lowered with ``_expr`` to a ``Lit`` (so ``date '...'`` casts and NULLs are
+    handled by the existing expression machinery). Unsupported INSERT variants
+    (ON CONFLICT, RETURNING, WHERE, INSERT ... SELECT, ...) raise.
+    """
+    for arg in ("conflict", "returning", "where", "partition", "ignore",
+                "overwrite", "alternative", "source"):
+        if stmt.args.get(arg) is not None:
+            raise NotImplementedError(f"INSERT with {arg.upper()} is not supported yet")
+    target = stmt.this.this if isinstance(stmt.this, exp.Schema) else stmt.this
+    if not isinstance(target, exp.Table):
+        raise ParseError("INSERT target is not a table")
+    table = target.name
+    if not table:
+        raise ParseError("INSERT target has no table name")
+    cols = None
+    if isinstance(stmt.this, exp.Schema):
+        cols = [c.name for c in stmt.this.expressions]
+        if not cols or any(not c for c in cols):
+            raise ParseError("INSERT column list is empty or malformed")
+        if len(set(cols)) != len(cols):
+            raise ParseError("INSERT column list has duplicates")
+    values = stmt.expression
+    if not isinstance(values, exp.Values):
+        raise NotImplementedError("only INSERT ... VALUES is supported")
+    rows = [[_expr(cell) for cell in row.expressions] for row in values.expressions]
+    if cols is not None:
+        for i, row in enumerate(rows):
+            if len(row) != len(cols):
+                raise ParseError(
+                    f"INSERT row {i} has {len(row)} values for {len(cols)} columns"
+                )
+    if not rows:
+        raise ParseError("INSERT has no value rows")
+    return Insert(table=table, columns=cols, rows=rows)
 
 
 def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
