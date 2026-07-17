@@ -7,6 +7,8 @@ RangeIndex so that Series and scalar broadcasts line up in Project/Aggregate.
 
 from __future__ import annotations
 
+import re
+
 import cudf
 import pandas as pd
 
@@ -26,8 +28,10 @@ from ..sql.plan import (
     Scan,
     Sort,
     Star,
+    TxnControl,
 )
 from ..storage import scan
+from ..transaction import Transaction
 from .fused import (
     _PendingFrame,
     _arrow_match_dtype,
@@ -38,6 +42,12 @@ from .fused import (
 from .ops import _literal, eval_expr
 
 _AGG_METHOD = {"SUM": "sum", "AVG": "mean", "MIN": "min", "MAX": "max", "COUNT": "count"}
+
+# Non-standard snapshot/restore SQL (sqlglot has no node for these). Pre-compiled
+# and guarded by a cheap prefix check in Engine.sql/explain so the regex never
+# runs on the SELECT hot path. Mirrors cli._CREATE_RE.
+_SNAPSHOT_RE = re.compile(r"CREATE\s+SNAPSHOT\s+([A-Za-z_][\w]*)\s*;?", re.IGNORECASE)
+_RESTORE_RE = re.compile(r"RESTORE\s+TO\s+SNAPSHOT\s+([A-Za-z_][\w]*)\s*;?", re.IGNORECASE)
 
 
 class Engine:
@@ -64,8 +74,18 @@ class Engine:
         self.cache_enabled: bool = True
         # In-memory delta-store for the immutable-base write path (Phase 2).
         # Empty by default; reads merge live batches onto the base in _scan.
-        # Step 2 leaves this empty (reads unchanged); step 3 appends INSERTs.
+        # Step 2 leaves this empty (reads unchanged); step 3 appends INSERTs;
+        # step 5 tags each committed batch with a monotonic commit_ts (MVCC).
         self.delta: DeltaStore = DeltaStore()
+        # Phase 2 step 5 -- MVCC transaction layer. Single-session: at most one
+        # txn is active and no commit happens mid-txn (INSERTs buffer, not
+        # commit), so snapshot isolation is structural, not lock-based. The
+        # commit_ts is required for full snapshot restore and is forward-looking
+        # for concurrent connections. _txn/_commit_ts/_snapshots are unprotected
+        # mutable state -- the Engine is single-session/one-thread (no locks).
+        self._commit_ts: int = 0          # monotonic; bumped on each commit
+        self._txn: Transaction | None = None
+        self._snapshots: dict[str, int] = {}  # name -> commit_ts captured
 
     def clear_scan_cache(self) -> None:
         """Clear the GPU-resident frame cache (forces a re-read on next scan).
@@ -121,6 +141,110 @@ class Engine:
         for k in [k for k in self._pk_cache if k[0] == table]:
             del self._pk_cache[k]
 
+    # ------------------------------------------------------------------ #
+    # Phase 2 step 5 -- MVCC transaction layer + snapshot restore
+    # ------------------------------------------------------------------ #
+
+    def has_pending(self, table: str) -> bool:
+        """True if ``table`` has unflushed committed delta rows OR a buffered
+        in-txn write -- i.e. a read of ``table`` must merge beyond the base.
+        Public so the cold Parquet reader (fused.py) can defer to the
+        materialising _scan+merge path for both committed-delta and txn-buffer
+        states (the cold reader bypasses _scan and would otherwise miss them)."""
+        return self.delta.has_unflushed(table) or (
+            self._txn is not None and self._txn.has(table)
+        )
+
+    def _next_commit_ts(self) -> int:
+        self._commit_ts += 1
+        return self._commit_ts
+
+    def _txn_control(self, node: TxnControl) -> None:
+        if node.kind == "begin":
+            self._begin()
+        elif node.kind == "commit":
+            self._commit()
+        elif node.kind == "rollback":
+            self._rollback()
+        else:
+            raise RuntimeError(f"unknown txn control: {node.kind}")
+
+    def _begin(self) -> None:
+        if self._txn is not None:
+            raise RuntimeError("BEGIN inside an active transaction (nested txns not supported)")
+        self._txn = Transaction(snapshot_ts=self._commit_ts)
+
+    def _commit(self) -> None:
+        txn = self._txn
+        if txn is None:
+            raise RuntimeError("COMMIT without an active transaction")
+        # Flush the txn's buffered batches to the shared delta under one new ts ->
+        # atomic commit (all-or-nothing). Buffer append order is preserved, so the
+        # post-commit visible series (base ++ batches_at(snapshot) ++ buffer) is
+        # byte-identical to the in-txn read-your-writes series.
+        ts = self._next_commit_ts()
+        for table in txn.tables():
+            for frame in txn.buffer_batches(table):
+                self.delta.append(table, frame, ts)
+            self._invalidate_table_caches(table)
+        self._txn = None
+
+    def _rollback(self) -> None:
+        txn = self._txn
+        if txn is None:
+            raise RuntimeError("ROLLBACK without an active transaction")
+        # Undo only this txn's writes: discard the buffer. The committed delta is
+        # untouched (the txn never committed). Invalidate the buffered tables'
+        # caches -- a read-your-writes SELECT may have populated them against the
+        # base++buffer series; after the buffer is gone those are stale.
+        for table in txn.tables():
+            self._invalidate_table_caches(table)
+        self._txn = None
+
+    # -- snapshot / restore (full DB restore, stronger than per-txn ROLLBACK) --
+
+    def snapshot(self, name: str) -> None:
+        """Capture the current committed state as a named snapshot. Allowed during
+        a txn: it captures the committed state (frozen mid-txn); the txn's buffer
+        is excluded. Overwrites an existing name."""
+        self._snapshots[name] = self._commit_ts
+
+    def restore(self, name: str) -> None:
+        """Restore the whole DB to the named snapshot: discard every committed
+        delta batch after the snapshot's ts (committed work after that point is
+        lost), rewind the commit counter, and drop any snapshots that now point at
+        discarded state. The current in-flight txn (if any) must be rolled back
+        first -- restoring mid-txn is rejected."""
+        if name not in self._snapshots:
+            raise RuntimeError(f"unknown snapshot: {name}")
+        self._restore_to(self._snapshots[name])
+
+    def restore_to(self, ts: int) -> None:
+        """Restore the whole DB to a raw commit timestamp (same semantics as
+        ``restore(name)`` but keyed by ts instead of a snapshot name)."""
+        self._restore_to(ts)
+
+    def _restore_to(self, target: int) -> None:
+        if self._txn is not None:
+            raise RuntimeError("cannot restore during a transaction (ROLLBACK first)")
+        if target > self._commit_ts:
+            # Defensive: a snapshot whose state was already discarded by a prior
+            # restore-to-earlier. Self-cleaning below makes this unreachable for
+            # surviving snapshots, but guard anyway.
+            raise RuntimeError(
+                f"cannot restore to ts {target} > current commit ts {self._commit_ts} "
+                "(that state was already discarded)"
+            )
+        touched = self.delta.rewind(target)
+        self._commit_ts = target
+        # Drop snapshots that now point at discarded state (ts > target). This is
+        # the dangling-snapshot fix: without it, restore("b") after restore("a")
+        # (where b's ts > a) would silently return state rolled back past b.
+        for n in [n for n, ts in self._snapshots.items() if ts > target]:
+            del self._snapshots[n]
+        for table in touched:
+            self._invalidate_table_caches(table)
+
     def is_unique_key(self, table: str, col: str, series) -> bool:
         """Return cached (table, col) uniqueness -- a dimension join key must be
         a primary key for the fused star-join path (a non-unique key would
@@ -174,11 +298,12 @@ class Engine:
             base = scan(self.catalog.get(table), columns)
             if self.cache_enabled:
                 self._scan_cache[key] = base
-        # Phase 2 delta merge: concatenate any unflushed batches onto the base.
-        # The cache stays base-only (the merged frame is never written back), so
-        # the live delta is re-merged each read and a future append is visible
-        # with no invalidation. Empty delta -> return base unchanged (zero cost).
-        if self.delta.has_unflushed(table):
+        # Phase 2 delta merge: concatenate any unflushed batches (committed delta
+        # OR an in-txn buffer) onto the base. The cache stays base-only (the
+        # merged frame is never written back), so the live delta is re-merged each
+        # read and a future append is visible with no invalidation. No pending
+        # rows -> return base unchanged (zero cost).
+        if self.has_pending(table):
             return self._merge_delta(base, table)
         return base
 
@@ -193,8 +318,20 @@ class Engine:
         Batches are assumed full-schema; a missing projected column raises
         KeyError -- a useful failure for a malformed INSERT once the write path
         exists.
+
+        MVCC (step 5): inside a transaction the visible batches are
+        ``batches_at(snapshot_ts)`` (committed at-or-before the snapshot) followed
+        by the txn's own buffered frames (read-your-writes). Outside a txn
+        (autocommit) ``batches(table)`` returns ALL committed frames. The buffer
+        frames are appended in the same order at COMMIT, so the visible series is
+        byte-identical pre/post commit -- which is what makes COMMIT/ROLLBACK/
+        RESTORE cache invalidation a safe over-invalidation.
         """
-        batches = self.delta.batches(table)
+        if self._txn is not None:
+            batches = self.delta.batches_at(table, self._txn.snapshot_ts) \
+                + self._txn.buffer_batches(table)
+        else:
+            batches = self.delta.batches(table)
         if not batches:
             return base
         cols = list(base.columns)
@@ -212,11 +349,13 @@ class Engine:
 
         Resolves the full schema from the catalog, fills DEFAULTs for omitted
         columns, enforces NOT NULL, builds a typed cuDF batch whose columns cast
-        cleanly to the base at merge time, and appends it to ``self.delta``. The
-        next SELECT re-merges the live delta in ``_scan`` -- this is autocommit
-        (no txn layer yet). PK/UNIQUE uniqueness is NOT enforced here (deferred
-        to step 4+); only NOT NULL + DEFAULT + type coercion. Returns the row
-        count appended.
+        cleanly to the base at merge time, and appends it to the table's write
+        target. Outside a transaction (autocommit) the batch is appended to
+        ``self.delta`` under a fresh commit_ts and the next SELECT re-merges it
+        in ``_scan``. Inside a transaction the batch is buffered on the txn
+        (read-your-writes) and flushed to ``self.delta`` at COMMIT. PK/UNIQUE
+        uniqueness is NOT enforced here (deferred); only NOT NULL + DEFAULT +
+        type coercion. Returns the row count appended.
         """
         info = self.catalog.get(node.table)
         if info is None:
@@ -276,20 +415,40 @@ class Engine:
             else:
                 pdf[c] = pd.array(arr, dtype=dt)
         frame = cudf.DataFrame(pd.DataFrame(pdf))
-        self.delta.append(node.table, frame)
-        # Autocommit: the delta is now live. The base-only factorize codes /
-        # PK-uniqueness caches for this table are stale (length mismatch / a
-        # possible duplicate PK), so drop them -- the next SELECT re-factorizes /
-        # re-checks uniqueness on the merged series. Other tables stay cached.
+        # Phase 2 step 5: inside a transaction, buffer the frame (visible only to
+        # this txn via read-your-writes; flushed to the shared delta at COMMIT).
+        # Outside a txn (autocommit) append it to the delta now under a fresh
+        # commit_ts. Either way the visible series for this table changes, so the
+        # maintained-fact caches must be dropped -- including on buffer-append,
+        # or a warm in-txn read would leave stale codes read OOB on the next
+        # in-txn read after the buffer grows.
+        if self._txn is not None:
+            self._txn.buffer_append(node.table, frame)
+        else:
+            ts = self._next_commit_ts()
+            self.delta.append(node.table, frame, ts)
         self._invalidate_table_caches(node.table)
         return len(frame)
 
-    def sql(self, sql: str) -> "cudf.DataFrame | int":
+    def sql(self, sql: str) -> "cudf.DataFrame | int | None":
+        # Non-standard snapshot/restore bypass sqlglot entirely (no AST node).
+        # Cheap prefix guard so the regex never runs on a SELECT/INSERT/BEGIN.
+        s = sql.lstrip()
+        if s[:7].upper() in ("CREATE ", "RESTORE"):
+            m = _SNAPSHOT_RE.match(s)
+            if m:
+                self.snapshot(m.group(1))
+                return None
+            m = _RESTORE_RE.match(s)
+            if m:
+                self.restore(m.group(1))
+                return None
         plan = parse(sql, self.catalog.schema_dict())
-        # INSERT is a write leaf with no predicate/projection/join to optimize;
-        # bypass the optimizer (the rules are pass-through-safe today, but a
-        # future Select-shaped rule could choke on an Insert root).
-        if not isinstance(plan, Insert):
+        # INSERT and TxnControl are non-relational leaves with no predicate /
+        # projection / join to optimize; bypass the optimizer (the rules are
+        # pass-through-safe today, but a future Select-shaped rule could choke on
+        # an Insert/TxnControl root).
+        if not isinstance(plan, (Insert, TxnControl)):
             plan = optimize(
                 plan,
                 self.catalog.schema_dict(),
@@ -300,19 +459,30 @@ class Engine:
     def explain(self, sql: str) -> str:
         from ..sql.plan import pretty
 
+        s = sql.lstrip()
+        if s[:7].upper() in ("CREATE ", "RESTORE"):
+            m = _SNAPSHOT_RE.match(s)
+            if m:
+                return f"CreateSnapshot({m.group(1)})"
+            m = _RESTORE_RE.match(s)
+            if m:
+                return f"RestoreToSnapshot({m.group(1)})"
         plan = parse(sql, self.catalog.schema_dict())
-        if not isinstance(plan, Insert):
+        if not isinstance(plan, (Insert, TxnControl)):
             plan = optimize(plan, self.catalog.schema_dict(), self.catalog.stats_dict())
         return pretty(plan)
 
-    def execute(self, plan: PlanNode) -> cudf.DataFrame:
+    def execute(self, plan: PlanNode) -> "cudf.DataFrame | int | None":
         return self._exec(plan)
 
-    def _exec(self, node: PlanNode) -> "cudf.DataFrame | int":
+    def _exec(self, node: PlanNode) -> "cudf.DataFrame | int | None":
         if isinstance(node, Scan):
             return self._scan(node.table, node.columns)
         if isinstance(node, Insert):
             return self._insert(node)
+        if isinstance(node, TxnControl):
+            self._txn_control(node)
+            return None
         if isinstance(node, Filter):
             df = self._exec(node.input)
             mask = eval_expr(node.predicate, df)

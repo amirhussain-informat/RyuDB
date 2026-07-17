@@ -38,6 +38,7 @@ from .plan import (
     Scan,
     Sort,
     Star,
+    TxnControl,
 )
 from .plan import Aggregate  # noqa: E402 (kept separate for readability)
 
@@ -55,10 +56,18 @@ class ParseError(ValueError):
 
 
 def parse(sql: str, schema: dict[str, list[str]] | None = None) -> object:
-    """Parse a single SELECT or INSERT statement into a logical plan node.
+    """Parse a single SELECT / INSERT / transaction-control statement into a
+    logical plan node.
 
     `schema` (table -> columns) is used to route unqualified join columns to the
     correct side of a join. When omitted, only table-qualified columns route.
+
+    Transaction control (BEGIN/COMMIT/ROLLBACK) lowers to a ``TxnControl`` leaf.
+    Snapshot/restore (``CREATE SNAPSHOT``/``RESTORE TO SNAPSHOT``) are non-standard
+    SQL and are handled by a regex pre-sniff in ``Engine.sql`` before this is
+    called -- they never reach the parser. ``START TRANSACTION`` does NOT parse in
+    sqlglot's default dialect; use ``BEGIN`` (optionally ``BEGIN TRANSACTION`` or
+    ``BEGIN WORK``).
     """
     statements = sqlglot.parse(sql)
     if len(statements) != 1:
@@ -68,7 +77,20 @@ def parse(sql: str, schema: dict[str, list[str]] | None = None) -> object:
         return _build_select(stmt, schema)
     if isinstance(stmt, exp.Insert):
         return _build_insert(stmt)
-    raise ParseError(f"only SELECT/INSERT is supported (got {type(stmt).__name__})")
+    if isinstance(stmt, exp.Transaction):
+        # sqlglot lowers BEGIN[/TRANSACTION/WORK/DEFERRED] to exp.Transaction;
+        # this/modes/mark are ignored (no nested txns, no SAVEPOINTs yet).
+        return TxnControl("begin")
+    if isinstance(stmt, exp.Commit):
+        if stmt.args.get("chain"):
+            raise NotImplementedError("COMMIT AND CHAIN is not supported")
+        return TxnControl("commit")
+    if isinstance(stmt, exp.Rollback):
+        if stmt.args.get("savepoint"):
+            raise NotImplementedError("ROLLBACK TO SAVEPOINT is not supported")
+        return TxnControl("rollback")
+    raise ParseError(f"only SELECT/INSERT/BEGIN/COMMIT/ROLLBACK is supported "
+                     f"(got {type(stmt).__name__})")
 
 
 def _build_insert(stmt: exp.Insert) -> Insert:
