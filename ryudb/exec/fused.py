@@ -1391,6 +1391,11 @@ def fused_scan_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     if not isinstance(filt.input, Scan):
         return None
     info = engine.catalog.get(filt.input.table)
+    # Phase 2 delta guard: the cold Parquet reader bypasses _scan and would miss
+    # unflushed delta rows. Defer to the materialising _scan + merge path when a
+    # table has a delta. Empty delta (step 2) -> never fires -> no regression.
+    if engine.delta is not None and engine.delta.has_unflushed(filt.input.table):
+        return None
     if len(info.paths) != 1:
         return None  # v1: single file per table
     path = info.paths[0]
