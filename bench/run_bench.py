@@ -184,7 +184,7 @@ def main() -> int:
         duck.execute(f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{data_dir}/{t}/*.parquet')")
 
     print(f"\nRyuDB (GPU/cuDF) vs DuckDB (CPU) — TPC-H SF={args.scale}, repeats={args.repeats}\n")
-    header = f"{'query':<26}{'ryudb (ms)':>14}{'duckdb (ms)':>14}{'speedup':>10}  check"
+    header = f"{'query':<26}{'ryu cold':>10}{'ryu warm':>10}{'duckdb':>10}{'warm x':>9}  check"
     print(header)
     print("-" * len(header))
 
@@ -198,18 +198,45 @@ def main() -> int:
             duck_df = duck.execute(duck_sql).fetchdf()
             ok = frames_match(ryu_df, duck_df)
         except Exception as exc:  # noqa: BLE001
-            print(f"{name:<26}{'ERROR':>14}{'':>14}{'':>10}  {exc}")
+            print(f"{name:<26}{'ERROR':>10}{'':>10}{'':>10}{'':>9}  {exc}")
             continue
 
-        # timing (warm-up first, then min of repeats)
+        # Warm up both engines (also builds RyuDB's GPU-resident frame + code
+        # index so the cold/warm split below is meaningful).
         engine.sql(ryu_sql)
         duck.execute(duck_sql).fetchdf()
-        ryu_ms = _time(lambda: engine.sql(ryu_sql), args.repeats) * 1000
-        duck_ms = _time(lambda: duck.execute(duck_sql).fetchdf(), args.repeats) * 1000
-        speedup = duck_ms / ryu_ms if ryu_ms > 0 else float("inf")
-        print(f"{name:<26}{ryu_ms:>14.1f}{duck_ms:>14.1f}{speedup:>9.2f}x  {'OK' if ok else 'MISMATCH'}")
 
-    print("\nNote: RyuDB times include Parquet read + GPU execution. Speedup > 1x means the GPU won.")
+        # RyuDB cold: scan cache cleared before each run (forces a Parquet
+        # re-read). The per-column factorize *code index* persists by design
+        # (it is a dictionary-encoded column, not a query cache), so "cold" here
+        # is scan-cold / index-resident -- the realistic "frame evicted from GPU
+        # memory but dictionary index kept" state. The very first run on a
+        # freshly started engine pays a one-time ~460 ms index build instead.
+        def ryu_cold():
+            engine.clear_scan_cache()
+            engine.sql(ryu_sql)
+
+        # RyuDB warm: frame + code index resident, repeated runs hit cache.
+        def ryu_warm():
+            engine.sql(ryu_sql)
+
+        ryu_cold_ms = _time(ryu_cold, args.repeats) * 1000
+        ryu_warm_ms = _time(ryu_warm, args.repeats) * 1000
+        duck_ms = _time(lambda: duck.execute(duck_sql).fetchdf(), args.repeats) * 1000
+        speedup = duck_ms / ryu_warm_ms if ryu_warm_ms > 0 else float("inf")
+        print(
+            f"{name:<26}{ryu_cold_ms:>10.1f}{ryu_warm_ms:>10.1f}{duck_ms:>10.1f}"
+            f"{speedup:>8.2f}x  {'OK' if ok else 'MISMATCH'}"
+        )
+
+    print(
+        "\nNotes:"
+        "\n  ryu cold = scan cache cleared (Parquet re-read), code index resident;"
+        "\n             the first run on a fresh engine also pays a one-time index build."
+        "\n  ryu warm = frame + code index GPU-resident (repeated query)."
+        "\n  duckdb   = DuckDB warm (repeated query, parquet metadata cached)."
+        "\n  warm x   = duckdb / ryu_warm (speedup > 1x means the GPU won warm)."
+    )
     return 0
 
 
