@@ -19,8 +19,14 @@ SQL Frontend (sqlglot)  ->  Logical Plan  ->  Rule-based Optimizer
 - **Storage:** columnar Parquet files; a catalog maps table names to files and
   Arrow schemas.
 
-Phase 2 will add a CPU delta-store + WAL + MVCC for writes (HTAP). Phase 3 will
-add full SQL, a cost-based optimizer, recovery, and C++/CUDA hot paths.
+Phase 2 adds a CPU delta-store + WAL + MVCC for writes (HTAP), over an
+**immutable Parquet base** (writes go to a delta-store merged at read; base
+`.parquet` files are never mutated). Step 1 (done): the catalog is now **typed
+and persistent** — `TableInfo` retains the full Arrow schema plus declarative
+constraints (NOT NULL / PK / UNIQUE / DEFAULTs, stored not yet enforced), and
+the catalog persists to `<data_dir>/ryudb.catalog.json` and reloads on restart.
+The read path is unchanged. Phase 3 will add full SQL, a cost-based optimizer,
+recovery, and C++/CUDA hot paths.
 
 ## Environment
 
