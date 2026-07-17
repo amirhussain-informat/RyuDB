@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numba import cuda
 
+from .. import kernels as _kernels
 from ..sql.plan import Aggregate, And, BinOp, Col, Filter, Lit, Or, Scan, Star, walk
 
 if TYPE_CHECKING:
@@ -48,6 +49,18 @@ MAX_ACC_CELLS = 4096
 THREADS = 256
 
 _KERNEL_CACHE: dict[str, object] = {}
+
+# --- C++ kernel descriptor codes (must mirror kernels/fused.cu) -------------- #
+_DT_INT64, _DT_FLOAT64 = 0, 1
+_OP = {"=": 0, "!=": 1, "<": 2, "<=": 3, ">": 4, ">=": 5}
+_TOP = {"+": 1, "-": 2, "*": 3, "/": 4}
+_TK_COL, _TK_LIT, _TK_OP = 0, 1, 2
+_AGG_COUNT, _AGG_SUM = 0, 1
+_STRAT_DENSE, _STRAT_HASH = 0, 1
+# Hash-table accumulator memory budget (bytes) and slot cap. Sized from row count
+# (catalog has no NDV): capacity = next_pow2(min(n, 2**25, BUDGET//(nagg*8))).
+_HASH_ACC_BUDGET = 2 * 10**9
+_HASH_CAP_MAX = 1 << 25  # 33.5M slots
 
 
 def fused_aggregate(node: Aggregate, child, engine=None) -> "cudf.DataFrame | None":
@@ -67,10 +80,23 @@ def fused_aggregate(node: Aggregate, child, engine=None) -> "cudf.DataFrame | No
     if n == 0:
         return _empty_result(spec)
 
-    # Resolve the source table name for the group-key code cache (best-effort:
-    # walk the subtree for a Scan). Falls back to None -> no caching.
+    # Phase 3b: prefer the C++/CUDA backend (nvcc+pybind11) when built. It handles
+    # both the dense low-cardinality path AND the hash-table high-cardinality path
+    # (numeric group keys read directly -- no factorize). Returns None if the shape
+    # isn't handled here (e.g. OR predicate, string high-card) -> fall through to
+    # the Numba dense path, then cuDF.
     table = _source_table(node)
+    if _kernels.is_available:
+        try:
+            res = _run_cpp(spec, child, engine, table)
+        except Exception:  # noqa: BLE001 -- never let a C++ fault break correctness
+            res = None
+        if res is not None:
+            return res
 
+    # Resolve the source table name for the group-key code cache (best-effort:
+    # walk the subtree for a Scan). Falls back to None -> no caching. (`table` was
+    # already computed above for the C++ path; reuse it here.)
     # ---- data prep ------------------------------------------------------- #
     # Factorise each group-key column to int codes; compute row-major strides
     # (last key varies fastest, stride 1). Use the engine's code cache when
@@ -442,3 +468,274 @@ def _empty_result(spec):
     for af, n in spec["aggs"]:
         data[n] = []
     return cudf.DataFrame(data)
+
+
+# --------------------------------------------------------------------------- #
+# C++/CUDA backend (nvcc + pybind11): descriptor lowering + frame assembly
+# --------------------------------------------------------------------------- #
+
+
+def _dev_ptr(arr) -> int:
+    """Raw device pointer (int) from a cuDF/numpy array exposing CAI."""
+    return int(arr.__cuda_array_interface__["data"][0])
+
+
+def _next_pow2(x: int) -> int:
+    p = 1
+    while p < x:
+        p <<= 1
+    return p
+
+
+def _lit_to_double(lit: Lit) -> float:
+    """Numeric literal -> double (mirrors _emit_expr; date lits handled by caller)."""
+    v = lit.value
+    if isinstance(v, bool):
+        return 1.0 if v else 0.0
+    return float(v)
+
+
+def _to_postfix(e, bind_named) -> list[tuple[int, int, float]]:
+    """Lower an agg-arg Expr to postfix tokens: (kind, col_or_op, lit).
+
+    kind: _TK_COL (col idx in 2nd), _TK_LIT (lit in 3rd), _TK_OP (op code in 2nd).
+    """
+    if isinstance(e, Col):
+        return [(_TK_COL, bind_named(e.name), 0.0)]
+    if isinstance(e, Lit):
+        return [(_TK_LIT, 0, _lit_to_double(e))]
+    if isinstance(e, BinOp) and e.op in _TOP:
+        return _to_postfix(e.left, bind_named) + _to_postfix(e.right, bind_named) + [
+            (_TK_OP, _TOP[e.op], 0.0)
+        ]
+    raise ValueError(f"unsupported agg expr in C++ lowering: {e!r}")
+
+
+def _flatten_and_pred(e, bind_named, child) -> list[tuple[int, int, float]] | None:
+    """Flatten an AND-of-comparisons predicate to (col_idx, op, lit) tuples.
+
+    Returns None if the predicate contains OR or an unsupported shape (the C++
+    kernel only evaluates conjunctions; OR falls back to Numba/cuDF).
+    """
+    if isinstance(e, And):
+        left = _flatten_and_pred(e.left, bind_named, child)
+        right = _flatten_and_pred(e.right, bind_named, child)
+        if left is None or right is None:
+            return None
+        return left + right
+    if isinstance(e, BinOp) and e.op in _OP:
+        lcol = e.left if isinstance(e.left, Col) else None
+        rcol = e.right if isinstance(e.right, Col) else None
+        col = lcol or rcol
+        lit = e.right if lcol else e.left
+        if col is None or not isinstance(lit, Lit):
+            return None
+        idx = bind_named(col.name)
+        # Date column -> literal is a date; convert to int64 seconds (the column
+        # was bound as int64 seconds). Else numeric literal.
+        if np.issubdtype(child[col.name].dtype, np.datetime64):
+            lv = float(int(np.datetime64(lit.value, "s").astype("int64")))
+        else:
+            lv = _lit_to_double(lit)
+        op = _OP[e.op]
+        # Preserve direction: if the literal was on the left, mirror the operator.
+        if lcol is None and rcol is not None:
+            op = {0: 0, 1: 1, 2: 4, 3: 5, 4: 2, 5: 3}[op]  # swap < <-> > , <= <-> >=
+        return [(idx, op, lv)]
+    return None
+
+
+def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
+    """Lower `spec` to descriptors, run the C++ fused kernel, build a cuDF frame.
+
+    Returns None when the shape isn't handled by the C++ path (OR predicate,
+    string high-cardinality GROUP BY -- deferred) or the hash table overflowed;
+    the caller then falls back to Numba/cuDF. `table` is the source table name for
+    the engine's factorize-code cache (None -> uncached factorize).
+    """
+    import cudf
+
+    n = len(child)
+    nagg = len(spec["aggs"])
+    ngkey = len(spec["group_keys"])
+
+    # Column binding: name -> index for predicate/agg-arg cols; group-key arrays
+    # get their own indices appended (they may bind codes, not the raw column).
+    col_ptrs: list[int] = []
+    col_dtypes: list[int] = []
+    name_idx: dict[str, int] = {}
+    date_cols: set[str] = set()
+    # Hold references to any temporary arrays (datetime->int64 casts, factorize
+    # codes) so cuDF does not free their device buffers before the kernel reads
+    # them via the raw pointers we stashed in col_ptrs.
+    _kept: list[object] = []
+
+    def bind_named(name: str) -> int:
+        if name in name_idx:
+            return name_idx[name]
+        col = child[name]
+        if np.issubdtype(col.dtype, np.datetime64):
+            arr = _to_int64_seconds(col)
+            _kept.append(arr)
+            ptr, dt = _dev_ptr(arr), _DT_INT64
+            date_cols.add(name)
+        elif np.issubdtype(col.dtype, np.integer) or "int" in str(col.dtype):
+            ptr, dt = _dev_ptr(col), _DT_INT64
+        elif np.issubdtype(col.dtype, np.floating) or "float" in str(col.dtype):
+            ptr, dt = _dev_ptr(col), _DT_FLOAT64
+        else:
+            raise ValueError(f"C++ kernel cannot bind non-numeric column {name}")
+        idx = len(col_ptrs)
+        col_ptrs.append(ptr)
+        col_dtypes.append(dt)
+        name_idx[name] = idx
+        return idx
+
+    # --- group-key encoding: numeric -> HASH direct; else factorize -> DENSE ---
+    gkey_decoders: list[tuple] = []  # ('codes', uniques) | ('int',) | ('datetime',)
+    gkey_idx: list[int] = []
+    gkey_stride: list[int] = []
+    strategy = _STRAT_DENSE
+    n_groups = 1
+    capacity = 0
+
+    def _numeric_key(ge) -> bool:
+        dt = child[ge.name].dtype
+        return np.issubdtype(dt, np.integer) or "int" in str(dt) or np.issubdtype(dt, np.datetime64)
+
+    all_numeric = all(_numeric_key(ge) for ge, _ in spec["group_keys"])
+
+    if all_numeric:
+        # HASH direct: bind the group key as an int64 array (datetime -> seconds).
+        # The C++ hash kernel handles a SINGLE int64 group key only (it reads
+        # p.gkey_idx[0] and uses atomicCAS-on-key). Multi-column numeric GROUP BY
+        # is deferred to cuDF for now.
+        if ngkey != 1:
+            return None
+        strategy = _STRAT_HASH
+        capacity = _next_pow2(min(n, _HASH_CAP_MAX, _HASH_ACC_BUDGET // (nagg * 8)))
+        if capacity < 4:
+            return None
+        for ge, _gn in spec["group_keys"]:
+            col = child[ge.name]
+            if np.issubdtype(col.dtype, np.datetime64):
+                arr = _to_int64_seconds(col)
+                gkey_decoders.append(("datetime",))
+            else:
+                arr = col
+                gkey_decoders.append(("int",))
+            _kept.append(arr)
+            idx = len(col_ptrs)
+            col_ptrs.append(_dev_ptr(arr))
+            col_dtypes.append(_DT_INT64)
+            gkey_idx.append(idx)
+    else:
+        # Factorize all group keys (cached) -> codes. DENSE if low-card, else the
+        # string high-card HASH-codes path is deferred (host decode of millions of
+        # codes is slow) -> return None and let cuDF handle it.
+        sizes: list[int] = []
+        uniques: list = []
+        for ge, _gn in spec["group_keys"]:
+            if engine is not None and table is not None:
+                codes, uniq = engine.get_codes(table, ge.name, child[ge.name])
+            else:
+                codes, uniq = child[ge.name].factorize()
+                uniq = list(uniq.to_pandas())
+            idx = len(col_ptrs)
+            _kept.append(codes)
+            col_ptrs.append(_dev_ptr(codes))
+            col_dtypes.append(_DT_INT64)
+            gkey_idx.append(idx)
+            sizes.append(len(uniq))
+            uniques.append(uniq)
+            gkey_decoders.append(("codes", uniq))
+        for j in range(len(sizes)):
+            gkey_stride.append(int(np.prod(sizes[j + 1:], dtype=np.int64)))
+        n_groups = int(np.prod(sizes, dtype=np.int64)) if sizes else 1
+        if n_groups * nagg > MAX_ACC_CELLS:
+            return None  # string high-card -> defer to cuDF
+        strategy = _STRAT_DENSE
+
+    # --- predicate (conjunction only) ---
+    pred = _flatten_and_pred(spec["predicate"], bind_named, child)
+    if pred is None:
+        return None
+    pred_col = np.array([p[0] for p in pred], dtype=np.int32)
+    pred_op = np.array([p[1] for p in pred], dtype=np.int32)
+    pred_lit = np.array([p[2] for p in pred], dtype=np.float64)
+
+    # --- aggregates ---
+    agg_kind: list[int] = []
+    agg_tok_start: list[int] = []
+    agg_tok_len: list[int] = []
+    tok_kind: list[int] = []
+    tok_col: list[int] = []
+    tok_lit: list[float] = []
+    tok_op: list[int] = []
+    for af, _n in spec["aggs"]:
+        start = len(tok_kind)
+        if af.func == "COUNT" and isinstance(af.arg, Star):
+            agg_kind.append(_AGG_COUNT)
+            agg_tok_start.append(start)
+            agg_tok_len.append(0)
+            continue
+        # SUM(expr)
+        toks = _to_postfix(af.arg, bind_named)
+        for k, a, b in toks:
+            tok_kind.append(k)
+            tok_lit.append(b)
+            if k == _TK_OP:
+                # _to_postfix packs the op code in the 2nd tuple slot; route it to
+                # tok_op (the array the kernel's eval_agg reads for TK_OP tokens).
+                tok_col.append(0)
+                tok_op.append(a)
+            else:
+                tok_col.append(a)
+                tok_op.append(0)
+        agg_kind.append(_AGG_SUM)
+        agg_tok_start.append(start)
+        agg_tok_len.append(len(toks))
+
+    col_ptrs_np = np.array(col_ptrs, dtype=np.int64)
+    col_dtypes_np = np.array(col_dtypes, dtype=np.int32)
+    gkey_idx_np = np.array(gkey_idx, dtype=np.int32)
+    gkey_stride_np = np.array(gkey_stride, dtype=np.int64)
+    tok_kind_np = np.array(tok_kind, dtype=np.int32)
+    tok_col_np = np.array(tok_col, dtype=np.int32)
+    tok_lit_np = np.array(tok_lit, dtype=np.float64)
+    tok_op_np = np.array(tok_op, dtype=np.int32)
+    agg_kind_np = np.array(agg_kind, dtype=np.int32)
+    agg_tok_start_np = np.array(agg_tok_start, dtype=np.int32)
+    agg_tok_len_np = np.array(agg_tok_len, dtype=np.int32)
+
+    overflow, n_out, keys_list, aggs_list = _kernels.fused_agg(
+        col_ptrs_np, col_dtypes_np, gkey_idx_np, gkey_stride_np,
+        pred_col, pred_op, pred_lit, agg_kind_np, agg_tok_start_np, agg_tok_len_np,
+        tok_kind_np, tok_col_np, tok_lit_np, tok_op_np,
+        int(strategy), int(n_groups), int(capacity), int(n),
+    )
+    if overflow != 0:
+        return None  # hash table filled -> cuDF fallback
+
+    # --- assemble cuDF frame ---
+    data: dict = {}
+    for j, (_ge, gn) in enumerate(spec["group_keys"]):
+        codes = np.asarray(keys_list[j], dtype=np.int64)
+        dec = gkey_decoders[j]
+        if dec[0] == "codes":
+            uniq = dec[1]
+            data[gn] = cudf.Series([uniq[int(c)] for c in codes])
+        elif dec[0] == "datetime":
+            data[gn] = cudf.Series(codes.astype("datetime64[s]"))
+        else:  # 'int'
+            data[gn] = cudf.Series(codes)
+    for a, (af, n) in enumerate(spec["aggs"]):
+        vals = np.asarray(aggs_list[a], dtype=np.float64)
+        if af.func == "COUNT" and isinstance(af.arg, Star):
+            data[n] = cudf.Series(vals.astype(np.int64))
+        else:
+            data[n] = cudf.Series(vals)
+
+    by_names = [gn for _, gn in spec["group_keys"]]
+    out = cudf.DataFrame(data)
+    return out[by_names + [n for _, n in spec["aggs"]]]

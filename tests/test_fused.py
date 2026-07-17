@@ -107,10 +107,11 @@ def test_fused_path_is_taken(q1_engine):
     assert len(res) > 0
 
 
-def test_high_card_groupby_falls_back(q1_engine, q1_duck):
-    """A high-cardinality GROUP BY (l_orderkey) must fall back to cuDF and still
-    match DuckDB. Force ineligibility by lowering the cell cap so the fused path
-    returns None and the cuDF path handles it."""
+def test_high_card_groupby_matches_duckdb(q1_engine, q1_duck):
+    """A high-cardinality numeric GROUP BY (l_orderkey) runs through the C++ HASH
+    path (single int64 group key, no factorize) and matches DuckDB."""
+    if not fused._kernels.is_available:
+        pytest.skip("C++ fused kernel not built")
     sql = """
     SELECT l_orderkey, sum(l_quantity) AS s
       FROM lineitem
@@ -118,20 +119,45 @@ def test_high_card_groupby_falls_back(q1_engine, q1_duck):
      GROUP BY l_orderkey
      ORDER BY l_orderkey
     """
-    # l_orderkey has 6 distinct values here; force fallback by capping cells at 0.
-    saved = fused.MAX_ACC_CELLS
+    plan = optimize(parse(sql, q1_engine.catalog.schema_dict()),
+                    q1_engine.catalog.schema_dict(), q1_engine.catalog.stats_dict())
+    agg = next(n for n in walk(plan) if isinstance(n, Aggregate))
+    child = q1_engine._exec(agg.input.input)
+    res = fused.fused_aggregate(agg, child, q1_engine)
+    assert res is not None, "high-card numeric GROUP BY should hit the C++ HASH path"
+    ryu = q1_engine.sql(sql)
+    duck = q1_duck.execute(sql).fetchdf()
+    _match(ryu, duck)
+
+
+def test_high_card_groupby_falls_back(q1_engine, q1_duck):
+    """When the C++ backend is unavailable and the dense accumulator would exceed
+    the cell cap, a high-cardinality GROUP BY (l_orderkey) falls back to cuDF and
+    still matches DuckDB. This exercises the safety-net fallback, not the hot
+    path."""
+    sql = """
+    SELECT l_orderkey, sum(l_quantity) AS s
+      FROM lineitem
+     WHERE l_shipdate <= date '1998-09-02'
+     GROUP BY l_orderkey
+     ORDER BY l_orderkey
+    """
+    saved_avail = fused._kernels.is_available
+    saved_cap = fused.MAX_ACC_CELLS
+    fused._kernels.is_available = False
     fused.MAX_ACC_CELLS = 0
     try:
         plan = optimize(parse(sql, q1_engine.catalog.schema_dict()),
                         q1_engine.catalog.schema_dict(), q1_engine.catalog.stats_dict())
         agg = next(n for n in walk(plan) if isinstance(n, Aggregate))
         child = q1_engine._exec(agg.input.input)
-        assert fused.fused_aggregate(agg, child) is None  # ineligible -> fallback
+        assert fused.fused_aggregate(agg, child, q1_engine) is None  # -> cuDF fallback
         ryu = q1_engine.sql(sql)
         duck = q1_duck.execute(sql).fetchdf()
         _match(ryu, duck)
     finally:
-        fused.MAX_ACC_CELLS = saved
+        fused._kernels.is_available = saved_avail
+        fused.MAX_ACC_CELLS = saved_cap
 
 
 def test_fused_no_filter_predicate():

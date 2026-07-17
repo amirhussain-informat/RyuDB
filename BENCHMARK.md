@@ -8,6 +8,85 @@ Hardware: NVIDIA RTX 3090 (24 GB), driver 591.86. Runs inside WSL2 Ubuntu, cuDF
 milliseconds. Two regimes are reported (see "Warm vs cold" below): **cold** (scan
 cache cleared — Parquet re-read) and **warm** (frame + code index GPU-resident).
 
+## RyuDB vs DuckDB — warm path (Phase 3b, SF=10)
+
+The fused kernel is now an **ahead-of-time C++/CUDA extension** (nvcc + pybind11),
+with a **hash-table groupby** so high-cardinality numeric GROUP BY keys run in the
+fused path instead of falling back to cuDF. Numba + cuDF remain as fallbacks.
+
+| query | ryu cold | ryu warm | duckdb | warm speedup |
+|---|---|---|---|---|
+| Q1 pricing summary | 414 | **52** | 101 | **1.95x** ✓ |
+| Q high-card orderkey (NEW) | 990 | **677** | 1192 | **1.76x** ✓ |
+| Q6 filter + agg | 360 | 47 | 64 | 1.36x ✓ |
+| Q3 3-table join + agg | 525 | 108 | 161 | 1.49x ✓ |
+| scan + 5 aggs | 371 | 66 | 59 | 0.89x |
+| 4-table join + agg | 882 | 593 | 411 | 0.69x |
+
+**4 of 6 queries beat DuckDB on the warm path.** Two headlines this round:
+
+- **The C++ port is faster than the Numba kernel it replaces.** Q1 warm went
+  59 → 52 ms (1.76x → 1.95x vs DuckDB) — ahead-of-time C++ removes Numba's
+  per-launch JIT/dispatch overhead, and the generic interpreter handles Q1's
+  string-keyed dense rollup with no per-query codegen.
+- **High-cardinality numeric GROUP BY now runs fused.** `GROUP BY l_orderkey`
+  (~1.5M distinct keys at SF10) previously fell back to cuDF; the new in-kernel
+  open-addressing hash table reads the int64 key directly (no `factorize`, no
+  dense-accumulator gate) and beats DuckDB 1.76x warm (677 vs 1192 ms). This is
+  the Phase-3b capability the user asked for.
+
+The two queries still losing — `scan_agg_full` (global aggregate, no GROUP BY →
+no fused path) and `4-table join + agg` (join-dominated, no fused join path) —
+are unchanged from Phase 3a and remain the targets.
+
+## Phase-3b: C++/nvcc fused kernel + hash-table groupby (this round)
+
+Phase 3a's fused kernel was Numba `@cuda.jit` with a dense per-group accumulator
+gated by `n_groups * nagg ≤ MAX_ACC_CELLS = 4096`, so high-cardinality GROUP BY
+fell back to cuDF. Phase 3b:
+
+1. **Ported the kernel to C++/CUDA** compiled ahead-of-time with **nvcc 13.3 +
+   pybind11** (no CUDA-toolkit install — nvcc was already in the `ryudb` conda
+   env; a conda-forge host compiler `gxx_linux-64` provides `-ccbin`). The kernel
+   is a **generic interpreter**: the Python side (`ryudb/exec/fused.py`) lowers a
+   matched plan to small descriptor arrays (column device pointers + dtypes,
+   predicate/aggregate token streams) and the C++ interprets them per row — no
+   per-query C++ codegen (which would need NVRTC, not nvcc). Build on demand:
+   `python -m ryudb.kernels.build` → `ryudb/kernels/fused.so`; if absent, the
+   executor falls back to Numba/cuDF, so the package stays importable without
+   nvcc and correctness never depends on the extension.
+2. **Added a hash-table groupby** (`STRAT_HASH`) for a **single int64 group key**
+   — the headline. The hash table *is* the int64 key array, initialised to
+   `EMPTY = -1` (via `cudaMemset 0xFF`). Insert/lookup uses `atomicCAS` directly
+   on the key slot: the CAS is the publish, so it's lock-free and race-free (an
+   earlier `atomicCAS(&occupied,0,1)`-then-publish design raced — probing threads
+   read stale keys and created duplicate groups). Numeric group keys (int,
+   datetime→int64 seconds) are read in-kernel directly — **no `factorize`, no
+   code index, no cardinality gate** — so cold *and* warm high-card numeric
+   GROUP BY both run fused. Capacity is sized from the row count (the catalog has
+   no NDV): `next_pow2(min(n, 2^25, 2GB // (nagg*8)))`; on overflow the C++ call
+   returns a sentinel and the caller falls back to cuDF.
+3. **Preserved every fallback.** `_match` is unchanged; the C++ backend runs
+   first, then Numba (dense), then the cuDF no-gather path. Multi-column numeric
+   GROUP BY, OR predicates, and string high-card keys still defer to cuDF
+   (deferred stretch goals). Datetime group keys are normalised to int64 seconds
+   on the Python side and take the hash path.
+
+Descriptor codes mirror between `ryudb/exec/fused.py` and `ryudb/kernels/fused.cu`
+(dtype / op / token-kind / agg-kind / strategy). One real bug found and fixed
+during the port: the postfix operator code was being lowered into the wrong
+descriptor array (`tok_col` instead of `tok_op`), so every operator evaluated as
+division — `Q1`'s `sum(l_extendedprice * (1 - l_discount))` came out as
+`ep / (1/disc)` = wrong by ~10x. Caught by the Q1-vs-DuckDB test.
+
+Build / run:
+```bash
+conda install -n ryudb -c conda-forge gxx_linux-64 gcc_linux-64 sysroot_linux-64
+pip install pybind11
+python -m ryudb.kernels.build          # -> ryudb/kernels/fused.so
+python -m pytest -q                    # 41 tests, incl. tests/test_kernels.py
+```
+
 ## RyuDB vs DuckDB — warm path (Phase 3a, SF=10)
 
 | query | ryu cold | ryu warm | duckdb | warm speedup |
@@ -214,16 +293,25 @@ Phase 3 (fused aggregation + no-gather filter folding) cut Q1 ~1.35x and
 identified **GPU compute orchestration** as the real bottleneck (534 ms
 compute-only vs DuckDB's 98 ms total).
 
-Phase 3a (this round) replaced that orchestration with a **single fused Numba
-CUDA kernel** for the `Aggregate → Filter → Scan` shape, plus a GPU-resident
-frame cache and a persistent factorize **code index**. The code index was the
-key finding: the fused kernel alone (~35 ms) was dwarfed by cuDF's 480 ms
-`factorize` prep until the codes were cached as a dictionary index, turning a
-541 ms fused aggregate into 55 ms. **Warm Q1 now beats DuckDB 1.76x** (59 vs 105
-ms), and Q6 (1.32x) and Q3 (1.44x) beat DuckDB warm too via the scan cache. The
-cold path still loses end-to-end (reader floor, as expected).
+Phase 3a replaced that orchestration with a **single fused Numba CUDA kernel**
+for the `Aggregate → Filter → Scan` shape, plus a GPU-resident frame cache and a
+persistent factorize **code index**. The code index was the key finding: the
+fused kernel alone (~35 ms) was dwarfed by cuDF's 480 ms `factorize` prep until
+the codes were cached as a dictionary index, turning a 541 ms fused aggregate
+into 55 ms. Warm Q1 beat DuckDB 1.76x (59 vs 105 ms), and Q6 (1.32x) and Q3
+(1.44x) beat DuckDB warm too via the scan cache.
 
-Remaining work: extend the fused-kernel approach to **joins** and **global
-aggregates** (the two queries still losing), and **port the proven kernel to
-C++/nvcc** (install the CUDA toolkit in WSL2) for production-grade throughput and
-a hash-table groupby for high-cardinality keys.
+Phase 3b (this round) **ported the proven kernel to ahead-of-time C++/CUDA**
+(nvcc + pybind11, no per-query codegen — a generic interpreter over descriptor
+arrays) and added a **hash-table groupby** so high-cardinality numeric GROUP BY
+(`GROUP BY l_orderkey`, ~1.5M keys at SF10) runs fused instead of falling back
+to cuDF — beating DuckDB 1.76x warm (677 vs 1192 ms). The C++ port is also
+faster than the Numba kernel on Q1 (59 → 52 ms, 1.76x → 1.95x). Numba + cuDF
+remain as fallbacks so a missing/failed C++ build never regresses correctness.
+**4 of 6 queries now beat DuckDB warm.** The cold path still loses end-to-end
+(reader floor, as expected).
+
+Remaining work: extend the fused-kernel approach to **joins** (the 4-table
+query is still 0.69x) and **global aggregates** (scan_agg_full still 0.89x), and
+lift the hash path to **multi-column / string** group keys (currently single
+int64 only).

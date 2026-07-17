@@ -37,6 +37,19 @@ QUERIES: dict[str, str] = {
          GROUP BY l_returnflag, l_linestatus
          ORDER BY l_returnflag, l_linestatus
     """,
+    # High-cardinality numeric GROUP BY -- the Phase-3b headline: runs fused via
+    # the C++ hash-table path (single int64 group key, no factorize, no dense
+    # accumulator gate) instead of falling back to cuDF.
+    "Q_high_card_orderkey": """
+        SELECT l_orderkey,
+               sum(l_quantity) AS sum_qty,
+               sum(l_extendedprice) AS sum_base_price,
+               count(*) AS count_order
+          FROM lineitem
+         WHERE l_shipdate <= date '1998-09-02'
+         GROUP BY l_orderkey
+         ORDER BY l_orderkey
+    """,
     "Q6_filter_agg": """
         SELECT sum(l_extendedprice * l_discount) AS revenue, count(*) AS n
           FROM lineitem
