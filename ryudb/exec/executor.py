@@ -25,7 +25,7 @@ from ..sql.plan import (
     Star,
 )
 from ..storage import scan
-from .fused import fused_aggregate
+from .fused import fused_aggregate, fused_join_aggregate
 from .ops import eval_expr
 
 _AGG_METHOD = {"SUM": "sum", "AVG": "mean", "MIN": "min", "MAX": "max", "COUNT": "count"}
@@ -47,6 +47,11 @@ class Engine:
         # (~460 ms for 2 cols); caching the int codes lets warm repeat queries
         # skip it and run just the ~35 ms fused kernel.
         self._code_cache: dict[tuple[str, str], tuple] = {}
+        # Cached "is this column a unique key" result for fused star-join
+        # eligibility (dimension join keys must be PKs). Like the code index it
+        # is a maintained fact about the data, not a query cache; reuse across
+        # runs is valid because uniqueness is deterministic for identical data.
+        self._pk_cache: dict[tuple[str, str], bool] = {}
         self.cache_enabled: bool = True
 
     def clear_scan_cache(self) -> None:
@@ -65,6 +70,20 @@ class Engine:
 
     def clear_code_cache(self) -> None:
         self._code_cache.clear()
+        self._pk_cache.clear()
+
+    def is_unique_key(self, table: str, col: str, series) -> bool:
+        """Return cached (table, col) uniqueness -- a dimension join key must be
+        a primary key for the fused star-join path (a non-unique key would
+        silently collapse joins). Cached so warm repeat queries skip the
+        hash-count; cleared with the code index by `clear_code_cache`."""
+        key = (table, col)
+        if self.cache_enabled and key in self._pk_cache:
+            return self._pk_cache[key]
+        u = int(series.nunique()) == len(series)
+        if self.cache_enabled:
+            self._pk_cache[key] = u
+        return u
 
     def get_codes(self, table: str, col: str, series):
         """Return cached (int64 codes, uniques list) for a group-key column,
@@ -176,6 +195,13 @@ class Engine:
         # No Filter below the Aggregate.
         if not group_keys:
             return self._scalar_global_agg(self._exec(in_node), aggs)
+        # Phase 4 step 2: try the fused star-join + aggregate kernel before
+        # materialising the joined frame. It works on the plan (not an executed
+        # frame) so the join output is never built; returns None instantly when
+        # node.input isn't a Join, leaving the Aggregate -> Scan path unchanged.
+        res = fused_join_aggregate(node, self)
+        if res is not None:
+            return res
         df = self._exec(in_node)
         return self._fused_agg(df, df, group_keys, aggs, by_names, dropna=False, mask=None)
 

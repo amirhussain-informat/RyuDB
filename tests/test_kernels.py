@@ -278,3 +278,111 @@ def test_hash_min_max_guard_defers(hc_engine, hc_duck):
     child = hc_engine._exec(agg.input.input)
     assert fused.fused_aggregate(agg, child, hc_engine) is None
     _match(hc_engine.sql(HASH_MIN_GUARD), hc_duck.execute(HASH_MIN_GUARD).fetchdf())
+
+
+# --- Phase 4 step 2: fused star-join + aggregate ---------------------------- #
+#
+# A small snowflake: fact F -> D1 -> D2, GROUP BY D2.label, SUM(F.f_val). The
+# data deliberately includes fact rows whose key misses D1 (f_key1 in 20..24,
+# D1 has keys 0..19) and D1 rows whose payload misses D2 (d1_next == 5, D2 has
+# keys 0..4), so the inner-join drop semantics are exercised end-to-end.
+
+@pytest.fixture(scope="module")
+def star_dir(tmp_path_factory):
+    d = tmp_path_factory.mktemp("ryudb_star")
+    rng = np.random.default_rng(11)
+    d2 = cudf.DataFrame({
+        "d2_key": np.arange(5, dtype=np.int64),
+        "label": np.array(["A", "B", "C", "D", "E"], dtype=object),
+    })
+    # d1_next in 0..5; 5 misses D2 -> second-stage inner-join drop.
+    d1 = cudf.DataFrame({
+        "d1_key": np.arange(20, dtype=np.int64),
+        "d1_next": rng.integers(0, 6, size=20).astype(np.int64),
+    })
+    # f_key1 in 0..24; 20..24 miss D1 -> first-stage inner-join drop.
+    f = cudf.DataFrame({
+        "f_key1": rng.integers(0, 25, size=20000).astype(np.int64),
+        "f_val": rng.uniform(1, 100, size=20000),
+    })
+    for name, fr in [("D2", d2), ("D1", d1), ("F", f)]:
+        (d / name).mkdir()
+        fr.to_pandas().to_parquet(d / name / "0.parquet")
+    return d
+
+
+@pytest.fixture
+def star_engine(star_dir) -> Engine:
+    cat = Catalog(str(star_dir))
+    for t in ("F", "D1", "D2"):
+        cat.register(t, str(star_dir / t))
+    return Engine(cat)
+
+
+@pytest.fixture
+def star_duck(star_dir) -> "duckdb.DuckDBPyConnection":
+    con = duckdb.connect()
+    for t in ("F", "D1", "D2"):
+        con.execute(f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{star_dir}/{t}/*.parquet')")
+    return con
+
+
+STAR_SNOWFLAKE = """
+    SELECT label, sum(f_val) AS revenue
+      FROM F
+      JOIN D1 ON f_key1 = d1_key
+      JOIN D2 ON d1_next = d2_key
+     GROUP BY label
+     ORDER BY revenue DESC
+"""
+
+STAR_MULTIKEY = """
+    SELECT label, d1_key, sum(f_val) AS s
+      FROM F
+      JOIN D1 ON f_key1 = d1_key
+      JOIN D2 ON d1_next = d2_key
+     GROUP BY label, d1_key
+     ORDER BY label, d1_key
+"""
+
+STAR_DIM_ARG = """
+    SELECT label, sum(d1_next) AS s
+      FROM F
+      JOIN D1 ON f_key1 = d1_key
+      JOIN D2 ON d1_next = d2_key
+     GROUP BY label
+     ORDER BY label
+"""
+
+
+def test_fused_star_join_matches_duckdb(star_engine, star_duck):
+    """A snowflake star-join + grouped SUM runs through the fused C++ kernel
+    (stream F, probe D1/D2 HTs, accumulate per label) and matches DuckDB,
+    including the inner-join drops on both join legs."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    agg = _agg_node(STAR_SNOWFLAKE, star_engine)
+    res = fused.fused_join_aggregate(agg, star_engine)
+    assert res is not None, "snowflake star-join + SUM should hit the C++ fused path"
+    _match(star_engine.sql(STAR_SNOWFLAKE), star_duck.execute(STAR_SNOWFLAKE).fetchdf())
+
+
+def test_fused_star_join_multikey_defers(star_engine, star_duck):
+    """A multi-key GROUP BY over a join is out of scope -> fused_join_aggregate
+    returns None and the query falls back to cuDF, still matching DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    agg = _agg_node(STAR_MULTIKEY, star_engine)
+    assert fused.fused_join_aggregate(agg, star_engine) is None
+    _match(star_engine.sql(STAR_MULTIKEY), star_duck.execute(STAR_MULTIKEY).fetchdf())
+
+
+def test_fused_star_join_dim_agg_arg_defers(star_engine, star_duck):
+    """An aggregate over a dimension column (not the fact table) is out of scope
+    (the kernel reads agg args at the streaming fact row) -> returns None and
+    falls back to cuDF, still matching DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    agg = _agg_node(STAR_DIM_ARG, star_engine)
+    assert fused.fused_join_aggregate(agg, star_engine) is None
+    _match(star_engine.sql(STAR_DIM_ARG), star_duck.execute(STAR_DIM_ARG).fetchdf())

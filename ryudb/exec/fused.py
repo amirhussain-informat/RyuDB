@@ -36,7 +36,7 @@ import numpy as np
 from numba import cuda
 
 from .. import kernels as _kernels
-from ..sql.plan import Aggregate, And, BinOp, Col, Filter, Lit, Or, Scan, Star, walk
+from ..sql.plan import Aggregate, And, BinOp, Col, Filter, Join, Lit, Or, Scan, Star, walk
 
 if TYPE_CHECKING:
     import cudf
@@ -837,3 +837,348 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
     by_names = [gn for _, gn in spec["group_keys"]]
     out = cudf.DataFrame(data)
     return out[by_names + [n for _, n in spec["aggs"]]]
+
+
+# --------------------------------------------------------------------------- #
+# Fused star-join + aggregate (C++/CUDA backend)
+# --------------------------------------------------------------------------- #
+
+
+def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
+    """Try to run an `Aggregate -> Join*` (snowflake star-join + grouped
+    aggregate) as one fused CUDA kernel.
+
+    Streams the fact table once, probes a chain of dimension hash tables
+    in-kernel, and accumulates straight into a dense per-group accumulator --
+    the joined frame is never materialised (the dominant cost of the cuDF
+    `merge` + `groupby` path). Returns a cuDF DataFrame, or None if the shape is
+    unsupported (the caller falls back to `self._exec(join)` + cuDF groupby).
+
+    Scope (deferred shapes return None -> cuDF): a single group key that is a
+    `Col` living in a dimension reached by the join chain; SUM / COUNT(*) over
+    fact-table columns; every join key int64/int32; a linear snowflake chain
+    from the fact table to the group-key dimension that covers every joined
+    table (no off-path branching dims, no pure-star legs); inner joins; no
+    Filter/Project/Sort under the Aggregate. Q3 (multi-key group + cross-table
+    filter), high-card group-from-join (HASH), non-int join keys, dimension agg
+    args, AVG/MIN/MAX/COUNT(col) over joins, and global-over-join all defer.
+    """
+    import cudf
+
+    if not _kernels.is_available:
+        return None
+    if not isinstance(node.input, Join):
+        return None
+
+    group_keys = node.group_keys
+    aggs = node.aggs
+    if len(group_keys) != 1:
+        return None
+    ge, gname = group_keys[0]
+    if not isinstance(ge, Col):
+        return None
+
+    # Aggs: COUNT(*) or SUM (numeric + fact-table-only checked later, once the
+    # fact frame is available). AVG/MIN/MAX/COUNT(col) over joins defer.
+    for af, _n in aggs:
+        if af.func == "COUNT" and isinstance(af.arg, Star):
+            continue
+        if af.func == "SUM":
+            continue
+        return None
+
+    # Only Scan and Join may appear under the Aggregate (no Filter/Project/...).
+    # Each join must be a single-pair inner equi-join.
+    scans: list[Scan] = []
+    edges: list[tuple[str, str]] = []
+    for n in walk(node.input):
+        if isinstance(n, Scan):
+            scans.append(n)
+        elif isinstance(n, Join):
+            if n.how != "inner" or len(n.on_left) != 1:
+                return None
+            edges.append((n.on_left[0], n.on_right[0]))
+        else:
+            return None
+    if not scans or len(edges) != len(scans) - 1:
+        return None  # not a tree -> defer
+
+    # Attribute each bare column name to a table among this query's scans. TPC-H
+    # prefixes keep names globally unique; an ambiguous name -> defer.
+    schema = engine.catalog.schema_dict()
+    scan_tables = [s.table for s in scans]
+    col_to_table: dict[str, str] = {}
+    for t in scan_tables:
+        for c in schema.get(t, []):
+            if c in col_to_table:
+                return None
+            col_to_table[c] = t
+
+    # Fact = the largest scan (streamed). Dimensions = the rest. The optimizer's
+    # join-side swap is handled by walking the join graph undirected from the
+    # fact, so the fact's position in the tree does not matter.
+    stats = engine.catalog.stats_dict()
+    fact_scan = max(scans, key=lambda s: stats.get(s.table, 0))
+    fact_table = fact_scan.table
+    target_dim = col_to_table.get(ge.name)
+    if target_dim is None or target_dim == fact_table:
+        return None  # group key must live in a joined dimension, not the fact
+
+    # Undirected adjacency over the join tree: table -> [(neigh, col_here, col_neigh)].
+    adj: dict[str, list[tuple[str, str, str]]] = {t: [] for t in scan_tables}
+    for a, b in edges:
+        ta, tb = col_to_table.get(a), col_to_table.get(b)
+        if ta is None or tb is None or ta == tb:
+            return None
+        adj[ta].append((tb, a, b))
+        adj[tb].append((ta, b, a))
+
+    # BFS from fact to the group-key dimension; record each step's parent edge.
+    parent: dict[str, tuple[str, str, str] | None] = {fact_table: None}
+    order = [fact_table]
+    i = 0
+    while i < len(order) and target_dim not in parent:
+        cur = order[i]
+        i += 1
+        for nb, ca, cb in adj[cur]:
+            if nb not in parent:
+                parent[nb] = (cur, ca, cb)  # ca = col on cur's side, cb = col on nb's side
+                order.append(nb)
+    if target_dim not in parent:
+        return None  # group-key dim not reachable from fact -> defer
+
+    # Walk back target_dim -> fact: path_dims[j] = (dim_table, dim_key_col,
+    # probe_key_col) where probe_key_col is on the already-connected side (fact
+    # for j=0, dim j-1 for j>0). The kernel reads only the FIRST probe key from a
+    # fact column; later probe keys are carried as the previous dim's payload.
+    path_dims: list[tuple[str, str, str]] = []
+    cur = target_dim
+    while cur != fact_table:
+        par, ca, cb = parent[cur]
+        path_dims.append((cur, cb, ca))
+        cur = par
+    path_dims.reverse()
+    if path_dims[0][2] not in schema.get(fact_table, []):
+        return None
+    # Every scan must lie on the path (no off-path branching dims).
+    if {fact_table} | {d[0] for d in path_dims} != set(scan_tables):
+        return None
+
+    # Payloads: dim j bridges to dim j+1 via payload = next step's probe key (a
+    # col of dim j). The last dim's payload = the group-key col (factorised to a
+    # dense code on the host). A pure-star leg (next probe is a fact col, not a
+    # col of dim j) defers.
+    n_joins = len(path_dims)
+    payloads: list[str] = []
+    for j in range(n_joins):
+        if j < n_joins - 1:
+            pl = path_dims[j + 1][2]
+            if pl not in schema.get(path_dims[j][0], []):
+                return None
+            payloads.append(pl)
+        else:
+            payloads.append(ge.name)
+    if ge.name not in schema.get(path_dims[-1][0], []):
+        return None
+
+    # --- execute the scan leaves (cached on warm runs; same nodes the cuDF
+    # merge path executes, so the scan cache is shared) ---
+    scan_by_table = {s.table: s for s in scans}
+    fact_frame = engine._exec(scan_by_table[fact_table])
+    dim_frames = [engine._exec(scan_by_table[path_dims[j][0]]) for j in range(n_joins)]
+    n = len(fact_frame)
+
+    # Verify needed columns survived projection pushdown; bail if not.
+    fact_cols_needed = {path_dims[0][2]}
+    for af, _ in aggs:
+        if not (af.func == "COUNT" and isinstance(af.arg, Star)):
+            fact_cols_needed |= af.arg.columns()
+    for c in fact_cols_needed:
+        if c not in fact_frame.columns:
+            return None
+    for j in range(n_joins):
+        if path_dims[j][1] not in dim_frames[j].columns or payloads[j] not in dim_frames[j].columns:
+            return None
+
+    # Agg args must be numeric and live in the fact table.
+    for af, _n in aggs:
+        if af.func == "COUNT" and isinstance(af.arg, Star):
+            continue
+        if not _is_numeric_expr(af.arg, fact_frame):
+            return None
+        for c in af.arg.columns():
+            if col_to_table.get(c) != fact_table:
+                return None
+
+    # n==0 -> empty grouped result.
+    if n == 0:
+        return _empty_result({"group_keys": group_keys, "aggs": aggs})
+
+    # --- bind fact columns (first probe key + agg-arg cols) ---
+    col_ptrs: list[int] = []
+    col_dtypes: list[int] = []
+    name_idx: dict[str, int] = {}
+    _kept: list[object] = []
+
+    def bind_fact(name: str) -> int:
+        if name in name_idx:
+            return name_idx[name]
+        col = fact_frame[name]
+        dt = col.dtype
+        if np.issubdtype(dt, np.datetime64):
+            arr = _to_int64_seconds(col)
+            _kept.append(arr)
+            ptr, dcode = _dev_ptr(arr), _DT_INT64
+        elif np.issubdtype(dt, np.integer) or "int" in str(dt):
+            if np.issubdtype(dt, np.int64):
+                arr = col
+            else:
+                arr = col.astype(np.int64)
+                _kept.append(arr)
+            ptr, dcode = _dev_ptr(arr), _DT_INT64
+        elif np.issubdtype(dt, np.floating) or "float" in str(dt):
+            ptr, dcode = _dev_ptr(col), _DT_FLOAT64
+        else:
+            raise ValueError(f"fused join cannot bind non-numeric column {name}")
+        idx = len(col_ptrs)
+        col_ptrs.append(ptr)
+        col_dtypes.append(dcode)
+        name_idx[name] = idx
+        return idx
+
+    # The first probe key is a join key -> must be integer (read raw int64).
+    first_probe_name = path_dims[0][2]
+    fp_dt = fact_frame[first_probe_name].dtype
+    if not (np.issubdtype(fp_dt, np.integer) or "int" in str(fp_dt)):
+        return None  # non-int join key deferred
+    try:
+        for c in fact_cols_needed:
+            bind_fact(c)
+    except ValueError:
+        return None
+    first_probe_col = name_idx[first_probe_name]
+
+    # --- build dimension HT inputs: (key, payload) int64 device ptrs ---
+    dim_key_ptrs: list[int] = []
+    dim_payload_ptrs: list[int] = []
+    dim_n: list[int] = []
+    ht_cap: list[int] = []
+    n_groups = 0
+    gkey_uniques: list = []
+
+    def _as_int64(series):
+        if np.issubdtype(series.dtype, np.int64):
+            return series
+        arr = series.astype(np.int64)
+        _kept.append(arr)
+        return arr
+
+    for j in range(n_joins):
+        dframe = dim_frames[j]
+        key_col = path_dims[j][1]
+        kseries = dframe[key_col]
+        if not (np.issubdtype(kseries.dtype, np.integer) or "int" in str(kseries.dtype)):
+            return None  # non-int join key deferred
+        # PK guard (cached): a non-unique dim key would silently collapse joins.
+        if not engine.is_unique_key(path_dims[j][0], key_col, kseries):
+            return None
+        dim_key_ptrs.append(_dev_ptr(_as_int64(kseries)))
+
+        if j < n_joins - 1:
+            pseries = dframe[payloads[j]]
+            if not (np.issubdtype(pseries.dtype, np.integer) or "int" in str(pseries.dtype)):
+                return None  # bridging payload is the next join key -> must be int
+            dim_payload_ptrs.append(_dev_ptr(_as_int64(pseries)))
+        else:
+            # Last dim: payload = factorised group-key codes (dense 0..n_groups-1).
+            codes, uniq = engine.get_codes(path_dims[j][0], payloads[j], dframe[payloads[j]])
+            _kept.append(codes)
+            dim_payload_ptrs.append(_dev_ptr(codes))
+            n_groups = len(uniq)
+            gkey_uniques = uniq
+
+        dn = len(dframe)
+        if 2 * dn > _HASH_CAP_MAX:
+            return None  # HT too large -> cuDF fallback
+        dim_n.append(dn)
+        ht_cap.append(_next_pow2(2 * dn))
+
+    nagg = len(aggs)
+    if n_groups * nagg > MAX_ACC_CELLS:
+        return None  # high-card group-from-join -> defer (DENSE only)
+
+    # --- aggregate descriptors (SUM/COUNT only this step; no hidden AVG slot) ---
+    _AGG_KIND = {"COUNT": _AGG_COUNT, "SUM": _AGG_SUM}
+    agg_kind: list[int] = []
+    agg_tok_start: list[int] = []
+    agg_tok_len: list[int] = []
+    tok_kind: list[int] = []
+    tok_col: list[int] = []
+    tok_lit: list[float] = []
+    tok_op: list[int] = []
+    for af, _n in aggs:
+        start = len(tok_kind)
+        if af.func == "COUNT" and isinstance(af.arg, Star):
+            agg_kind.append(_AGG_COUNT)
+            agg_tok_start.append(start)
+            agg_tok_len.append(0)
+            continue
+        toks = _to_postfix(af.arg, bind_fact)
+        for k, a, b in toks:
+            tok_kind.append(k)
+            tok_lit.append(b)
+            if k == _TK_OP:
+                tok_col.append(0)
+                tok_op.append(a)
+            else:
+                tok_col.append(a)
+                tok_op.append(0)
+        agg_kind.append(_AGG_KIND[af.func])
+        agg_tok_start.append(start)
+        agg_tok_len.append(len(toks))
+
+    # No predicate (this path requires no Filter under the Aggregate).
+    pred_col = np.empty(0, dtype=np.int32)
+    pred_op = np.empty(0, dtype=np.int32)
+    pred_lit = np.empty(0, dtype=np.float64)
+
+    # Per-slot acc init: +inf/-inf for MIN/MAX, 0 otherwise (all 0 for SUM/COUNT).
+    per_slot = np.array(
+        [np.inf if k == _AGG_MIN else -np.inf if k == _AGG_MAX else 0.0 for k in agg_kind],
+        dtype=np.float64,
+    )
+    acc_init = np.tile(per_slot, n_groups)
+
+    try:
+        overflow, n_out, keys_list, aggs_list = _kernels.fused_join_agg(
+            np.array(col_ptrs, dtype=np.int64), np.array(col_dtypes, dtype=np.int32),
+            int(first_probe_col),
+            np.array(dim_key_ptrs, dtype=np.int64),
+            np.array(dim_payload_ptrs, dtype=np.int64),
+            np.array(dim_n, dtype=np.int32), np.array(ht_cap, dtype=np.int32),
+            pred_col, pred_op, pred_lit,
+            np.array(agg_kind, dtype=np.int32),
+            np.array(agg_tok_start, dtype=np.int32),
+            np.array(agg_tok_len, dtype=np.int32),
+            np.array(tok_kind, dtype=np.int32), np.array(tok_col, dtype=np.int32),
+            np.array(tok_lit, dtype=np.float64), np.array(tok_op, dtype=np.int32),
+            acc_init, int(n_groups), int(n),
+        )
+    except Exception:  # noqa: BLE001 -- never let a C++ fault break correctness
+        return None
+    if overflow != 0:
+        return None  # a dim HT filled -> cuDF fallback
+    if n_out == 0:
+        return _empty_result({"group_keys": group_keys, "aggs": aggs})
+
+    # --- assemble cuDF frame (single group key: code -> unique value) ---
+    codes = np.asarray(keys_list[0], dtype=np.int64)
+    data: dict = {gname: cudf.Series([gkey_uniques[int(c)] for c in codes])}
+    for a, (af, n_) in enumerate(aggs):
+        vals = np.asarray(aggs_list[a], dtype=np.float64)
+        if af.func == "COUNT" and isinstance(af.arg, Star):
+            data[n_] = cudf.Series(vals.astype(np.int64))
+        else:
+            data[n_] = cudf.Series(vals)
+    out = cudf.DataFrame(data)
+    return out[[gname] + [n_ for _, n_ in aggs]]

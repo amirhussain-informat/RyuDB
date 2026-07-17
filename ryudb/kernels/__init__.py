@@ -32,7 +32,9 @@ def _load():
 try:
     _mod = _load()
     fused_agg = _mod.fused_agg
+    fused_join_agg = _mod.fused_join_agg
     is_available = True
 except ImportError:
     fused_agg = None  # type: ignore[assignment]
+    fused_join_agg = None  # type: ignore[assignment]
     is_available = False

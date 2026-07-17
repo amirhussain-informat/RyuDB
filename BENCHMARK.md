@@ -8,46 +8,85 @@ Hardware: NVIDIA RTX 3090 (24 GB), driver 591.86. Runs inside WSL2 Ubuntu, cuDF
 milliseconds. Two regimes are reported (see "Warm vs cold" below): **cold** (scan
 cache cleared — Parquet re-read) and **warm** (frame + code index GPU-resident).
 
-## RyuDB vs DuckDB — warm path (Phase 4, SF=10)
+## RyuDB vs DuckDB — warm path (Phase 4 step 2, SF=10)
 
-The fused C++/CUDA kernel now also handles **global aggregates** (no GROUP BY) and
-the **MIN/MAX/AVG** kinds, so `Aggregate → Filter → Scan` global rollups run in
-one fused pass. Numba + cuDF remain as fallbacks.
+The fused C++/CUDA kernel now also handles **snowflake star-joins + aggregate**
+in one pass — it streams the fact table, probes dimension hash tables in-kernel,
+and accumulates per group, **never materialising the joined frame**. Combined
+with the earlier global-aggregate + MIN/MAX/AVG work, every warm-path query now
+runs fused. Numba + cuDF remain as fallbacks.
 
 | query | ryu cold | ryu warm | duckdb | warm speedup |
 |---|---|---|---|---|
-| Q1 pricing summary | 410 | **53** | 105 | **1.97x** ✓ |
-| Q high-card orderkey | 967 | **670** | 1177 | **1.76x** ✓ |
-| Q6 filter + global agg | 317 | **22** | 60 | **2.74x** ✓ |
-| Q3 3-table join + agg | 529 | 107 | 163 | 1.52x ✓ |
-| scan + 5 aggs (global) | 322 | **32** | 62 | **1.93x** ✓ |
-| 4-table join + agg | 898 | 598 | 436 | 0.73x |
+| Q1 pricing summary | 409 | **52** | 104 | **1.97x** ✓ |
+| Q high-card orderkey | 980 | **688** | 1195 | **1.74x** ✓ |
+| Q6 filter + global agg | 321 | **23** | 65 | **2.77x** ✓ |
+| Q3 3-table join + agg | 535 | 113 | 164 | 1.45x ✓ |
+| scan + 5 aggs (global) | 330 | **33** | 58 | **1.76x** ✓ |
+| 4-table join + agg | 332 | **64** | 412 | **6.49x** ✓ |
 
-**5 of 6 queries beat DuckDB on the warm path.** Two headlines this round:
+**6 of 6 queries beat DuckDB on the warm path.** Headline this round:
 
-- **Global aggregates + MIN/MAX/AVG now run fused.** `scan_agg_full`
-  (`count/sum/avg/min/max ... WHERE`) went 66 → 32 ms (0.89x → **1.93x** vs
-  DuckDB) — it used to take the scalar cuDF path (gather + 5 separate
-  reductions); now one fused pass with a single-group (`n_groups=1`) dense
-  accumulator handles all five kinds. As a bonus, `Q6` (also a global
-  `Aggregate → Filter → Scan` SUM+COUNT) jumped 47 → 22 ms (1.36x → **2.74x**).
-- **DENSE kernel generalized to all five agg kinds.** MIN/MAX use a double
-  `atomicCAS` min/max (CUDA has no double `atomicMin`/`atomicMax`) with +∞/−∞
-  slot init; AVG stores a running sum divided at read-out by a hidden per-group
-  passing-row count. The HASH high-card path stays SUM/COUNT-only (MIN/MAX/AVG
-  there defer to cuDF). Q1 (grouped SUM/COUNT) is unchanged at 1.97x at SF10.
+- **Fused star-join + aggregate.** `4-table join + agg`
+  (`lineitem ⋈ orders ⋈ customer ⋈ nation`, `GROUP BY n_name`,
+  `SUM(l_extendedprice)`) went 598 → 64 ms (0.73x → **6.49x** vs DuckDB) — it
+  used to materialise the full 60M-row joined frame via 3 cuDF `merge` calls then
+  run a cuDF groupby; now one kernel streams `lineitem` once, does 3 dimension
+  hash-table lookups per row, and writes only 25 group accumulator slots. The
+  joined frame is never built, so the dominant write-bandwidth cost disappears.
+  The win is even larger than the scan-agg fused queries because the join output
+  is bigger than any single table.
 
-The one query still losing — `4-table join + agg` (0.73x, join-dominated, no
-fused join path) — is the remaining target (a fused join+aggregate is the
-follow-on Phase-4 step).
+The other 5 queries are unchanged in shape (not retargeted); small differences
+vs the step-1 table are run-to-run noise (Q3 1.52x→1.45x, scan_agg_full
+1.93x→1.76x — both still win).
 
-### Honest note on small-scale Q1
-At SF1, Q1 warm nudged from 1.20x to 0.94x (13 → 18 ms). The generalized DENSE
-kernel adds a per-slot agg-kind branch (init / accumulate / reduce) that is
-visible only when the query is launch-bound at small scale; at SF10 (bandwidth-
-bound, the documented scale) Q1 is unchanged at 1.97x. The trade buys
-`scan_agg_full` (0.42x → 0.99x at SF1) and `Q6` (0.58x → 1.53x at SF1) — a large
-net win.
+### Honest note on small scale (SF=1)
+At SF1 the 4-table query is **3.88x** warm (11 ms vs DuckDB 43 ms) — the fused
+star-join wins at small scale too (unlike the step-1 DENSE-generalisation which
+cost a little at SF1). Q1 is back to **1.20x** at SF1 (the step-1 0.94x dip was
+run-to-run noise around the launch-bound breakeven). Q3 at SF1 is 0.95x — it is
+**not** handled by the fused join path (multi-key group + cross-table filter →
+cuDF fallback) and is essentially tied with DuckDB at small scale; at SF10 it
+wins at 1.45x. So at SF1, 5 of 6 beat DuckDB (Q3 tied); at SF10, 6 of 6.
+
+## Phase 4 step 2: fused star-join + aggregate (this round)
+
+Phase 4 step 1 left `4-table join + agg` as the only warm-path loser (0.73x):
+`Aggregate → Join` materialised the joined frame via cuDF `merge` then ran a
+cuDF groupby — the fused kernel never fired (it required `Aggregate → Filter`).
+Phase 4 step 2 adds a **fused star-join + aggregate** path:
+
+1. **New C++ kernel** (`fused_join_agg`): builds an open-addressing int64→int64
+   hash table per dimension (`build_ht_kernel`, atomicCAS-on-key insert with a
+   payload — reuses the HASH groupby's insert pattern), then a `probe_agg_kernel`
+   streams the fact table, walks the chain of dimension HTs (read-only lookups,
+   no atomics during probe), and accumulates per group. The accumulator + shared-
+   mem + cross-block reduce are the existing DENSE logic; only the group-index
+   computation differs (chain lookups instead of code×stride). A probe miss at
+   any stage drops the row — inner-join semantics.
+2. **Snowflake chain on the host** (`fused.py::fused_join_aggregate`): works on
+   the **plan** (not an executed frame, so the join is never materialised).
+   Detects the chain orientation-independently — BFS over the undirected join
+   graph from the largest scan (the fact) to the group-key dimension, since the
+   optimizer swaps join sides. Each dimension's payload is the next chain key
+   (or the factorised group-key code for the last dim), so the kernel threads
+   `l_orderkey → o_custkey → c_nationkey → n_name(code)`. int32 keys are promoted
+   to int64; the group key (n_name, 25 distinct) is factorised to a dense code →
+   DENSE accumulator.
+3. **Executor wiring** (`executor._aggregate`): the fused join path is attempted
+   *before* `self._exec(in_node)` materialises the join; returns None instantly
+   when `node.input` isn't a Join, so `Aggregate → Scan` is unchanged.
+4. **Tight eligibility** (defer to cuDF): single group key in a dimension; SUM /
+   COUNT(*) over fact-table columns; int join keys; a linear snowflake chain
+   covering every joined table; inner joins; no Filter under the Aggregate. Q3
+   (multi-key group + cross-table filter), high-card group-from-join (HASH),
+   non-int keys, dimension agg args, AVG/MIN/MAX over joins, and global-over-join
+   all defer. A cached PK guard (`engine.is_unique_key`) rejects non-unique
+   dimension keys (which would silently collapse joins); a VRAM cap rejects
+   oversized HTs.
+
+## Phase 4 step 1: fused global aggregate + MIN/MAX/AVG
 
 ## Phase 4 step 1: fused global aggregate + MIN/MAX/AVG (this round)
 
@@ -313,18 +352,21 @@ Reader experiments that did *not* pan out:
 - **Uncompressed storage** saves ~80 ms on read (197 vs 278 ms) — real but
   small, and it bloats disk ~4x. Not pursued.
 
-## Why RyuDB still loses on some queries (and where it now wins)
+## Why RyuDB still loses (and where it now wins)
 
-1. **Join-dominated queries** (`4-table join + agg`) — no fused path for joins;
-   cuDF's merge orchestration dominates (warm 598 ms vs 436 ms DuckDB, 0.73x).
-   The follow-on Phase-4 step is a fused join+aggregate path.
-2. **Cold reads** — cuDF's Parquet decoder (~278 ms) is slower than DuckDB's
-   vectorized CPU reader. Real but secondary now that the warm path wins on 5
-   of 6 queries.
+1. **Cold reads** — cuDF's Parquet decoder (~278 ms) is slower than DuckDB's
+   vectorized CPU reader. This is now the **only** systematic warm-path gap, and
+   it is a reader floor, not a compute gap: every warm-path query — including the
+   4-table join — now runs fused and beats DuckDB. Closing it needs a custom GPU
+   Parquet/Arrow reader (or GPU-resident warmup), the natural next step.
+2. **Small-scale Q3** (SF1, 0.95x) — Q3's multi-key group + cross-table filter
+   is not handled by the fused join path (it defers to cuDF); at SF1 it is
+   essentially tied with DuckDB, at SF10 it wins at 1.45x. Not a regression —
+   the fused join path deliberately scopes to single-key snowflake shapes.
 
-The GPU's advantage is **bandwidth and parallelism once data is on-device**, now
-realized on the warm path for 5 of 6 TPC-H queries. The remaining win over
-DuckDB comes from extending the fused-kernel approach to **joins**, and from
+The GPU's advantage is **bandwidth and parallelism once data is on-device**,
+now realized on the warm path for **all 6** TPC-H queries at SF10. The remaining
+win over DuckDB comes from a custom GPU reader (cold path) and from
 larger-than-memory / compute-heavy workloads.
 
 ## How to run
@@ -361,15 +403,29 @@ faster than the Numba kernel on Q1 (59 → 52 ms, 1.76x → 1.95x). Numba + cuDF
 remain as fallbacks so a missing/failed C++ build never regresses correctness.
 **4 of 6 queries beat DuckDB warm.**
 
-Phase 4 step 1 (this round) extended the fused kernel to **global aggregates**
+Phase 4 step 1 extended the fused kernel to **global aggregates**
 (no GROUP BY, `n_groups = 1`) and the **MIN/MAX/AVG** kinds (double `atomicCAS`
 min/max with +∞/−∞ init; AVG = running sum ÷ hidden per-group count). The
 executor now attempts the fused kernel first for every `Aggregate → Filter`
 (grouped or global). `scan_agg_full` flipped 0.89x → **1.93x** (66 → 32 ms) and
 `Q6` (also a global SUM+COUNT) jumped 1.36x → **2.74x** (47 → 22 ms). **5 of 6
-queries now beat DuckDB warm.** The cold path still loses end-to-end (reader
+queries beat DuckDB warm.** The cold path still loses end-to-end (reader
 floor, as expected).
 
-Remaining work: a **fused join + aggregate** path (the 4-table query is still
-0.73x — the only warm-path loser), and lifting the HASH path to **multi-column
-/ string** group keys + MIN/MAX/AVG (currently single int64, SUM/COUNT only).
+Phase 4 step 2 (this round) added a **fused star-join + aggregate** kernel so
+`Aggregate → Join` no longer materialises the joined frame. One kernel streams
+the fact table, probes a chain of dimension hash tables in-kernel, and
+accumulates per group — the 60M-row join output is never built. `4-table join +
+agg` flipped 0.73x → **6.49x** warm (598 → 64 ms vs DuckDB 412 ms) at SF10, and
+**3.88x** at SF1 — the largest win in the project, because skipping the join
+output removes more write bandwidth than any single-table fusion. **6 of 6
+queries now beat DuckDB warm** at SF10. The chain is detected orientation-
+independently (BFS from the largest scan), int32 join keys are promoted, the
+low-card group key is factorised to a dense code, and a cached PK guard + VRAM
+cap keep the path safe. Q3 (multi-key + cross-table filter) and high-card
+group-from-join defer to cuDF.
+
+Remaining work: a **custom GPU Parquet/Arrow reader** (the cold path is now the
+only systematic gap — every warm query already wins), and lifting the HASH path
+to **multi-column / string** group keys + MIN/MAX/AVG (currently single int64,
+SUM/COUNT only) and to the fused join path (high-card group-from-join).

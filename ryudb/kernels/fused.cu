@@ -250,6 +250,106 @@ __global__ void compact_kernel(const long long *key, const double *acc, int capa
     }
 }
 
+// ---------------- FUSED STAR-JOIN + AGGREGATE ----------------
+//
+// Streams the fact table once, walks a chain of dimension hash tables in-kernel
+// (probe-side streaming + late materialisation -- the joined frame is never
+// built), and accumulates straight into a dense per-group accumulator. The
+// final dimension's payload is the (factorised) group key code, so the group
+// index g is produced by the chain lookups -- everything else reuses the DENSE
+// accumulator logic. Inner-join semantics: a probe miss at any stage drops the
+// row (no accumulation, seen not set).
+//
+// Dimension HTs are built once (build_ht_kernel) and probed read-only
+// (probe_agg_kernel -- no atomics during probe). All keys/payloads are int64
+// (int32 keys are promoted on the Python side). TPC-H join targets are primary
+// keys, so dim keys are unique; build_ht_kernel keeps the first payload on a
+// duplicate key (last-writer-wins would race) -- the Python side gates out
+// non-unique dim keys.
+
+// Build an open-addressing int64->int64 hash table from (key[p], payload[p]).
+// atomicCAS on the key slot is the publish (same pattern as hash_kernel).
+__global__ void build_ht_kernel(const long long *key, const long long *payload, int n,
+                                long long *ht_key, long long *ht_payload, int capacity,
+                                int *overflow) {
+    for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < n; r += gridDim.x * blockDim.x) {
+        long long mykey = key[r];
+        if (mykey == HASH_EMPTY) { atomicExch(overflow, 1); continue; }
+        unsigned long long h = (unsigned long long)mykey;
+        h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+        h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
+        int slot = (int)(h & (unsigned long long)(capacity - 1));
+        bool placed = false;
+        for (int probe = 0; probe < 64; probe++) {
+            long long old = (long long)atomicCAS((unsigned long long *)&ht_key[slot],
+                                                 (unsigned long long)HASH_EMPTY,
+                                                 (unsigned long long)mykey);
+            if (old == HASH_EMPTY) { ht_payload[slot] = payload[r]; placed = true; break; }
+            if (old == mykey) { placed = true; break; }  // dup key: keep first payload
+            slot = (slot + 1) & (capacity - 1);
+        }
+        if (!placed) atomicExch(overflow, 1);
+    }
+}
+
+// Probe the chain of dimension HTs and accumulate per group (DENSE). Reuses
+// pass_pred (no-op when n_pred==0) and eval_agg (reads fact cols at row i).
+// ht_key/ht_payload are device arrays of per-join device pointers; ht_cap the
+// per-join power-of-two capacity. first_probe_col is a fact DT_INT64 column.
+__global__ void probe_agg_kernel(Plan p, const long long **ht_key, const long long **ht_payload,
+                                 const int *ht_cap, int n_joins, int first_probe_col,
+                                 double *acc, int *seen, int n_groups, int nagg) {
+    extern __shared__ double sh[];
+    int t = threadIdx.x;
+    int nga = n_groups * nagg;
+    for (int k = t; k < nga; k += blockDim.x) sh[k] = init_for_kind(p.agg_kind[k % nagg]);
+    __syncthreads();
+    for (int i = blockIdx.x * blockDim.x + t; i < p.n; i += gridDim.x * blockDim.x) {
+        if (!pass_pred(p, i)) continue;
+        long long key = ((const long long *)p.cols[first_probe_col])[i];
+        bool dropped = false;
+        for (int j = 0; j < n_joins; j++) {
+            int cap = ht_cap[j];
+            unsigned long long h = (unsigned long long)key;
+            h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+            h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
+            int slot = (int)(h & (unsigned long long)(cap - 1));
+            int found = -1;
+            for (int probe = 0; probe < 64; probe++) {
+                long long k = ht_key[j][slot];  // read-only HT
+                if (k == HASH_EMPTY) break;      // miss -> inner-join drop
+                if (k == key) { found = slot; break; }
+                slot = (slot + 1) & (cap - 1);
+            }
+            if (found < 0) { dropped = true; break; }
+            key = ht_payload[j][found];  // carry payload -> next probe key
+        }
+        if (dropped) continue;
+        long long g = key;  // final payload = group code
+        if (g < 0 || g >= n_groups) continue;
+        for (int a = 0; a < p.nagg; a++) {
+            int kind = p.agg_kind[a];
+            double *slot = &sh[g * nagg + a];
+            if (kind == AGG_MIN) {
+                atomic_min_d(slot, eval_agg(p, i, a));
+            } else if (kind == AGG_MAX) {
+                atomic_max_d(slot, eval_agg(p, i, a));
+            } else {
+                double val = kind == AGG_COUNT ? 1.0 : eval_agg(p, i, a);
+                atomicAdd(slot, val);
+            }
+        }
+        atomicMax(&seen[g], 1);
+    }
+    __syncthreads();
+    for (int k = t; k < nga; k += blockDim.x) {
+        int kind = p.agg_kind[k % nagg];
+        if (kind == AGG_MIN) atomic_min_d(&acc[k], sh[k]);
+        else if (kind == AGG_MAX) atomic_max_d(&acc[k], sh[k]);
+        else atomicAdd(&acc[k], sh[k]);
+    }
+}
+
 // ---------------- helpers ----------------
 static void check(cudaError_t e, const char *what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
@@ -485,4 +585,186 @@ py::tuple fused_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes
     return py::make_tuple(overflow, n_out, keys_list, aggs_list);
 }
 
-PYBIND11_MODULE(fused, m) { m.def("fused_agg", &fused_agg); }
+// ---------------- host entry point: fused star-join + aggregate ----------------
+//
+// Streams the fact table, builds a dimension hash table per join, probes the
+// chain, and accumulates per group (DENSE). The joined frame is never built.
+//
+// Args (all numpy arrays unless noted):
+//   col_ptrs        : int64 device pointers per FACT column
+//   col_dtypes      : int32 DT_* per fact column
+//   first_probe_col : int -- fact column index of the first join's probe key (DT_INT64)
+//   dim_key_ptrs    : int64 (n_joins,) device addresses of each dim KEY column (int64)
+//   dim_payload_ptrs: int64 (n_joins,) device addresses of each dim PAYLOAD column (int64)
+//   dim_n           : int32 (n_joins,) row counts per dimension
+//   ht_cap          : int32 (n_joins,) power-of-two capacities per HT
+//   pred_col,pred_op: int32 (n_pred)  pred_lit: float64 (n_pred)
+//   agg_kind,agg_tok_start,agg_tok_len : int32 (nagg)
+//   tok_kind:int32 (ntok) tok_col:int32 tok_lit:float64 tok_op:int32
+//   acc_init : float64 (n_groups*nagg) per-slot init
+//   n_groups : int (DENSE group count)   n_rows : int (fact row count)
+//
+// Returns (overflow:int, n_out:int, keys:py::list[int64 arrays (1 col, the codes)],
+//          aggs:py::list[float64 arrays]). overflow!=0 -> caller falls back to cuDF.
+py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes,
+                         int first_probe_col,
+                         py::array_t<long long> dim_key_ptrs,
+                         py::array_t<long long> dim_payload_ptrs,
+                         py::array_t<int> dim_n, py::array_t<int> ht_cap,
+                         py::array_t<int> pred_col, py::array_t<int> pred_op,
+                         py::array_t<double> pred_lit, py::array_t<int> agg_kind,
+                         py::array_t<int> agg_tok_start, py::array_t<int> agg_tok_len,
+                         py::array_t<int> tok_kind, py::array_t<int> tok_col,
+                         py::array_t<double> tok_lit, py::array_t<int> tok_op,
+                         py::array_t<double> acc_init,
+                         int n_groups, int n_rows) {
+    int ncol = (int)col_ptrs.shape(0);
+    int nagg = (int)agg_kind.shape(0);
+    int ntok = (int)tok_kind.shape(0);
+    int n_pred = (int)pred_col.shape(0);
+    int n_joins = (int)dim_n.shape(0);
+
+    auto ptrs_info = col_ptrs.request();
+    const void **d_cols = nullptr;
+    check(cudaMalloc(&d_cols, sizeof(void *) * ncol), "malloc cols join");
+    check(cudaMemcpy(d_cols, ptrs_info.ptr, sizeof(void *) * ncol, cudaMemcpyHostToDevice),
+          "memcpy cols join");
+
+    Plan p{};
+    p.cols = d_cols;
+    p.dtypes = np_dev(col_dtypes);
+    p.ngkey = 0;  // group index comes from the join chain, not gkey_idx
+    p.n_pred = n_pred;
+    p.pred_col = np_dev(pred_col);
+    p.pred_op = np_dev(pred_op);
+    p.pred_lit = np_dev(pred_lit);
+    p.nagg = nagg;
+    p.agg_kind = np_dev(agg_kind);
+    p.agg_tok_start = np_dev(agg_tok_start);
+    p.agg_tok_len = np_dev(agg_tok_len);
+    p.ntok = ntok;
+    p.tok_kind = np_dev(tok_kind);
+    p.tok_col = np_dev(tok_col);
+    p.tok_lit = np_dev(tok_lit);
+    p.tok_op = np_dev(tok_op);
+    p.n = n_rows;
+
+    auto dk_info = dim_key_ptrs.request();
+    auto dp_info = dim_payload_ptrs.request();
+    auto dn_info = dim_n.request();
+    auto cap_info = ht_cap.request();
+    long long *dk_host = static_cast<long long *>(dk_info.ptr);
+    long long *dp_host = static_cast<long long *>(dp_info.ptr);
+    int *dn_host = static_cast<int *>(dn_info.ptr);
+    int *cap_host = static_cast<int *>(cap_info.ptr);
+
+    const int THREADS = 256;
+    int overflow = 0;
+    int n_out = 0;
+    py::list keys_list;
+    py::list aggs_list;
+
+    // --- build one HT per dimension ---
+    std::vector<long long *> ht_key(n_joins, nullptr);
+    std::vector<long long *> ht_payload(n_joins, nullptr);
+    int *d_ovf = nullptr;
+    check(cudaMalloc(&d_ovf, sizeof(int)), "malloc join ovf");
+    check(cudaMemset(d_ovf, 0, sizeof(int)), "memset join ovf");
+
+    for (int j = 0; j < n_joins; j++) {
+        int cap = cap_host[j];
+        int n = dn_host[j];
+        check(cudaMalloc(&ht_key[j], sizeof(long long) * cap), "malloc ht_key");
+        check(cudaMalloc(&ht_payload[j], sizeof(long long) * cap), "malloc ht_payload");
+        check(cudaMemset(ht_key[j], 0xFF, sizeof(long long) * cap), "memset ht_key");  // EMPTY
+        int blocks = (n + THREADS - 1) / THREADS;
+        if (blocks > 65535) blocks = 65535;
+        build_ht_kernel<<<blocks, THREADS>>>((const long long *)dk_host[j],
+                                             (const long long *)dp_host[j], n,
+                                             ht_key[j], ht_payload[j], cap, d_ovf);
+        check(cudaGetLastError(), "build_ht_kernel launch");
+    }
+    check(cudaDeviceSynchronize(), "build sync");
+    check(cudaMemcpy(&overflow, d_ovf, sizeof(int), cudaMemcpyDeviceToHost), "cp join ovf");
+
+    if (overflow != 0) {
+        for (int j = 0; j < n_joins; j++) { cudaFree(ht_key[j]); cudaFree(ht_payload[j]); }
+        cudaFree(d_ovf);
+        cudaFree((void *)p.dtypes); cudaFree((void *)p.pred_col); cudaFree((void *)p.pred_op);
+        cudaFree((void *)p.pred_lit); cudaFree((void *)p.agg_kind); cudaFree((void *)p.agg_tok_start);
+        cudaFree((void *)p.agg_tok_len); cudaFree((void *)p.tok_kind); cudaFree((void *)p.tok_col);
+        cudaFree((void *)p.tok_lit); cudaFree((void *)p.tok_op); cudaFree(d_cols);
+        return py::make_tuple(overflow, n_out, keys_list, aggs_list);
+    }
+
+    // --- device arrays of per-join HT pointers + capacities for the probe kernel ---
+    long long **d_htkey = nullptr, **d_htpayload = nullptr;
+    int *d_htcap = nullptr;
+    check(cudaMalloc(&d_htkey, sizeof(void *) * n_joins), "malloc d_htkey");
+    check(cudaMalloc(&d_htpayload, sizeof(void *) * n_joins), "malloc d_htpayload");
+    check(cudaMemcpy(d_htkey, ht_key.data(), sizeof(void *) * n_joins, cudaMemcpyHostToDevice),
+          "memcpy d_htkey");
+    check(cudaMemcpy(d_htpayload, ht_payload.data(), sizeof(void *) * n_joins, cudaMemcpyHostToDevice),
+          "memcpy d_htpayload");
+    d_htcap = np_dev(ht_cap);
+
+    // --- DENSE accumulator (single int64 group key = code 0..n_groups-1) ---
+    int nga = n_groups * nagg;
+    double *acc = nullptr;
+    int *seen = nullptr;
+    check(cudaMalloc(&acc, sizeof(double) * nga), "malloc join acc");
+    check(cudaMalloc(&seen, sizeof(int) * n_groups), "malloc join seen");
+    auto init_info = acc_init.request();
+    if (init_info.ndim > 0 && init_info.shape[0] > 0) {
+        check(cudaMemcpy(acc, init_info.ptr, sizeof(double) * nga, cudaMemcpyHostToDevice),
+              "cp join acc_init");
+    } else {
+        check(cudaMemset(acc, 0, sizeof(double) * nga), "memset join acc");
+    }
+    check(cudaMemset(seen, 0, sizeof(int) * n_groups), "memset join seen");
+
+    int blocks = (n_rows + THREADS - 1) / THREADS;
+    if (blocks > 65535) blocks = 65535;
+    size_t shbytes = sizeof(double) * nga;
+    probe_agg_kernel<<<blocks, THREADS, shbytes>>>(
+        p, (const long long **)d_htkey, (const long long **)d_htpayload, d_htcap,
+        n_joins, first_probe_col, acc, seen, n_groups, nagg);
+    check(cudaGetLastError(), "probe_agg_kernel launch");
+    check(cudaDeviceSynchronize(), "probe sync");
+
+    // --- read-out (single group key: code == group index g) ---
+    std::vector<double> h_acc(nga);
+    std::vector<int> h_seen(n_groups);
+    check(cudaMemcpy(h_acc.data(), acc, sizeof(double) * nga, cudaMemcpyDeviceToHost), "cp join acc");
+    check(cudaMemcpy(h_seen.data(), seen, sizeof(int) * n_groups, cudaMemcpyDeviceToHost), "cp join seen");
+    for (int g = 0; g < n_groups; g++)
+        if (h_seen[g]) n_out++;
+    std::vector<long long> h_keys(n_out);
+    std::vector<std::vector<double>> h_aggs(nagg, std::vector<double>(n_out));
+    int row = 0;
+    for (int g = 0; g < n_groups; g++) {
+        if (!h_seen[g]) continue;
+        h_keys[row] = g;  // code == group index
+        for (int a = 0; a < nagg; a++) h_aggs[a][row] = h_acc[g * nagg + a];
+        row++;
+    }
+    keys_list.append(py::array_t<long long>(n_out, h_keys.data()));
+    for (int a = 0; a < nagg; a++)
+        aggs_list.append(py::array_t<double>(n_out, h_aggs[a].data()));
+
+    // --- free everything ---
+    cudaFree(acc); cudaFree(seen); cudaFree(d_ovf);
+    cudaFree(d_htkey); cudaFree(d_htpayload); cudaFree((void *)d_htcap);
+    for (int j = 0; j < n_joins; j++) { cudaFree(ht_key[j]); cudaFree(ht_payload[j]); }
+    cudaFree((void *)p.dtypes); cudaFree((void *)p.pred_col); cudaFree((void *)p.pred_op);
+    cudaFree((void *)p.pred_lit); cudaFree((void *)p.agg_kind); cudaFree((void *)p.agg_tok_start);
+    cudaFree((void *)p.agg_tok_len); cudaFree((void *)p.tok_kind); cudaFree((void *)p.tok_col);
+    cudaFree((void *)p.tok_lit); cudaFree((void *)p.tok_op); cudaFree(d_cols);
+
+    return py::make_tuple(overflow, n_out, keys_list, aggs_list);
+}
+
+PYBIND11_MODULE(fused, m) {
+    m.def("fused_agg", &fused_agg);
+    m.def("fused_join_agg", &fused_join_agg);
+}
