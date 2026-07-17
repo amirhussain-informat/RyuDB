@@ -85,6 +85,67 @@ def engine(data_dir) -> Engine:
     return Engine(cat)
 
 
+# A typed TPC-H lineitem written the same way the bench generates data
+# (`bench/run_bench.py`): DuckDB `COPY ... TO parquet`, which stores
+# DECIMAL(15,2) as INT64, DATE as INT32, with Snappy compression -- the exact
+# on-disk layout the Phase 5 cold Parquet reader (fused_scan_agg) targets. The
+# float-typed `lineitem` above is fine for the executor/fused-kernel tests but
+# its FLOAT columns make the cold reader defer (it only reads INT physical
+# types), so the page-decode + scan-agg tests need this typed copy. ~130k rows
+# span DuckDB's default 122,880-row group boundary -> 2 row groups, so the
+# per-row-group launch loop and the page-header parser run across >1 group.
+# Value ranges are chosen so the Q6 / scan_agg / high-card predicates return
+# non-trivial (non-empty, non-all) results.
+_TYPED_LINEITEM_ROWS = 130000
+
+
+@pytest.fixture(scope="session")
+def typed_lineitem_dir(tmp_path_factory):
+    d = tmp_path_factory.mktemp("ryudb_typed")
+    (d / "lineitem").mkdir()
+    con = duckdb.connect()
+    con.execute(
+        "CREATE TABLE lineitem (l_orderkey BIGINT, l_quantity DECIMAL(15,2), "
+        "l_extendedprice DECIMAL(15,2), l_discount DECIMAL(15,2), "
+        "l_tax DECIMAL(15,2), l_shipdate DATE)"
+    )
+    # Deterministic synthetic rows: orderkey is unique (i+1) so DuckDB stores
+    # it PLAIN -- the v1 HASH group-key path reads a raw int64 at values_off and
+    # does not gather a dict index. quantity 1..50, discount 0.04..0.07, tax
+    # 0.01..0.04, shipdate across 1994-1995+ so the Q6 date window matches a
+    # real subset.
+    con.execute(
+        "INSERT INTO lineitem "
+        "SELECT i + 1, ((i % 50) + 1)::DECIMAL(15,2), "
+        "((i % 50) + 1) * 10::DECIMAL(15,2), "
+        "(0.04 + (i % 4) * 0.01)::DECIMAL(15,2), "
+        "(0.01 + (i % 4) * 0.01)::DECIMAL(15,2), "
+        "date '1994-01-01' + ((i % 730)::INTEGER) FROM range(130000) t(i)"
+    )
+    con.execute(
+        f"COPY (SELECT * FROM lineitem) TO '{d}/lineitem/0.parquet' "
+        "(FORMAT PARQUET, COMPRESSION 'snappy')"
+    )
+    con.close()
+    return d
+
+
+@pytest.fixture
+def typed_engine(typed_lineitem_dir) -> Engine:
+    cat = Catalog(str(typed_lineitem_dir))
+    cat.register("lineitem", str(typed_lineitem_dir / "lineitem"))
+    return Engine(cat)
+
+
+@pytest.fixture
+def typed_duck(typed_lineitem_dir) -> "duckdb.DuckDBPyConnection":
+    con = duckdb.connect()
+    con.execute(
+        f"CREATE VIEW lineitem AS SELECT * FROM read_parquet('{typed_lineitem_dir}/lineitem/*.parquet')"
+    )
+    return con
+
+
 @pytest.fixture
 def duck(data_dir) -> "duckdb.DuckDBPyConnection":
     con = duckdb.connect()

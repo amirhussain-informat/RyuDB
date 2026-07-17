@@ -7,6 +7,8 @@ RangeIndex so that Series and scalar broadcasts line up in Project/Aggregate.
 
 from __future__ import annotations
 
+import os
+
 import cudf
 
 from ..catalog import Catalog
@@ -25,7 +27,7 @@ from ..sql.plan import (
     Star,
 )
 from ..storage import scan
-from .fused import fused_aggregate, fused_join_aggregate
+from .fused import fused_aggregate, fused_join_aggregate, fused_scan_aggregate
 from .ops import eval_expr
 
 _AGG_METHOD = {"SUM": "sum", "AVG": "mean", "MIN": "min", "MAX": "max", "COUNT": "count"}
@@ -169,6 +171,20 @@ class Engine:
         # copying ~98% of 60M rows and cuts compute roughly in half.
         in_node = node.input
         if isinstance(in_node, Filter):
+            # Phase 5: the cold Parquet reader runs the whole Aggregate -> Filter
+            # -> Scan straight off the Parquet pages (nvCOMP Snappy -> decode ->
+            # filter -> accumulate) WITHOUT materialising the 60M-row cuDF frame.
+            # It is CORRECT and safely defers (None -> path below; correctness
+            # never depends on it), but at SF10 it is currently SLOWER than the
+            # cuDF materialising fallback: nvCOMP is invoked once per row group
+            # with ~7 chunks each, which underutilises the 82-SM GPU, and the
+            # dict-index decode is single-threaded per row group (see
+            # BENCHMARK.md). So it is OPT-IN via RYUDB_SCAN_KERNEL until a single
+            # batched nvCOMP call + parallel dict decode make it the cold winner.
+            if os.environ.get("RYUDB_SCAN_KERNEL"):
+                res = fused_scan_aggregate(node, self)
+                if res is not None:
+                    return res
             child = self._exec(in_node.input)
             # Phase 3b/4: try the fused C++/CUDA filter+groupby+aggregate kernel
             # first -- it now handles grouped AND global aggregates, and the

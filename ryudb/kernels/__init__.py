@@ -33,8 +33,12 @@ try:
     _mod = _load()
     fused_agg = _mod.fused_agg
     fused_join_agg = _mod.fused_join_agg
+    fused_scan_agg = _mod.fused_scan_agg
+    pqpages_probe = _mod.pqpages_probe
     is_available = True
 except ImportError:
     fused_agg = None  # type: ignore[assignment]
     fused_join_agg = None  # type: ignore[assignment]
+    fused_scan_agg = None  # type: ignore[assignment]
+    pqpages_probe = None  # type: ignore[assignment]
     is_available = False

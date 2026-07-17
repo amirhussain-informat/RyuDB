@@ -86,6 +86,73 @@ Phase 4 step 2 adds a **fused star-join + aggregate** path:
    dimension keys (which would silently collapse joins); a VRAM cap rejects
    oversized HTs.
 
+## Phase 5: hand-rolled CUDA Parquet decoder (this round)
+
+The cold path was the only systematic gap (every warm query already wins). Phase
+5 built a hand-rolled Parquet decoder that fuses **nvCOMP batched Snappy
+decompress → page decode → filter → aggregate** straight off the Parquet pages,
+never materialising the 60M-row cuDF frame — the same `Aggregate → Filter →
+Scan` shapes the warm fused kernel handles, but off the cold bytes.
+
+**It is correct and safely gated, but it does NOT beat DuckDB cold at SF10 — so
+it is opt-in (`RYUDB_SCAN_KERNEL`), not the default cold path.** The default
+cold path remains the cuDF materialising fallback (no regression: Q6 cold
+315 ms, scan_agg 324 ms, high_card 978 ms — unchanged from Phase 4).
+
+Measured at SF10 with the scan path enabled (`RYUDB_SCAN_KERNEL=1`), all correct
+(`check = OK`, exact match to DuckDB):
+
+| query | scan-path cold | duckdb | vs duckdb |
+|---|---|---|---|
+| Q6 filter + global agg | 3986 ms | 59 ms | 0.015x (67x slower) |
+| scan + 5 aggs (global) | 4048 ms | 57 ms | 0.014x (71x slower) |
+| Q high-card orderkey | 4744 ms | 1154 ms | 0.24x (4.1x slower) |
+
+Per-RG CUDA-event profile (Q6, 489 row groups) shows where the time goes:
+
+| phase | ms | share |
+|---|---|---|
+| nvCOMP Snappy decompress | 3861 | 97% |
+| dict-index decode + meta copies | 182 | 5% |
+| page kernel (filter + accumulate) | 23 | 0.6% |
+
+**The bottleneck is nvCOMP invoked once per row group with ~7 chunks each.**
+nvCOMP's batched Snappy decoder parallelises *across chunks*; 7 chunks on an
+82-SM RTX 3090 is severe underutilisation, so each ~1 MB batch takes ~7.9 ms
+(≈250 MB/s — slower than CPU Snappy). The page kernel itself is 23 ms total —
+the fused decode+filter+accumulate idea is sound; the decompression feeding it
+is the wall. The serial single-threaded `scan_runs_kernel` dict-index decode
+(0.37 ms × 489 = 182 ms) is a second, smaller wall that on its own already
+exceeds DuckDB's 57 ms total.
+
+**Why it is still shipped:** it is correct (Q6 and high_card match DuckDB
+exactly at SF10, DENSE and HASH), it defers safely on any shape/encoding it
+cannot handle (None → cuDF fallback, so correctness never depends on the C++
+extension), and it is the foundation for the two fixes that could make it the
+cold winner. It is gated off by default so the measured cuDF cold path is
+unchanged.
+
+**Path to flip cold (not done this round):**
+1. **One batched nvCOMP call over all row groups' pages** (≈3400 chunks at SF10)
+   instead of 489 calls of ~7 — fills the GPU and should cut the 3861 ms toward
+   the ~50 ms the page kernel proves is achievable. Trades ~1.5 GB VRAM for the
+   full compressed+decompressed page set (trivial on 24 GB).
+2. **Parallel or host-side dict-index decode** to remove the serial
+   `scan_runs_kernel` (182 ms → ~20 ms).
+3. With both, the back-of-envelope is nvCOMP ~50 + dict ~20 + page 23 + H2D +
+   pre-parse ≈ 120–150 ms — closer to DuckDB's 57 ms but likely still short of a
+   flip without further work; the measured 3861 ms today is the honest ceiling.
+
+Also fixed this round: PLAIN values are read with **byte-wise unaligned loads**
+(Parquet `values_off = 4 + deflen` is data-dependent and not 8-byte aligned, so
+`((const long long*)base)[i]` faulted with `cudaErrorMisalignedAddress` on the
+HASH group key — Q6/DENSE never hit it because its only PLAIN int64 is read via
+the dict path); and the host loop is **stream-ordered with a pinned-ring gather**
+(`cudaHostRegister` fails on the 2.2 GB WSL2 mmap, so per-RG compressed pages are
+gathered into a 16-slot pinned ring and H2D'd with a bounded-launch-queue batch
+sync — fixing an earlier `cudaErrorMemoryAllocation` and a host-source data
+race).
+
 ## Phase 4 step 1: fused global aggregate + MIN/MAX/AVG
 
 ## Phase 4 step 1: fused global aggregate + MIN/MAX/AVG (this round)
@@ -425,7 +492,16 @@ low-card group key is factorised to a dense code, and a cached PK guard + VRAM
 cap keep the path safe. Q3 (multi-key + cross-table filter) and high-card
 group-from-join defer to cuDF.
 
-Remaining work: a **custom GPU Parquet/Arrow reader** (the cold path is now the
-only systematic gap — every warm query already wins), and lifting the HASH path
-to **multi-column / string** group keys + MIN/MAX/AVG (currently single int64,
+Phase 5 built the hand-rolled CUDA Parquet decoder (nvCOMP Snappy → decode →
+filter → aggregate, never materialising the frame). It is **correct** (Q6 and
+high_card match DuckDB exactly at SF10, DENSE and HASH) and **safely defers**,
+but measured 67–71x slower than DuckDB cold at SF10 — 97% of the time is nvCOMP
+invoked per row group with ~7 chunks (severe GPU underutilisation), plus a
+serial dict-index decode. It is **opt-in (`RYUDB_SCAN_KERNEL`)** so the default
+cold path is unchanged. The cold flip needs one batched nvCOMP call over all
+pages + a parallel dict decode (see the Phase 5 section above).
+
+Remaining work: make the Phase 5 decoder the cold winner (single batched nvCOMP
+call + parallel/host dict-index decode), and lift the HASH path to
+**multi-column / string** group keys + MIN/MAX/AVG (currently single int64,
 SUM/COUNT only) and to the fused join path (high-card group-from-join).

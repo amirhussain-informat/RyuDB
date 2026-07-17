@@ -8,9 +8,11 @@ dist/
 .pytest_cache/
 .ruff_cache/
 
-# nvcc+pybind11 build artifact (built on demand: python -m ryudb.kernels.build)
+# nvcc+pybind11 build artifacts (built on demand: python -m ryudb.kernels.build)
 ryudb/kernels/fused.so
+ryudb/kernels/pqpages.o
 *.so
+*.o
 
 # generated data
 data/

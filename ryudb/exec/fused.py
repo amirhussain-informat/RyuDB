@@ -591,8 +591,6 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
     the caller then falls back to Numba/cuDF. `table` is the source table name for
     the engine's factorize-code cache (None -> uncached factorize).
     """
-    import cudf
-
     n = len(child)
     nagg = len(spec["aggs"])
     ngkey = len(spec["group_keys"])
@@ -807,7 +805,18 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
     if is_global and n_out == 0:
         return _global_null_result(spec)
 
-    # --- assemble cuDF frame ---
+    return _assemble_agg_frame(spec, keys_list, aggs_list, gkey_decoders, hidden_count_idx)
+
+
+def _assemble_agg_frame(spec, keys_list, aggs_list, gkey_decoders, hidden_count_idx):
+    """Build the cuDF result frame from the C++ kernel's output arrays. Shared by
+    the warm `_run_cpp` path and the cold `fused_scan_aggregate` path.
+
+    `gkey_decoders[j]` is ('codes', uniques) | ('datetime',) | ('int',); for a
+    global aggregate the group-keys loop is a no-op. `hidden_count_idx` is the
+    internal AVG-denominator slot index, or None when no AVG is present."""
+    import cudf
+
     hidden_count = (
         np.asarray(aggs_list[hidden_count_idx], dtype=np.float64)
         if hidden_count_idx is not None else None
@@ -1182,3 +1191,361 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
             data[n_] = cudf.Series(vals)
     out = cudf.DataFrame(data)
     return out[[gname] + [n_ for _, n_ in aggs]]
+
+
+# --------------------------------------------------------------------------- #
+# Fused scan + aggregate (C++/CUDA cold reader: nvCOMP Snappy -> decode -> agg)
+# --------------------------------------------------------------------------- #
+#
+# Phase 5 cold path. `Aggregate -> Filter -> Scan` is run straight off the
+# Parquet pages -- nvCOMP batched Snappy-decompress on the GPU, an RLE/bit-packed
+# dict-index decode, decimal/date folds, predicate + per-group accumulate -- so
+# the 60M-row cuDF frame is never materialised. Works on the PLAN (no executed
+# frame), so the executor calls it BEFORE `self._exec(in_node.input)`.
+#
+# v1 scope (the certain cold wins): global aggregate (no GROUP BY -> Q6 /
+# scan_agg_full) and HASH with a single PLAIN int64 group key (high-card
+# l_orderkey). Columns are PLAIN or PLAIN_DICTIONARY numeric, Snappy, non-null.
+# Dict-string DENSE group keys (Q1) are deferred: the dictionary is per-row-group
+# so dict indices are local codes that don't map to a global DENSE accumulator
+# without a per-RG local->global remap (Phase 5 step 2).
+
+# Column-plan codes (mirror kernels/fused.cu).
+_PK_PLAIN_RAW, _PK_DICT_NUMERIC_ARG = 0, 1
+_PHYS_I32, _PHYS_I64 = 0, 1
+_PQ_META_CACHE: dict[str, object] = {}
+
+
+def _pq_file(path: str):
+    """Cached pyarrow ParquetFile (footer metadata only; read-only Phase 1 -> the
+    file is immutable so a module cache is safe)."""
+    pf = _PQ_META_CACHE.get(path)
+    if pf is None:
+        import pyarrow.parquet as pq
+        pf = pq.ParquetFile(path)
+        _PQ_META_CACHE[path] = pf
+    return pf
+
+
+class _Defer(Exception):
+    """Raised internally to abandon the scan path -> caller falls back to cuDF."""
+
+
+class _ColProxy:
+    __slots__ = ("dtype", "null_count")
+
+    def __init__(self, dtype, null_count):
+        self.dtype = dtype
+        self.null_count = null_count
+
+
+class _SchemaProxy:
+    """Frame-like view over the arrow schema + null-count stats so the existing
+    `_match` / `_is_numeric_expr` / `_is_supported_predicate` / `_flatten_and_pred`
+    helpers work WITHOUT materialising the cuDF frame."""
+
+    def __init__(self, columns, dtypes, null_counts):
+        self.columns = columns
+        self._dt = dtypes
+        self._nc = null_counts
+
+    def __getitem__(self, name):
+        return _ColProxy(self._dt[name], self._nc[name])
+
+
+def _arrow_match_dtype(t) -> object:
+    """arrow type -> numpy dtype for shape matching (decimals -> float64 so
+    _is_numeric_expr accepts them; the kernel folds the decimal scale itself)."""
+    import pyarrow as pa
+
+    if pa.types.is_decimal(t) or pa.types.is_floating(t):
+        return np.dtype("float64")
+    if pa.types.is_signed_integer(t) or pa.types.is_unsigned_integer(t):
+        return np.dtype("int64")
+    if pa.types.is_date(t):
+        return np.dtype("datetime64[s]")
+    return np.dtype("object")  # string/bool/other -> non-numeric -> defer
+
+
+def _col_type_meta(t):
+    """arrow numeric type -> (phys, scale, is_date) the reader supports, or None
+    (strings/doubles/bools/etc. defer). The encoding (PLAIN vs PLAIN_DICTIONARY)
+    is resolved per-chunk in bind_named."""
+    import pyarrow as pa
+
+    if pa.types.is_decimal(t):
+        return (_PHYS_I64, int(t.scale), 0)
+    if pa.types.is_date(t):
+        return (_PHYS_I32, 0, 1)
+    if pa.types.is_int64(t):
+        return (_PHYS_I64, 0, 0)
+    if pa.types.is_int32(t):
+        return (_PHYS_I32, 0, 0)
+    return None
+
+
+def fused_scan_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
+    """Try to run `Aggregate -> Filter -> Scan` straight off the Parquet pages
+    (cold reader) without materialising the cuDF frame. Returns a cuDF DataFrame,
+    or None when the shape is unsupported (caller falls back to the existing
+    materialising path). Called BEFORE `self._exec(in_node.input)` in the
+    executor's `_aggregate`, so a None leaves the scan cache untouched."""
+    import pyarrow as pa
+
+    if not _kernels.is_available:
+        return None
+    if not isinstance(node.input, Filter):
+        return None
+    filt = node.input
+    if not isinstance(filt.input, Scan):
+        return None
+    info = engine.catalog.get(filt.input.table)
+    if len(info.paths) != 1:
+        return None  # v1: single file per table
+    path = info.paths[0]
+
+    try:
+        pf = _pq_file(path)
+        md = pf.metadata
+        schema_arrow = pf.schema_arrow
+        nrg = md.num_row_groups
+        if nrg == 0:
+            return None
+        names = schema_arrow.names
+        name_to_j = {n: i for i, n in enumerate(names)}
+
+        # Schema proxy for shape matching (decimals numeric, dates datetime,
+        # null_count from per-chunk statistics -- 0 for TPC-H).
+        dtypes = {n: _arrow_match_dtype(schema_arrow.field(n).type) for n in names}
+        null_counts: dict[str, int] = {}
+        for n in names:
+            j = name_to_j[n]
+            nc = 0
+            for rg in range(nrg):
+                st = md.row_group(rg).column(j).statistics
+                if st is None or st.null_count != 0:
+                    nc = 1
+                    break
+            null_counts[n] = nc
+        proxy = _SchemaProxy(names, dtypes, null_counts)
+
+        spec = _match(node, proxy)
+        if spec is None:
+            return None
+
+        nagg = len(spec["aggs"])
+        ngkey = len(spec["group_keys"])
+        has_avg = any(af.func == "AVG" for af, _ in spec["aggs"])
+        nagg_eff = nagg + (1 if has_avg else 0)
+
+        # --- column plan: bind predicate/agg-arg/group-key cols, record per-chunk
+        # descriptors. bind_named raises _Defer on any unsupported column/encoding. ---
+        col_kind: list[int] = []
+        col_phys: list[int] = []
+        col_scale: list[int] = []
+        col_is_date: list[int] = []
+        chunk_off: list[int] = []
+        chunk_total: list[int] = []
+        chunk_nvals: list[int] = []
+        name_idx: dict[str, int] = {}
+
+        def bind_named(name: str) -> int:
+            if name in name_idx:
+                return name_idx[name]
+            if name not in name_to_j:
+                raise _Defer()
+            t = schema_arrow.field(name).type
+            tmeta = _col_type_meta(t)
+            if tmeta is None:
+                raise _Defer()
+            phys, scale, is_date = tmeta
+            j = name_to_j[name]
+            kind = None
+            for rg in range(nrg):
+                cc = md.row_group(rg).column(j)
+                if cc.compression != "SNAPPY":
+                    raise _Defer()
+                st = cc.statistics
+                if st is None or st.null_count != 0:
+                    raise _Defer()  # kernel reads raw values, does not skip nulls
+                enc = set(cc.encodings)
+                is_dict = "PLAIN_DICTIONARY" in enc
+                if is_dict:
+                    ck = _PK_DICT_NUMERIC_ARG
+                elif enc == {"PLAIN"}:
+                    ck = _PK_PLAIN_RAW
+                else:
+                    raise _Defer()
+                if kind is None:
+                    kind = ck
+                elif ck != kind:
+                    raise _Defer()  # encoding varies across row groups -> defer
+                pt = cc.physical_type
+                if phys == _PHYS_I64 and pt != "INT64":
+                    raise _Defer()
+                if phys == _PHYS_I32 and pt != "INT32":
+                    raise _Defer()
+                off = cc.dictionary_page_offset
+                if off is None:
+                    off = cc.data_page_offset
+                chunk_off.append(int(off))
+                chunk_total.append(int(cc.total_compressed_size))
+                chunk_nvals.append(int(cc.num_values))
+            idx = len(col_kind)
+            col_kind.append(kind)
+            col_phys.append(phys)
+            col_scale.append(scale)
+            col_is_date.append(is_date)
+            name_idx[name] = idx
+            return idx
+
+        # --- group key / strategy ---
+        gkey_idx: list[int] = []
+        gkey_stride: list[int] = []
+        gkey_decoders: list = []
+        if ngkey == 0:
+            strategy = _STRAT_DENSE
+            n_groups = 1
+            capacity = 0
+        elif ngkey == 1:
+            ge, _gname = spec["group_keys"][0]
+            if not isinstance(ge, Col):
+                return None
+            t = schema_arrow.field(ge.name).type
+            # v1 HASH: a single PLAIN int64 key read raw at values_off. int32/date
+            # would misread the int64 slot; decimal would emit unscaled ints; dict
+            # would read the index array; string is the deferred DENSE case.
+            if not pa.types.is_int64(t):
+                return None
+            idx = bind_named(ge.name)
+            if col_kind[idx] != _PK_PLAIN_RAW or col_phys[idx] != _PHYS_I64:
+                return None
+            strategy = _STRAT_HASH
+            n_groups = 0  # HASH uses `capacity`, not n_groups (kernel ignores it)
+            total_rows = info.row_count
+            capacity = _next_pow2(min(total_rows, _HASH_CAP_MAX, _HASH_ACC_BUDGET // (nagg * 8)))
+            if capacity < 4:
+                return None
+            gkey_idx = [idx]
+            gkey_decoders = [("int",)]
+        else:
+            return None  # multi-key GROUP BY -> defer (v1)
+
+        # --- predicate (conjunction of Col OP lit; date lit -> int64 seconds) ---
+        pred = _flatten_and_pred(spec["predicate"], bind_named, proxy)
+        if pred is None:
+            return None
+        pred_col = np.array([p[0] for p in pred], dtype=np.int32)
+        pred_op = np.array([p[1] for p in pred], dtype=np.int32)
+        pred_lit = np.array([p[2] for p in pred], dtype=np.float64)
+
+        # --- aggregates (COUNT(*)/SUM/AVG/MIN/MAX over numeric arithmetic) ---
+        _AGG_KIND = {"COUNT": _AGG_COUNT, "SUM": _AGG_SUM, "AVG": _AGG_AVG,
+                     "MIN": _AGG_MIN, "MAX": _AGG_MAX}
+        agg_kind: list[int] = []
+        agg_tok_start: list[int] = []
+        agg_tok_len: list[int] = []
+        tok_kind: list[int] = []
+        tok_col: list[int] = []
+        tok_lit: list[float] = []
+        tok_op: list[int] = []
+        for af, _n in spec["aggs"]:
+            start = len(tok_kind)
+            if af.func == "COUNT" and isinstance(af.arg, Star):
+                agg_kind.append(_AGG_COUNT)
+                agg_tok_start.append(start)
+                agg_tok_len.append(0)
+                continue
+            toks = _to_postfix(af.arg, bind_named)
+            for k, a, b in toks:
+                tok_kind.append(k)
+                tok_lit.append(b)
+                if k == _TK_OP:
+                    tok_col.append(0)
+                    tok_op.append(a)
+                else:
+                    tok_col.append(a)
+                    tok_op.append(0)
+            agg_kind.append(_AGG_KIND[af.func])
+            agg_tok_start.append(start)
+            agg_tok_len.append(len(toks))
+
+        # HASH supports SUM/COUNT only (no per-slot inf/-inf init).
+        if strategy == _STRAT_HASH and any(
+            k in (_AGG_MIN, _AGG_MAX, _AGG_AVG) for k in agg_kind
+        ):
+            return None
+
+        # Hidden per-group passing-row count slot: the AVG denominator.
+        hidden_count_idx = None
+        if has_avg:
+            hidden_count_idx = len(agg_kind)
+            agg_kind.append(_AGG_COUNT)
+            agg_tok_start.append(len(tok_kind))
+            agg_tok_len.append(0)
+
+        # DENSE global: shared-mem gate on the internal slot count.
+        if strategy == _STRAT_DENSE and n_groups * nagg_eff > MAX_ACC_CELLS:
+            return None
+
+        # Per-slot accumulator init: +inf for MIN, -inf for MAX, 0 otherwise (DENSE
+        # only; HASH is SUM/COUNT and zero-inits).
+        if strategy == _STRAT_DENSE:
+            per_slot = np.array(
+                [np.inf if k == _AGG_MIN else -np.inf if k == _AGG_MAX else 0.0
+                 for k in agg_kind], dtype=np.float64,
+            )
+            acc_init = np.tile(per_slot, n_groups)
+        else:
+            acc_init = np.empty(0, dtype=np.float64)
+
+        ncol = len(col_kind)
+        overflow, n_out, keys_list, aggs_list = _kernels.fused_scan_agg(
+            path, int(ncol), int(nrg),
+            np.array(chunk_off, dtype=np.int64),
+            np.array(chunk_total, dtype=np.int32),
+            np.array(chunk_nvals, dtype=np.int32),
+            np.array(col_kind, dtype=np.int32),
+            np.array(col_phys, dtype=np.int32),
+            np.array(col_scale, dtype=np.int32),
+            np.array(col_is_date, dtype=np.int32),
+            np.array(gkey_idx, dtype=np.int32),
+            np.array(gkey_stride, dtype=np.int64),
+            pred_col, pred_op, pred_lit,
+            np.array(agg_kind, dtype=np.int32),
+            np.array(agg_tok_start, dtype=np.int32),
+            np.array(agg_tok_len, dtype=np.int32),
+            np.array(tok_kind, dtype=np.int32),
+            np.array(tok_col, dtype=np.int32),
+            np.array(tok_lit, dtype=np.float64),
+            np.array(tok_op, dtype=np.int32),
+            acc_init, int(strategy), int(n_groups), int(capacity),
+        )
+    except _Defer as _e:
+        import os as _os
+        if _os.environ.get("RYUDB_SCAN_DEBUG"):
+            import traceback as _tb
+            print("[scan_agg] DEFER:", _e)
+            _tb.print_exc()
+        return None
+    except Exception as _e:  # noqa: BLE001 -- never let a C++/metadata fault break correctness
+        import os as _os
+        if _os.environ.get("RYUDB_SCAN_DEBUG"):
+            import traceback as _tb
+            print("[scan_agg] EXC:", _e)
+            _tb.print_exc()
+        return None
+
+    if overflow != 0:
+        import os as _os
+        if _os.environ.get("RYUDB_SCAN_DEBUG"):
+            print("[scan_agg] kernel overflow =", overflow)
+        return None  # decompress/decode/hash-table error -> cuDF fallback
+
+    is_global = ngkey == 0
+    if is_global and n_out == 0:
+        return _global_null_result(spec)
+    if n_out == 0:
+        return _empty_result(spec)
+
+    return _assemble_agg_frame(spec, keys_list, aggs_list, gkey_decoders, hidden_count_idx)
