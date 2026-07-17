@@ -273,6 +273,91 @@ gathered into a 16-slot pinned ring and H2D'd with a bounded-launch-queue batch
 sync — fixing an earlier `cudaErrorMemoryAllocation` and a host-source data
 race).
 
+### Phase 5 step 5: attack the cold wall — meta-cache + async-pooled alloc (this round)
+
+Step 4 left cold at 299 / 350 / 925 ms. A `RYUDB_SCAN_PROFILE` run (Q6 SF10,
+steady-state, `min` over 3 cold runs in one process — the reported cold is run
+2/3, after the OS page cache is warm) showed where cold time actually goes:
+preparse+plan ~44 ms, scratch-alloc ~70 ms, h2d-comp ~86 ms (490 MB H2D at the
+~6.6 GB/s WSL2 PCIe ceiling), nvcomp ~13, stream-loop+sync ~27. Two levers
+attack the CPU/alloc portion (the H2D bytes are PCIe-capped — a microbench
+confirmed pinned AND pageable H2D both top out at ~6.6 GB/s on WSL2's
+paravirtualized GPU, so a chunked-`cudaHostRegister` direct-pin lever was
+**skipped** as not worth the ~11 ms host-memcpy hop it would save).
+
+**Lever 2 — `cudaMallocAsync` pooling (big scratch → ~0 on repeat cold).** Every
+big scratch buffer (`dbig` ~490 MB, `ubig` ~635 MB, `d_idxbig` ~721 MB,
+`d_runs` ~960 MB, the nvCOMP metadata arrays, `d_temp`, the materialise arrays)
+is allocated with `cudaMallocAsync(ptr, sz, stream)` via a one-time-probed
+`dev_alloc_async` helper (falls back to `cudaMalloc` if unsupported). Load-bearing
+CUDA semantics: `cudaFree` on async memory is valid but **RELEASES** the block
+from the pool (no reuse); only `cudaFreeAsync(ptr, stream)` **returns** it for
+reuse. So every converted alloc's free became `cudaFreeAsync(ptr, 0)` (the
+`stream` is destroyed before the cleanup/finalize frees, so the default stream
+is used; the blocks are idle by then — the cleanup runs after the final stream
+sync, and `fused_scan_finalize` runs after `cudaEventSynchronize(E_mat)`).
+Second load-bearing detail: the default mempool's `ReleaseThreshold` is 0, so
+freed blocks are handed back to the OS immediately → **no reuse**; the helper
+raises it to ~256 GB once so freed blocks stay in the pool. Result: `scratch-
+alloc` 70 → ~1 ms on run 3 (pool reuse).
+
+**Lever 1 — page-metadata cache (preparse → ~0 on repeat cold) + async pre-
+preparse setup.** The cold scan's host-side preparse walks every (col, row-group)
+chunk's Thrift page headers (~3400 pages for Q6 SF10) to recover page offsets
+Parquet file metadata does not store. The result depends only on the file bytes
++ the bound columns' chunk descriptors — never on the mmap address (offsets are
+byte offsets) or the predicate/aggregate plan — so it is memoized in a
+file-scope `g_meta_cache` (`unordered_map<MetaKey, ParsedMeta>`, LRU-capped at
+16 paths, no lock — single Python thread under the GIL, same convention as the
+`g_pending` registry) keyed by `{path, file_len, mtime_ns (ext4 nanosecond),
+ncol, nrg, chunk_off[ncol*nrg], chunk_total[ncol*nrg], chunk_nvals[nrg],
+col_kind[ncol]}`. The preparse body moved into a file-scope `run_preparse`; on a
+hit the ~44 ms parse is skipped (`preparse+plan` 44 → 0.2 ms). Staleness (same-
+size + same-mtime rewrite) would feed wrong offsets → nvCOMP/gather fault →
+`overflow=1` → cuDF fallback (the standing "correctness never depends on the
+extension" rule); nanosecond mtime makes it near-zero. A parse/layout error is
+NOT cached.
+
+Profiling then showed the `preparse+plan` mark's bulk was NOT the Thrift parse
+(~7 ms) but ~16 **synchronous** `cudaMemcpy` round-trips in the plan-descriptor
+uploads (`np_dev`, each a device sync ≈ 2 ms on WSL2/GPU-PV). So the pre-preparse
+setup — the 16 plan descriptors, `d_overflow`, the `acc/seen` (DENSE) /
+`key/acc/distinct` (HASH) accumulators, and `d_buf/d_dict` — was made **async on
+the default stream**: `cudaMalloc`→`dev_alloc_async(..., 0)`,
+`cudaMemcpy`/`cudaMemset`→`...Async(..., 0)`. They queue without per-call sync
+round-trips and complete before any `stream` kernel via null-stream
+synchronization (the scan `stream` is a legacy stream). The accumulators are
+now pooled too (helps the HASH `high_card` cold). Every device free in
+`fused_scan_agg` is now `cudaFreeAsync(..., 0)`; `fused_scan_finalize` returns
+the registry scratch to the pool the same way.
+
+Measured at SF10 (min of 3, async materialise + both levers = default):
+
+| query | ryu cold (step 4) | ryu cold (step 5) | ryu warm | duckdb | warm x |
+|---|---|---|---|---|---|
+| Q6 filter + global agg | 298.8 | **215.3** | **23.6** | 60.8 | **2.57x** ✓ |
+| scan + 5 aggs (global) | 349.9 | **269.6** | **36.2** | 60.8 | **1.68x** ✓ |
+| Q high-card orderkey | 924.8 | **830.3** | **682.7** | 1245.0 | **1.82x** ✓ |
+
+**Cold drops ~84 ms on every query** (-84 / -80 / -94 vs step 4); **warm is
+preserved** (23.6 / 36.2 / 682.7 vs step-4 23.2 / 34.1 / 687.6 — noise; all
+three still beat DuckDB warm). The bench's reported cold is the repeat-cold min,
+so the meta-cache and pool reuse both fully manifest there (first-cold unchanged
+— the parse and first allocs still pay). 64 tests pass 3× clean (the registry-
+lifetime / cross-stream race surface is the guard).
+
+**Honest result — the cold win is the CPU/alloc portion, not the H2D bytes.**
+Cold is now ~215 / ~270 / ~830; DuckDB warm is still faster on the two global
+aggs (60.8 ms) — beating DuckDB cold on the scan path at SF10 is out of reach
+while H2D is PCIe-capped at 6.6 GB/s (the 490 MB compressed H2D alone is ~75 ms
+of irreducible transfer). The remaining cold is dominated by `h2d-comp` (~80 ms,
+the 490 MB H2D + batch sync) and the scan/nvCOMP/accumulate loop (~27 ms) —
+bytes-on-the-wire, not CPU/alloc. A further cold win would need reducing H2D
+bytes (Parquet page-index skipping / column pruning) or a faster transport, both
+out of scope here. Correctness never depends on any of this: `cudaMallocAsync`
+unsupported → `cudaMalloc` fallback; meta-cache staleness → `overflow=1` → cuDF
+fallback.
+
 ## Phase 4 step 1: fused global aggregate + MIN/MAX/AVG
 
 ## Phase 4 step 1: fused global aggregate + MIN/MAX/AVG (this round)
