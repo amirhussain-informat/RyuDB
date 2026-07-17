@@ -1,5 +1,11 @@
 # RyuDB
 
+
+
+![Uploading ChatGPT Image Jul 18, 2026, 12_43_38 AM.png…]()
+
+
+
 A GPU-powered HTAP RDBMS. Phase 1: a read-only GPU analytical SQL engine over
 columnar Parquet storage, executing on NVIDIA GPUs via RAPIDS **cuDF**.
 
