@@ -1,0 +1,64 @@
+ now I want to pause for today, jsut tell me when I come again tommorow morning, what I need to resume the development?
+
+● Here's your resume checklist for tomorrow morning. Save this and you can pick up exactly where we left off.
+
+  Tomorrow's resume — Phase 2 step 6 (WAL + recovery)
+
+  Where you are
+
+  - Phase 2 steps 1-5 are DONE and merged to master (9a4f808). Non-durable INSERT/SELECT round-trip + in-memory MVCC txns/snapshots are complete.
+  - Next: step 6 — WAL + recovery. Then step 7 (DECIMAL type fidelity / delta write-back). After 6-7 you have a real durable HTAP store.
+
+  How to start (env + repo)
+
+  wsl -d NVIDIA-Workbench
+  cd ~/RyuDB
+  source ~/miniconda3/etc/profile.d/conda.sh && conda activate ryudb
+  git checkout master && git pull origin master    # should be at 9a4f808
+  git log --oneline -3                              # confirm
+  From Windows, files are at \\wsl.localhost\NVIDIA-Workbench\home\workbench\RyuDB.
+
+  Verify everything is green before new work
+
+  python -m pytest tests/ -q          # expect 128 passed
+  ruff check ryudb/ tests/            # expect clean
+  python bench/run_bench.py --scale 10 --repeats 3 --queries Q6_filter_agg scan_agg_full Q_high_card_orderkey
+  # expect all 3 to beat DuckDB warm
+
+  What step 6 is (the design already agreed in memory)
+
+  Persist each committed delta batch as a WAL record; commit_ts becomes the WAL LSN. On Catalog/Engine startup, replay the WAL to reconstruct the in-memory delta. Key shape:
+  - WAL file per data dir (e.g. <data_dir>/ryudb.wal), append-only, fsync on commit.
+  - _commit writes a record (table + serialized batch + the new commit_ts) before / as it appends to the in-memory delta (durability: recoverable up to the last fsynced LSN).
+  - A RESTORE/rewind needs to truncate the WAL to the target LSN (the delta rewind(ts) already exists — mirror it on the WAL).
+  - Recovery: on Engine init, scan the WAL and replay surviving records into DeltaStore (re-tag with their commit_ts), then set _commit_ts to the max replayed LSN.
+  - Snapshots could optionally be a WAL checkpoint marker (or stay in-memory only — decide; memory currently says snapshots are in-memory, so a restart drops them, which is fine for step 6 scope).
+
+  Critical context to keep in mind (from memory)
+
+  - MVCC invariant is load-bearing: commit_ts monotonic + append-to-tail + _merge_delta concats batches_at ++ buffer in order → visible series byte-identical pre/post commit. The WAL replay MUST preserve batch order and commit_ts tagging or the over-invalidation safety breaks.
+  - Single-session, in-memory txns today — a pending (uncommitted) txn is implicitly rolled back on process exit. The WAL only records committed batches (buffered/uncommitted frames are never written). Don't WAL the buffer.
+  - _invalidate_table_caches is reused on every write/commit/rollback/restore — the WAL recovery path should rebuild caches lazily (they re-populate on first read), no need to persist them.
+  - cuDF 26.06 gotcha: cudf.DataFrame.from_pandas doesn't exist — use cudf.DataFrame(pd.DataFrame(pdf)). Batch serialization for the WAL: pickling cuDF frames is the easy path, or round-trip via pandas/Arrow (Parquet IPC) — the existing _insert builds frames from pandas; mirror
+  that dtype path so replayed frames cast cleanly in _merge_delta.
+  - row_count staleness + PK/UNIQUE enforcement are still deferred — don't scope-creep them into step 6.
+  - Correctness never depends on the C++ extension; never claim a GPU win without measurement; commit on branch is part of the plan, push/PR only on explicit confirmation. A faulting kernel poisons the sticky CUDA context — keep tests from deliberately running stale-codes
+  kernels.
+
+  Suggested workflow (the pattern that's worked for steps 1-5)
+
+  1. I write a plan → you approve (plan mode).
+  2. Create feature/wal-recovery from master.
+  3. Implement → pytest 3× + bench no-regression + smoke.
+  4. Update memory + commit on branch.
+  5. On your "push/merge" confirmation → PR → merge → sync master → branch cleanup.
+
+  When you come back, just say
+
+  ▎ "resume step 6" (or "proceed with step 6")
+
+  I'll re-read the plan file and memory, confirm the green baseline, and go into plan mode for the WAL design. Nothing else needed from you — the repo and memory are already in the right state.
+
+  Have a good rest. 🌙
+
+✻ Baked for 16s
