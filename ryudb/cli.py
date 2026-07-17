@@ -8,7 +8,14 @@ Usage:
 
 REPL dot-commands:
   :tables        list registered tables
-  :schema NAME   show columns + row count for a table
+  :schema NAME   show columns (typed) + row count + constraints for a table
+  :drop NAME     drop a table from the catalog
+  :alter NAME ...  alter catalog metadata (no base-file mutation):
+                     :alter NAME rename NEW
+                     :alter NAME pk c1[,c2,...]
+                     :alter NAME notnull COL | :alter NAME notnull- COL
+                     :alter NAME unique c1[,c2,...]
+                     :alter NAME default COL VALUE
   :explain SQL   print the optimized logical plan without running
   :help          show help
   :quit          exit
@@ -123,8 +130,37 @@ def _dot_command(cmd: str, engine: Engine, catalog: Catalog) -> bool:
         try:
             info = catalog.get(arg)
             print(f"{info.name}: {info.row_count} rows, cols={info.columns}")
+            if info.schema is not None:
+                for f in info.schema:
+                    print(f"  {f.name}: {f.type}")
+            c = info.constraints
+            pieces = []
+            if c.primary_key:
+                pieces.append(f"PRIMARY KEY {list(c.primary_key)}")
+            if c.not_null:
+                nn = sorted(c.not_null - (set(c.primary_key) if c.primary_key else set()))
+                if c.primary_key:
+                    pieces.append(f"NOT NULL (incl. PK) {sorted(c.not_null)}")
+                else:
+                    pieces.append(f"NOT NULL {nn}")
+            for u in c.unique:
+                pieces.append(f"UNIQUE {list(u)}")
+            for col, val in c.defaults.items():
+                pieces.append(f"DEFAULT {col}={val!r}")
+            if pieces:
+                print("  constraints:")
+                for p in pieces:
+                    print(f"    {p}")
         except KeyError as exc:
             print(f"error: {exc}")
+    elif name == "drop":
+        try:
+            catalog.drop_table(arg)
+            print(f"dropped {arg}")
+        except KeyError as exc:
+            print(f"error: {exc}")
+    elif name == "alter":
+        _alter_command(catalog, arg)
     elif name == "explain":
         if not arg:
             print("usage: :explain <sql>")
@@ -143,6 +179,79 @@ def _dot_command(cmd: str, engine: Engine, catalog: Catalog) -> bool:
 def _split_statements(text: str) -> list[str]:
     # Naive splitter on ';'. Sufficient for Phase 1 scripts without quoted ';'.
     return [s for s in text.split(";") if s.strip()]
+
+
+def _coerce_literal(text: str):
+    text = text.strip()
+    low = text.lower()
+    if low == "null":
+        return None
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    # strip surrounding quotes
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1]
+    return text
+
+
+def _alter_command(catalog: Catalog, arg: str) -> None:
+    """Handle ``:alter NAME <action> ...`` (catalog metadata only)."""
+    parts = arg.split(None, 2)
+    if len(parts) < 2:
+        print("usage: :alter NAME {rename NEW|pk c1,...|notnull COL|notnull- COL|"
+              "unique c1,...|default COL VALUE}")
+        return
+    table, action = parts[0], parts[1].lower()
+    rest = parts[2] if len(parts) > 2 else ""
+    try:
+        if action == "rename":
+            if not rest:
+                print("usage: :alter NAME rename NEW")
+                return
+            catalog.rename_table(table, rest.strip())
+            print(f"renamed {table} -> {rest.strip()}")
+        elif action == "pk":
+            cols = [c.strip() for c in rest.split(",") if c.strip()]
+            if not cols:
+                print("usage: :alter NAME pk c1[,c2,...]")
+                return
+            catalog.set_primary_key(table, cols)
+            print(f"{table}: primary key set to {cols}")
+        elif action in ("notnull", "notnull-"):
+            col = rest.strip()
+            if not col:
+                print("usage: :alter NAME notnull COL")
+                return
+            catalog.set_not_null(table, col, on=(action == "notnull"))
+            print(f"{table}: {col} NOT NULL {'set' if action == 'notnull' else 'dropped'}")
+        elif action == "unique":
+            cols = [c.strip() for c in rest.split(",") if c.strip()]
+            if not cols:
+                print("usage: :alter NAME unique c1[,c2,...]")
+                return
+            catalog.set_unique(table, cols)
+            print(f"{table}: UNIQUE({cols}) added")
+        elif action == "default":
+            sub = rest.split(None, 1)
+            if len(sub) < 2:
+                print("usage: :alter NAME default COL VALUE")
+                return
+            catalog.set_default(table, sub[0], _coerce_literal(sub[1]))
+            print(f"{table}: {sub[0]} DEFAULT = {_coerce_literal(sub[1])!r}")
+        else:
+            print(f"unknown alter action: {action!r} (rename|pk|notnull|notnull-|unique|default)")
+    except KeyError as exc:
+        print(f"error: {exc}")
 
 
 def _print_frame(df) -> None:
