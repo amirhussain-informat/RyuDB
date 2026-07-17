@@ -25,7 +25,12 @@ from ..sql.plan import (
     Star,
 )
 from ..storage import scan
-from .fused import fused_aggregate, fused_join_aggregate, fused_scan_aggregate
+from .fused import (
+    _PendingFrame,
+    fused_aggregate,
+    fused_join_aggregate,
+    fused_scan_aggregate,
+)
 from .ops import eval_expr
 
 _AGG_METHOD = {"SUM": "sum", "AVG": "mean", "MIN": "min", "MAX": "max", "COUNT": "count"}
@@ -65,7 +70,24 @@ class Engine:
         ~460 ms hash-factorize and run just read+coerce+kernel (~380 ms) instead of
         re-paying it. Use `clear_code_cache()` to invalidate it explicitly (e.g. when
         the underlying table is written to, once the HTAP write path exists).
+
+        Phase 5 async-materialise: a pending entry holds a `pending_id` whose
+        background gather scratch (~1.4 GB: `ubig`+`d_idxbig`+small arrays) is
+        owned by the C++ registry and freed only by `fused_scan_finalize`.
+        Finalize every pending entry before dropping our refs so a cold run
+        immediately followed by `clear` (bench ryu_cold / tests) doesn't leak or
+        fault. Ready frames need no finalization.
         """
+        from .. import kernels as _kernels
+
+        if _kernels.fused_scan_finalize is not None:
+            for v in self._scan_cache.values():
+                pid = getattr(v, "pending_id", None)
+                if pid:
+                    try:
+                        _kernels.fused_scan_finalize(int(pid))
+                    except Exception:
+                        pass
         self._scan_cache.clear()
 
     def clear_code_cache(self) -> None:
@@ -102,7 +124,22 @@ class Engine:
         cols = frozenset(columns) if columns else None
         key = (table, cols)
         if self.cache_enabled and key in self._scan_cache:
-            return self._scan_cache[key]
+            v = self._scan_cache[key]
+            # Phase 5 async-materialise: a cold fused scan may have stored a
+            # _PendingFrame whose background CUDA gather is still in flight.
+            # Resolve it now (syncs the gather, builds the cuDF frame) and
+            # replace the cache entry so subsequent warm reads hit the ready
+            # frame directly. .get() returns None on failure -> fall through to
+            # storage.scan (lose the cache, keep correctness).
+            if isinstance(v, _PendingFrame):
+                v = v.get()
+                if v is None:
+                    self._scan_cache.pop(key, None)
+                else:
+                    self._scan_cache[key] = v
+                    return v
+            else:
+                return v
         df = scan(self.catalog.get(table), columns)
         if self.cache_enabled:
             self._scan_cache[key] = df

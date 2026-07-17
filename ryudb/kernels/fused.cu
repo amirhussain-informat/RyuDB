@@ -21,10 +21,13 @@
 #include <pybind11/numpy.h>
 
 #include <cuda_runtime.h>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <fcntl.h>
@@ -1121,6 +1124,54 @@ __global__ void check_stat_kernel(const int *stat, int npages, int *overflow) {
         if (stat[i] != 0) { atomicExch(overflow, 1); return; }
 }
 
+// --- async-materialise pending context registry ---
+//
+// When the cold scan path populates _scan_cache, the materialise-gather of the
+// 60M-row frame runs on a NON-BLOCKING side stream so the host can return the
+// aggregate immediately (recovering the cold win). The materialise reads device
+// scratch that the scan produced (decompressed pages `ubig`, dict indices
+// `d_idxbig`, the per-RG pointer arrays `d_buf_all`/`d_dict_all`, the row-offset
+// / frame-descriptor arrays, and the static PageSrc `kind/phys/scale` arrays).
+// That scratch must outlive the C++ call -- it is moved into a PendingMatCtx,
+// keyed by an int id returned to Python, and freed later by fused_scan_finalize
+// (the ONLY freer of this scratch) once the warm path has waited on E_mat. A
+// missed transfer -> UAF -> sticky context fault (breaks the cuDF fallback too),
+// so the registry is the single source of truth for these allocations.
+struct PendingMatCtx {
+    uint8_t *ubig = nullptr;
+    uint8_t *d_idxbig = nullptr;
+    const void **d_buf_all = nullptr;
+    const void **d_dict_all = nullptr;
+    long long *d_row_off = nullptr;
+    long long *d_frame_ptrs = nullptr;
+    int *d_out_kind = nullptr;
+    int *d_kind = nullptr;
+    int *d_phys = nullptr;
+    int *d_scale = nullptr;
+    cudaStream_t stream2 = nullptr;
+    cudaEvent_t E_mat = nullptr;
+};
+static std::unordered_map<int, PendingMatCtx> g_pending;
+static std::atomic<int> g_pending_next{1};
+
+// Wait for the side-stream materialise to finish (no-op if already done) and
+// free every allocation in the pending ctx. Idempotent: a missing/already-
+// finalized id is a silent no-op. Called from Python on the first warm read of
+// the cached frame and from clear_scan_cache.
+void fused_scan_finalize(int pending_id) {
+    if (pending_id == 0) return;
+    auto it = g_pending.find(pending_id);
+    if (it == g_pending.end()) return;
+    PendingMatCtx c = it->second;  // copy; erase before (potentially slow) sync
+    g_pending.erase(it);
+    if (c.E_mat) { cudaEventSynchronize(c.E_mat); cudaEventDestroy(c.E_mat); }
+    if (c.stream2) cudaStreamDestroy(c.stream2);
+    cudaFree(c.ubig); cudaFree(c.d_idxbig);
+    cudaFree(c.d_buf_all); cudaFree(c.d_dict_all);
+    cudaFree(c.d_row_off); cudaFree(c.d_frame_ptrs); cudaFree(c.d_out_kind);
+    cudaFree(c.d_kind); cudaFree(c.d_phys); cudaFree(c.d_scale);
+}
+
 // ---------------- host entry: fused scan + aggregate ----------------
 //
 // Args:
@@ -1136,9 +1187,14 @@ __global__ void check_stat_kernel(const int *stat, int npages, int *overflow) {
 //   strategy   : 0=DENSE (global, n_groups==1), 1=HASH (single plain int64 key)
 //   n_groups   : DENSE group count   capacity : HASH power-of-two capacity
 //
-// Returns (overflow:int, n_out:int, keys:py::list, aggs:py::list).
+// Returns (overflow:int, n_out:int, keys:py::list, aggs:py::list, pending_id:int).
 //   overflow != 0 -> caller falls back to the cuDF path (correctness never
 //   depends on this extension).
+//   pending_id != 0 -> the materialise-gather is still running on a non-blocking
+//   side stream; Python holds the id + frame buffers and calls
+//   fused_scan_finalize(id) on the first warm read (or clear). pending_id == 0
+//   means no async materialise (sync path / no populate / overflow / async-setup
+//   failure) -- the frame, if any, is already fully written.
 py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
                          py::array_t<long long> chunk_off, py::array_t<int> chunk_total,
                          py::array_t<int> chunk_nvals,
@@ -1209,6 +1265,7 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
 
     const int THREADS = 256;
     int overflow = 0, n_out = 0;
+    int pending_id = 0;  // >0 if the materialise gather is still running async
     py::list keys_list, aggs_list;
 
     // Unified device overflow flag: a bad nvCOMP status, a dict-index run cap
@@ -1353,6 +1410,16 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
     RunEntry *d_runs = nullptr; int *d_nruns = nullptr, *d_bw = nullptr;
     const void **d_dict_data = nullptr; int *d_dict_n = nullptr;  // batched dict-decode job arrays
     long long *d_frame_ptrs = nullptr; int *d_out_kind = nullptr; long long *d_row_off = nullptr;  // materialise-gather
+    // async materialise: side stream + events + stable per-RG pointer arrays.
+    // stream2 is NON-BLOCKING so the default-stream read-out does not implicitly
+    // wait for the materialise (legacy streams sync with the default stream --
+    // that would re-serialize the cold return). d_buf_all/d_dict_all hold all
+    // nrg per-RG pointer arrays so the post-loop gather reads stable slots
+    // instead of the shared d_buf/d_dict (overwritten each RG).
+    bool async_mat = false;
+    cudaStream_t stream2 = nullptr;
+    cudaEvent_t E_page = nullptr, E_mat = nullptr;
+    const void **d_buf_all = nullptr, **d_dict_all = nullptr;
     bool pinned_mmap = false;
     nvcompBatchedSnappyDecompressOpts_t opts = nvcompBatchedSnappyDecompressDefaultOpts;
 
@@ -1417,6 +1484,26 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
                 check(cudaMalloc(&d_out_kind, sizeof(int) * ncol), "malloc out_kind");
                 check(cudaMemcpyAsync(d_out_kind, okd.ptr, sizeof(int) * ncol,
                                       cudaMemcpyHostToDevice, stream), "cp out_kind");
+            }
+        }
+        // Decide async materialise: only when populating the cache (d_frame_ptrs
+        // allocated) and not disabled via RYUDB_ASYNC_MATERIALISE=0. Create a
+        // non-blocking side stream + two sync-only events; on ANY failure drop to
+        // the synchronous in-loop materialise (pending_id stays 0).
+        if (d_frame_ptrs) {
+            const char *am = std::getenv("RYUDB_ASYNC_MATERIALISE");
+            bool want_async = !(am && am[0] == '0' && am[1] == '\0');
+            if (want_async &&
+                cudaStreamCreateWithFlags(&stream2, cudaStreamNonBlocking) == cudaSuccess &&
+                cudaEventCreateWithFlags(&E_page, cudaEventDisableTiming) == cudaSuccess &&
+                cudaEventCreateWithFlags(&E_mat, cudaEventDisableTiming) == cudaSuccess) {
+                async_mat = true;
+            } else {
+                if (stream2) { cudaStreamDestroy(stream2); stream2 = nullptr; }
+                if (E_page)  { cudaEventDestroy(E_page);  E_page = nullptr; }
+                if (E_mat)   { cudaEventDestroy(E_mat);   E_mat = nullptr; }
+                cudaGetLastError();  // drain a sticky error so a later check() is clean
+                async_mat = false;
             }
         }
 
@@ -1562,8 +1649,9 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
             // global row offset, so the scan path can cache the GPU-resident
             // frame for warm repeats. Reuses this RG's PageSrc s (d_buf/d_dict
             // copied earlier this same stream iteration; same-stream ordering
-            // makes the reads safe). Skipped when no frame_ptrs were passed.
-            if (d_frame_ptrs) {
+            // makes the reads safe). Skipped when no frame_ptrs were passed, and
+            // when async_mat (the gather runs post-loop on the side stream).
+            if (d_frame_ptrs && !async_mat) {
                 materialise_kernel<<<blocks, THREADS, 0, stream>>>(
                     s, d_frame_ptrs, d_out_kind, d_row_off, rg, n, ncol);
                 check(cudaGetLastError(), "materialise launch");
@@ -1571,7 +1659,69 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
             if ((rg + 1) % BATCH == 0) check(cudaStreamSynchronize(stream), "batch sync");
         }  // end row-group loop
 
-        check(cudaDeviceSynchronize(), "final sync");
+        // --- async materialise: gather the frame on the non-blocking side stream
+        // so the host can return the aggregate NOW and the warm path waits on
+        // E_mat. The sync path already gathered in-loop above. Skipped on overflow
+        // (never cache a partial frame -- Python returns None on overflow anyway).
+        if (async_mat && overflow == 0) {
+            // Stable per-RG pointer arrays: flatten all nrg buf_host/dict_host
+            // slots into one H2D each on `stream`, so the side-stream gather reads
+            // RG rg's pointers at d_buf_all + rg*ncol (not the shared d_buf, which
+            // holds only the last RG by now). The page data (ubig/d_idxbig) and
+            // the descriptors (d_row_off/d_frame_ptrs/d_out_kind/d_kind/d_phys/
+            // d_scale) were all produced on `stream` -- E_page captures them.
+            std::vector<const void *> flat_buf((size_t)nrg * ncol);
+            std::vector<const void *> flat_dict((size_t)nrg * ncol);
+            for (int rg = 0; rg < nrg; rg++)
+                for (int c = 0; c < ncol; c++) {
+                    flat_buf[(size_t)rg * ncol + c]  = buf_host[rg][c];
+                    flat_dict[(size_t)rg * ncol + c] = dict_host[rg][c];
+                }
+            check(cudaMalloc(&d_buf_all,  sizeof(void *) * (size_t)nrg * ncol), "malloc buf_all");
+            check(cudaMalloc(&d_dict_all, sizeof(void *) * (size_t)nrg * ncol), "malloc dict_all");
+            check(cudaMemcpyAsync(d_buf_all,  flat_buf.data(),
+                                  sizeof(void *) * (size_t)nrg * ncol, cudaMemcpyHostToDevice, stream), "cp buf_all");
+            check(cudaMemcpyAsync(d_dict_all, flat_dict.data(),
+                                  sizeof(void *) * (size_t)nrg * ncol, cudaMemcpyHostToDevice, stream), "cp dict_all");
+            check(cudaEventRecord(E_page, stream), "rec E_page");
+            check(cudaStreamWaitEvent(stream2, E_page, 0), "wait E_page");
+            for (int rg = 0; rg < nrg; rg++) {
+                int n = cn_h[rg];
+                int blocks = (n + THREADS - 1) / THREADS; if (blocks > 65535) blocks = 65535;
+                PageSrc s_rg = s;
+                s_rg.buf  = (const void **)(d_buf_all)  + (size_t)rg * ncol;
+                s_rg.dict = (const void **)(d_dict_all) + (size_t)rg * ncol;
+                materialise_kernel<<<blocks, THREADS, 0, stream2>>>(
+                    s_rg, d_frame_ptrs, d_out_kind, d_row_off, rg, n, ncol);
+                check(cudaGetLastError(), "materialise async launch");
+            }
+            check(cudaEventRecord(E_mat, stream2), "rec E_mat");
+            // Transfer ownership of every device allocation the gather reads to
+            // the pending registry; null the locals so the cleanup below's
+            // cudaFree(nullptr) skips them (the registry frees them in
+            // fused_scan_finalize, the sole freer).
+            PendingMatCtx ctx;
+            ctx.ubig = ubig; ubig = nullptr;
+            ctx.d_idxbig = d_idxbig; d_idxbig = nullptr;
+            ctx.d_buf_all = d_buf_all; d_buf_all = nullptr;
+            ctx.d_dict_all = d_dict_all; d_dict_all = nullptr;
+            ctx.d_row_off = d_row_off; d_row_off = nullptr;
+            ctx.d_frame_ptrs = d_frame_ptrs; d_frame_ptrs = nullptr;
+            ctx.d_out_kind = d_out_kind; d_out_kind = nullptr;
+            ctx.d_kind = d_kind; d_kind = nullptr;
+            ctx.d_phys = d_phys; d_phys = nullptr;
+            ctx.d_scale = d_scale; d_scale = nullptr;
+            ctx.stream2 = stream2; stream2 = nullptr;
+            ctx.E_mat = E_mat; E_mat = nullptr;
+            pending_id = g_pending_next.fetch_add(1);
+            g_pending[pending_id] = ctx;
+        }
+
+        // Sync ONLY the main scan stream in async mode (the materialise on the
+        // non-blocking stream2 is allowed to continue past the return). In sync
+        // mode a device sync waits for the in-loop materialise as before.
+        if (async_mat) check(cudaStreamSynchronize(stream), "final stream sync");
+        else            check(cudaDeviceSynchronize(), "final sync");
 #ifdef RYUDB_SCAN_PROFILE
         _tm.mark("stream-loop+sync");
 #endif
@@ -1619,7 +1769,11 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
                 check(cudaMemset(counter, 0, sizeof(int)), "memset ctr");
                 int cblocks = (capacity + THREADS - 1) / THREADS; if (cblocks > 65535) cblocks = 65535;
                 compact_kernel<<<cblocks, THREADS>>>(key, acc, capacity, nagg, out_keys, out_acc, counter);
-                check(cudaDeviceSynchronize(), "compact sync");
+                // Sync only the default stream (compact_kernel runs here). A
+                // device sync would also wait for the async materialise on the
+                // non-blocking stream2, re-serializing the cold return.
+                if (async_mat) check(cudaStreamSynchronize(0), "compact stream sync");
+                else            check(cudaDeviceSynchronize(), "compact sync");
                 std::vector<long long> h_keys(n_out); std::vector<double> h_acc2((size_t)n_out * nagg);
                 check(cudaMemcpy(h_keys.data(), out_keys, sizeof(long long) * n_out, cudaMemcpyDeviceToHost), "cp ok");
                 check(cudaMemcpy(h_acc2.data(), out_acc, sizeof(double) * n_out * nagg, cudaMemcpyDeviceToHost), "cp oa");
@@ -1640,11 +1794,19 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
 #endif
     if (pinned_mmap) cudaHostUnregister((void *)file_data);
     if (stream) cudaStreamDestroy(stream);
+    // async-materialise resources not transferred to the pending registry: in
+    // async-success they were moved to the ctx (null here -> no-op); in
+    // async-overflow or sync mode they're still local and must be freed here.
+    // E_page is never registered (it only orders stream2 after `stream`).
+    if (E_page)  cudaEventDestroy(E_page);
+    if (stream2) cudaStreamDestroy(stream2);
+    if (E_mat)   cudaEventDestroy(E_mat);
     cudaFreeHost(pin); cudaFree(dbig); cudaFree(ubig); cudaFree(d_idxbig);
     cudaFree(d_cptrs); cudaFree(d_cbytes); cudaFree(d_ubytes); cudaFree(d_actual);
     cudaFree(d_uptrs); cudaFree(d_stat); cudaFree(d_temp);
     cudaFree(d_runs); cudaFree(d_nruns); cudaFree(d_bw); cudaFree(d_dict_data); cudaFree(d_dict_n); cudaFree(d_overflow);
     cudaFree(d_frame_ptrs); cudaFree(d_out_kind); cudaFree(d_row_off);
+    cudaFree(d_buf_all); cudaFree(d_dict_all);
     cudaFree(d_buf); cudaFree(d_dict);
     cudaFree((void *)d_kind); cudaFree((void *)d_phys);
     cudaFree((void *)d_scale); cudaFree((void *)d_isdate);
@@ -1656,7 +1818,7 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
     cudaFree((void *)p.tok_col); cudaFree((void *)p.tok_lit); cudaFree((void *)p.tok_op);
     munmap((void *)file_data, file_len); close(fd);
 
-    return py::make_tuple(overflow, n_out, keys_list, aggs_list);
+    return py::make_tuple(overflow, n_out, keys_list, aggs_list, pending_id);
 }
 
 // Testability hook: mmap `path`, parse the page headers of one column chunk
@@ -1693,5 +1855,6 @@ PYBIND11_MODULE(fused, m) {
     m.def("fused_agg", &fused_agg);
     m.def("fused_join_agg", &fused_join_agg);
     m.def("fused_scan_agg", &fused_scan_agg);
+    m.def("fused_scan_finalize", &fused_scan_finalize);
     m.def("pqpages_probe", &pqpages_probe);
 }

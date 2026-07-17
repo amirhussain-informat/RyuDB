@@ -63,6 +63,72 @@ _HASH_ACC_BUDGET = 2 * 10**9
 _HASH_CAP_MAX = 1 << 25  # 33.5M slots
 
 
+class _PendingFrame:
+    """A lazily-materialised scan frame awaiting a background CUDA gather.
+
+    Phase 5 async-materialise: when the C++ fused scan runs the cache-populate
+    `materialise_kernel` on a side stream, it returns a `pending_id` (>0) and
+    hands ownership of the gather scratch to a registry. The cold query stores
+    this object in `engine._scan_cache` instead of a ready `cudf.DataFrame`; the
+    aggregate result itself is already computed and returned synchronously.
+
+    The first warm read calls `.get()`, which runs `fused_scan_finalize` (syncs
+    the gather's completion event `E_mat` so the per-column numba buffers are
+    fully written and visible), then builds the cuDF Series from those buffers.
+    Building the Series *after* the `E_mat` sync preserves the step-3 race fix
+    (`as_column`'s async copy must read completed data). `frame_bufs` are kept
+    alive here until the Series are built.
+
+    If `finalize`/build fails, `.get()` returns `None` so `Engine._scan` falls
+    through to `storage.scan` -- we lose the cache but keep correctness (the
+    async side effect must never break a query).
+    """
+
+    __slots__ = ("_bufs", "_meta", "_pid", "_proj", "_frame")
+
+    def __init__(self, frame_bufs, frame_meta, pending_id, proj):
+        self._bufs = frame_bufs
+        self._meta = frame_meta  # list[(name, out_kind)]
+        self._pid = int(pending_id)
+        self._proj = proj
+        self._frame = None  # cached cudf.DataFrame once built
+
+    def get(self):
+        if self._frame is not None:
+            return self._frame
+        import cudf
+        import cudf.core.column as _cc
+        try:
+            # Sync the background gather (no-op if already done) and free its
+            # scratch. Sole freer of the materialise device buffers.
+            if _kernels.fused_scan_finalize is not None:
+                _kernels.fused_scan_finalize(self._pid)
+            cols_out: dict[str, "cudf.Series"] = {}
+            for c, (name, ok) in enumerate(self._meta):
+                series = cudf.Series._from_column(_cc.as_column(self._bufs[c]))
+                if ok == 3:
+                    series = series.astype("datetime64[s]")
+                cols_out[name] = series
+            self._frame = cudf.DataFrame(
+                {n: cols_out[n] for n in sorted(self._proj)}
+            )
+            # Buffers are now owned by the cuDF columns; release our refs.
+            self._bufs = None
+            self._pid = 0
+            return self._frame
+        except Exception:
+            # Never let the async side effect break a query: drop the cache so
+            # the warm path re-scans via storage.scan.
+            self._frame = None
+            self._bufs = None
+            self._pid = 0
+            return None
+
+    @property
+    def pending_id(self) -> int:
+        return self._pid
+
+
 def fused_aggregate(node: Aggregate, child, engine=None) -> "cudf.DataFrame | None":
     """Try to run `node` as a fused CUDA kernel over `child`.
 
@@ -1566,7 +1632,7 @@ def fused_scan_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
                 frame_out_kind.append(ok)
                 frame_meta.append((idx_name[c], ok))
 
-        overflow, n_out, keys_list, aggs_list = _kernels.fused_scan_agg(
+        overflow, n_out, keys_list, aggs_list, pending_id = _kernels.fused_scan_agg(
             path, int(ncol), int(nrg),
             np.array(chunk_off, dtype=np.int64),
             np.array(chunk_total, dtype=np.int32),
@@ -1614,22 +1680,37 @@ def fused_scan_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     # Cache the materialised frame so warm repeats hit the GPU-resident frame
     # instead of re-reading Parquet. overflow == 0 here, so every RG wrote its
     # full row range into the per-column numba buffers (the kernel's write
-    # targets, now sync-visible). Build the cuDF Series from those buffers NOW --
-    # any copy as_column performs reads correct data (no race with the kernel,
-    # which already completed under the C++ entry's final sync). Date columns
-    # (out_kind 3) were written as int64 seconds -> astype datetime64[s] to match
-    # the date dtype family storage.scan produces; the warm path is unit-agnostic
-    # via _to_int64_seconds. Never reached when populate is False (no buffers).
+    # targets). Two paths:
+    #
+    #  * pending_id != 0 (async): the materialise gather is still running on the
+    #    C++ side-stream (stream2). Store a _PendingFrame that *defers* building
+    #    the cuDF Series until the first warm read calls .get() -> fused_scan_
+    #    finalize, which syncs E_mat first. Building the Series *after* that sync
+    #    preserves the step-3 race fix (as_column's async copy must read gather
+    #    writes that are already visible). Keep frame_bufs alive on the pending
+    #    object until then.
+    #  * pending_id == 0 (sync fallback / kill switch): the gather already
+    #    completed under the C++ entry's final sync, so build the cuDF Series NOW
+    #    exactly as before. Date columns (out_kind 3) were written as int64
+    #    seconds -> astype datetime64[s] to match storage.scan; the warm path is
+    #    unit-agnostic via _to_int64_seconds.
+    # Never reached when populate is False (no buffers).
     if populate:
-        cols_out: dict[str, "cudf.Series"] = {}
-        for c, (name, ok) in enumerate(frame_meta):
-            series = cudf.Series._from_column(_cc.as_column(frame_bufs[c]))
-            if ok == 3:
-                series = series.astype("datetime64[s]")
-            cols_out[name] = series
-        engine._scan_cache[(filt.input.table, frozenset(proj))] = cudf.DataFrame(
-            {n: cols_out[n] for n in sorted(proj)}
-        )
+        cache_key = (filt.input.table, frozenset(proj))
+        if pending_id:
+            engine._scan_cache[cache_key] = _PendingFrame(
+                frame_bufs, frame_meta, pending_id, proj
+            )
+        else:
+            cols_out: dict[str, "cudf.Series"] = {}
+            for c, (name, ok) in enumerate(frame_meta):
+                series = cudf.Series._from_column(_cc.as_column(frame_bufs[c]))
+                if ok == 3:
+                    series = series.astype("datetime64[s]")
+                cols_out[name] = series
+            engine._scan_cache[cache_key] = cudf.DataFrame(
+                {n: cols_out[n] for n in sorted(proj)}
+            )
 
     is_global = ngkey == 0
     if is_global and n_out == 0:

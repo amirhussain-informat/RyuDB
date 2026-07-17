@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 
 from ryudb.exec import fused
+from ryudb.exec.fused import _PendingFrame
 from ryudb.storage import scan
 
 Q6 = """
@@ -64,6 +65,21 @@ def _norm_date(s) -> np.ndarray:
     return s.astype("datetime64[s]").astype("int64").to_numpy()
 
 
+def _resolve_cache(typed_engine, key):
+    """Return the ready cuDF frame for a cache key, resolving a _PendingFrame.
+
+    Phase 5 async-materialise stores a _PendingFrame after a cold scan; this
+    helper mirrors what `Engine._scan` does on the first warm read (call .get(),
+    which runs `fused_scan_finalize` to sync the background gather then builds
+    the cuDF Series) so tests can inspect the materialised frame.
+    """
+    v = typed_engine._scan_cache[key]
+    if isinstance(v, _PendingFrame):
+        v = v.get()
+        assert v is not None, "pending frame failed to materialise"
+    return v
+
+
 def test_cold_scan_populates_cache(typed_engine, counting_kernel):
     typed_engine.clear_scan_cache()
     typed_engine.clear_code_cache()
@@ -74,7 +90,15 @@ def test_cold_scan_populates_cache(typed_engine, counting_kernel):
     key = ("lineitem", frozenset(PROJ))
     assert key in typed_engine._scan_cache, "cold scan did not populate _scan_cache"
 
-    cached = typed_engine._scan_cache[key]
+    # Async path: the cold scan stores a _PendingFrame (gather still running on
+    # the side stream). Resolve it -> ready frame, then verify contents.
+    cached_raw = typed_engine._scan_cache[key]
+    assert isinstance(cached_raw, _PendingFrame), (
+        f"async cold path should store a _PendingFrame, got {type(cached_raw).__name__}"
+    )
+    assert cached_raw.pending_id != 0, "pending_id should be >0 on the async path"
+
+    cached = _resolve_cache(typed_engine, key)
     assert list(cached.columns) == sorted(PROJ), f"cols {list(cached.columns)}"
 
     ref = scan(typed_engine.catalog.get("lineitem"), PROJ)
@@ -88,6 +112,65 @@ def test_cold_scan_populates_cache(typed_engine, counting_kernel):
             assert str(cached[c].dtype) == "float64", f"{c}: expected float64, got {cached[c].dtype}"
             a, b = cached[c].to_numpy(), ref[c].to_numpy()
             assert np.allclose(a, b, rtol=1e-9, atol=1e-6), f"col {c} value mismatch"
+
+
+def test_clear_scan_cache_finalizes_pending(typed_engine, counting_kernel):
+    """clear_scan_cache must finalize a pending ctx (sync its gather + free the
+    ~1.4 GB background scratch) so a cold run immediately followed by clear
+    doesn't leak or fault, and the already-gathered frame stays usable."""
+    typed_engine.clear_scan_cache()
+    typed_engine.clear_code_cache()
+
+    typed_engine.sql(Q6)  # cold -> _PendingFrame stored
+    assert counting_kernel["n"] == 1
+    key = ("lineitem", frozenset(PROJ))
+    pending = typed_engine._scan_cache[key]
+    assert isinstance(pending, _PendingFrame)
+
+    # clear finalizes the pending ctx (syncs E_mat, frees source scratch).
+    typed_engine.clear_scan_cache()
+    assert key not in typed_engine._scan_cache
+
+    # The gather completed (finalize synced E_mat) before its source scratch was
+    # freed, so the Python-owned output buffers still hold a correct frame.
+    frame = pending.get()
+    assert frame is not None, "frame should be usable after clear finalized it"
+    assert list(frame.columns) == sorted(PROJ)
+
+    ref = scan(typed_engine.catalog.get("lineitem"), PROJ)
+    assert len(frame) == len(ref)
+    a, b = frame["l_extendedprice"].to_numpy(), ref["l_extendedprice"].to_numpy()
+    assert np.allclose(a, b, rtol=1e-9, atol=1e-6), "post-clear frame values mismatch"
+
+    # A second cold run after clear still works (no sticky context fault from a
+    # freed/leaked pending ctx).
+    counting_kernel["n"] = 0
+    typed_engine.sql(Q6)
+    assert counting_kernel["n"] == 1, "second cold run after clear should dispatch the scan path"
+
+
+def test_kill_switch_sync_path(typed_engine, counting_kernel, monkeypatch):
+    """RYUDB_ASYNC_MATERIALISE=0 forces the synchronous materialise: the gather
+    completes inside the C++ entry's final sync, so pending_id==0 and the cache
+    holds a ready DataFrame (not a _PendingFrame)."""
+    typed_engine.clear_scan_cache()
+    typed_engine.clear_code_cache()
+
+    monkeypatch.setenv("RYUDB_ASYNC_MATERIALISE", "0")
+    typed_engine.sql(Q6)  # cold, sync path
+    assert counting_kernel["n"] == 1
+
+    key = ("lineitem", frozenset(PROJ))
+    cached = typed_engine._scan_cache[key]
+    assert not isinstance(cached, _PendingFrame), (
+        "kill switch should store a ready DataFrame, not a _PendingFrame"
+    )
+    assert list(cached.columns) == sorted(PROJ)
+
+    ref = scan(typed_engine.catalog.get("lineitem"), PROJ)
+    assert len(cached) == len(ref)
+    a, b = cached["l_extendedprice"].to_numpy(), ref["l_extendedprice"].to_numpy()
+    assert np.allclose(a, b, rtol=1e-9, atol=1e-6), "sync-path frame values mismatch"
 
 
 def test_warm_rerun_hits_cache(typed_engine, counting_kernel, typed_duck):
