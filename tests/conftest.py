@@ -185,8 +185,16 @@ def as_sorted(df) -> list[tuple]:
 
 
 def _clean(v):
-    """Round floats for stable comparison across GPU/CPU float differences."""
+    """Round floats for stable comparison across GPU/CPU float differences.
+
+    A SQL NULL in a decimal/float column arrives as NaN (cuDF ``_coerce_decimals``
+    null -> NaN; DuckDB too); ``NaN != NaN`` would otherwise make every row with a
+    NULL compare unequal to itself, so normalize NaN -> None. The engine never
+    stores a distinct NaN *value* (decimals are finite), so NaN always means NULL.
+    """
     if isinstance(v, float):
+        if v != v:  # NaN (SQL NULL in a decimal/float column)
+            return None
         return round(v, 6)
     return v
 
