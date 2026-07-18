@@ -11,8 +11,15 @@ Uses sqlglot to parse SQL, then lowers the AST into RyuDB's relational algebra
   [ORDER BY col [ASC|DESC] [, ...]]
   [LIMIT n [OFFSET m]]
 
-Not yet supported: subqueries, CTEs, window functions, HAVING, UNION, non-equi
-joins, correlated predicates, cross joins. Unsupported constructs raise
+Supported joins: INNER, LEFT/RIGHT/FULL OUTER, CROSS, and NATURAL (lowered to
+an equi-join on the intersection of common column names). A non-equi ON residual
+alongside equi keys (e.g. ``ON a.k=b.k AND b.x>10``) is kept on the Join as an
+``on_predicate`` and applied *inside* the join so outer-join semantics survive
+(it filters only matched rows, never the null-padded unmatched rows).
+
+Not yet supported: subqueries, CTEs, window functions, HAVING, UNION, pure
+non-equi/theta joins (an ON with no equi key), correlated predicates,
+table-qualified column output (bare ``Col`` only). Unsupported constructs raise
 NotImplementedError with a clear message.
 """
 
@@ -227,23 +234,20 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
     aliases: dict[str, str] = {base_alias: base_table}
 
     for j in sel.args.get("joins", []) or []:
-        if j.side and j.side != "" and j.side.upper() not in ("", "INNER"):
-            raise NotImplementedError(f"{j.side} joins are not supported (inner only)")
-        if j.method and j.method.upper() in ("CROSS", "NATURAL"):
-            raise NotImplementedError(f"{j.method} joins are not supported")
         rtbl, ralias = _table_ref(j.this)
         left_tables = {n.table for n in _walk_scans(plan)}
-        on_left, on_right, leftover = _join_keys(j, aliases, ralias, rtbl, schema, left_tables)
+        how, on_left, on_right, on_predicate = _join_spec(
+            j, aliases, ralias, rtbl, schema, left_tables
+        )
         plan = Join(
             left=plan,
             right=Scan(rtbl),
             on_left=on_left,
             on_right=on_right,
-            how="inner",
+            how=how,
+            on_predicate=on_predicate,
         )
         aliases[ralias] = rtbl
-        if leftover is not None:
-            plan = Filter(plan, leftover)
 
     # --- WHERE ----------------------------------------------------------- #
     where = sel.args.get("where")
@@ -391,6 +395,82 @@ def _table_ref(node) -> tuple[str, str]:
         raise ParseError("table reference has no name")
     alias = node.alias or name
     return name, alias
+
+
+def _join_spec(j, left_aliases, ralias, rtable, schema, left_tables):
+    """Lower a sqlglot ``Join`` into (how, on_left, on_right, on_predicate).
+
+    ``how`` is the cuDF merge kind (inner/left/right/full/cross). ``on_left`` /
+    ``on_right`` are the equi-join key column names (empty for a pure CROSS).
+    ``on_predicate`` is the non-equi ON residual the executor applies *inside* the
+    join with outer-correct semantics (``None`` when there is no residual).
+
+    Keeping the residual on the Join -- not wrapped in a top Filter -- is what
+    preserves ON-vs-WHERE for outer joins: a WHERE Filter would wrongly drop the
+    null-padded unmatched rows that an outer join must retain. ``Filter`` is still
+    used for the query's actual WHERE clause (see ``_build_select``).
+
+    sqlglot encodes the join shape across three attrs: ``method`` (NATURAL),
+    ``side`` (LEFT/RIGHT/FULL), ``kind`` (INNER/OUTER/CROSS). CROSS lives in
+    ``kind``, not ``method``; NATURAL lives in ``method`` and may combine with a
+    ``side`` (NATURAL LEFT/RIGHT/FULL).
+    """
+    method = (j.method or "").upper()
+    side = (j.side or "").upper()
+    kind = (j.kind or "").upper()
+
+    if method == "NATURAL":
+        if schema is None:
+            raise NotImplementedError("NATURAL joins require a table schema")
+        how = _side_how(side, kind)
+        on_left, on_right = _common_columns(left_tables, rtable, schema)
+        if not on_left:
+            # SQL standard: a NATURAL join over no common columns is a cross join.
+            return "cross", [], [], None
+        return how, on_left, on_right, None
+
+    if kind == "CROSS":
+        on = j.args.get("on")
+        if on is None:
+            return "cross", [], [], None
+        # `CROSS JOIN ... ON ...` is semantically an inner join on that ON; lower
+        # it through _join_keys so equi columns route correctly (a post-cross
+        # filter would collide on bare column names that appear on both sides).
+        on_left, on_right, leftover = _join_keys(
+            j, left_aliases, ralias, rtable, schema, left_tables
+        )
+        return "inner", on_left, on_right, leftover
+
+    how = _side_how(side, kind)
+    on_left, on_right, leftover = _join_keys(
+        j, left_aliases, ralias, rtable, schema, left_tables
+    )
+    return how, on_left, on_right, leftover
+
+
+def _side_how(side: str, kind: str) -> str:
+    """Map sqlglot ``side``/``kind`` to a cuDF merge ``how``."""
+    if side == "LEFT":
+        return "left"
+    if side == "RIGHT":
+        return "right"
+    if side == "FULL":
+        return "full"
+    if side == "" and kind == "OUTER":
+        return "full"  # bare `OUTER JOIN` -> FULL OUTER (standard reading)
+    return "inner"
+
+
+def _common_columns(left_tables, rtable, schema) -> tuple[list[str], list[str]]:
+    """Sorted intersection of the right table's columns with the union of the
+    left relation's tables' columns -- the NATURAL-join key set (same name on
+    both sides). Returns (keys, keys) since NATURAL keys share a name."""
+    right_cols = set(schema.get(rtable, []))
+    left_cols: set[str] = set()
+    for t in left_tables:
+        left_cols |= set(schema.get(t, []))
+    common = sorted(left_cols & right_cols)
+    return common, common
 
 
 def _join_keys(j, left_aliases, ralias, rtable, schema, left_tables):
