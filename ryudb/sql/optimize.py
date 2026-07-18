@@ -33,6 +33,7 @@ from .plan import (
     PlanNode,
     Project,
     Scan,
+    SetOp,
     Sort,
     walk,
 )
@@ -77,6 +78,13 @@ def prune_projections(plan: PlanNode, schema: Schema) -> PlanNode:
         if isinstance(node, Join):
             return Join(rewrite(node.left), rewrite(node.right), node.on_left,
                         node.on_right, node.how, node.on_predicate)
+        if isinstance(node, SetOp):
+            # A set op is a projection barrier: the columns each branch needs are
+            # exactly what that branch projects, so recurse into both children
+            # independently (a column referenced only in the left branch must not
+            # be pruned from the right branch's scans, and vice versa).
+            return SetOp(rewrite(node.left), rewrite(node.right),
+                         node.op, node.distinct)
         if isinstance(node, Filter):
             return Filter(rewrite(node.input), node.predicate)
         if isinstance(node, Project):
@@ -156,6 +164,22 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
                 plan.how,
                 plan.on_predicate,
             )
+        if isinstance(plan, SetOp):
+            # A set op is a pushdown barrier: a predicate above it cannot be
+            # pushed across (it applies to the combined rows). But predicates
+            # already routed to a table that lives entirely in one branch are
+            # forwarded into that branch only, so a WHERE inside a UNION arm
+            # still reaches its own scan.
+            left_tables = subtree_tables(plan.left)
+            right_tables = subtree_tables(plan.right)
+            left_map = {t: cs for t, cs in per_table.items() if t in left_tables}
+            right_map = {t: cs for t, cs in per_table.items() if t in right_tables}
+            return SetOp(
+                insert(plan.left, left_map),
+                insert(plan.right, right_map),
+                plan.op,
+                plan.distinct,
+            )
         if isinstance(plan, Filter):
             # Push past existing filters; they re-wrap below.
             return Filter(insert(plan.input, per_table), plan.predicate)
@@ -184,6 +208,8 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
         elif isinstance(node, Join):
             node = Join(go(node.left), go(node.right), node.on_left,
                         node.on_right, node.how, node.on_predicate)
+        elif isinstance(node, SetOp):
+            node = SetOp(go(node.left), go(node.right), node.op, node.distinct)
 
         if isinstance(node, Filter) and isinstance(node.input, Join):
             join = node.input
@@ -244,6 +270,12 @@ def select_join_sides(plan: PlanNode, stats: Stats) -> PlanNode:
             left_rows = est_rows(node.left)
             right_rows = est_rows(node.right)
             return min(left_rows * right_rows, 10**15)
+        if isinstance(node, SetOp):
+            # UNION is at most the sum; INTERSECT/EXCEPT at most the left. Use the
+            # sum (capped) as a conservative upper bound -- this only feeds
+            # join-side selection of an *enclosing* join, and a SetOp is never
+            # side-swapped itself.
+            return min(est_rows(node.left) + est_rows(node.right), 10**15)
         if hasattr(node, "input"):
             return est_rows(node.input)
         return 10**9
@@ -265,6 +297,10 @@ def select_join_sides(plan: PlanNode, stats: Stats) -> PlanNode:
                             how, node.on_predicate)
             return Join(left, right, node.on_left, node.on_right,
                         node.how, node.on_predicate)
+        if isinstance(node, SetOp):
+            # Symmetric: no build/probe side to choose, just recurse so joins
+            # inside each branch still get side-selected.
+            return SetOp(go(node.left), go(node.right), node.op, node.distinct)
         if isinstance(node, Filter):
             return Filter(go(node.input), node.predicate)
         if isinstance(node, Project):
