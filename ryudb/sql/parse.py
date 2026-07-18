@@ -255,23 +255,49 @@ def _build_update(stmt: exp.Update) -> Update:
     return Update(table=table, assignments=assignments, predicate=predicate)
 
 
-def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
+def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None, ctes=None):
     if sel.args.get("qualify") or sel.args.get("windows"):
         raise NotImplementedError("window functions are not supported yet")
     if sel.args.get("connect") or sel.args.get("start"):
         raise NotImplementedError("recursive/hierarchical queries are not supported")
     having = sel.args.get("having")
 
+    # --- WITH / CTEs (Phase F-2c) ---------------------------------------- #
+    # Build each CTE's subplan eagerly, in order, into a *copy* of the incoming
+    # ``ctes`` map (so this scope's CTEs don't leak to an outer scope). A later CTE
+    # sees the earlier ones (forward / self references are not in the map and fall
+    # through to a ``Scan`` -> execution error -- an acceptable limitation). Each
+    # body is built once via ``_build_query`` and shared by all references; the
+    # optimizer rebuilds rather than mutates, so multiple ``Derived`` references
+    # each get their own optimized copy during the single ``optimize()`` pass.
+    ctes = dict(ctes or {})
+    with_ = sel.args.get("with_") or sel.args.get("with")
+    if with_ is not None:
+        if with_.args.get("recursive"):
+            raise NotImplementedError("recursive CTEs (WITH RECURSIVE) are not supported")
+        for cte in with_.expressions:
+            # A column-list CTE (``name(col,...) AS (...)``) renames/restricts the
+            # CTE's output columns; sqlglot stores the list on the CTE's
+            # TableAlias (``alias.columns``), not ``key_expressions``. Not supported
+            # in the flat-column model (the CTE's output names come from its body's
+            # projection; a column list would shadow them), so reject explicitly.
+            if cte.args["alias"].args.get("columns"):
+                raise NotImplementedError(
+                    "column-list CTEs (name(col,...) AS ...) are not supported"
+                )
+            name = cte.args["alias"].name
+            ctes[name] = _build_query(cte.args["this"], schema, ctes)
+
     # --- FROM + JOINs -> base relation ----------------------------------- #
     from_ = sel.args.get("from") or sel.args.get("from_")
     if from_ is None:
         raise NotImplementedError("SELECT without FROM is not supported")
-    base_source, base_alias, base_name = _table_ref(from_.this, schema)
+    base_source, base_alias, base_name = _table_ref(from_.this, schema, ctes)
     plan: object = base_source
     aliases: dict[str, str] = {base_alias: base_name}
 
     for j in sel.args.get("joins", []) or []:
-        r_source, ralias, rname = _table_ref(j.this, schema)
+        r_source, ralias, rname = _table_ref(j.this, schema, ctes)
         left_tables = {n.table for n in _walk_scans(plan)}
         how, on_left, on_right, on_predicate = _join_spec(
             j, aliases, ralias, rname, schema, left_tables
@@ -297,7 +323,7 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
     # scope); IN/NOT IN subqueries are left untouched (handled below). See
     # ``_flatten_outer_subqueries``. Non-aggregate and GROUP BY scalar subqueries
     # are deferred (no 1-row guarantee).
-    plan = _flatten_outer_subqueries(plan, sel, schema, aliases)
+    plan = _flatten_outer_subqueries(plan, sel, schema, aliases, ctes)
 
     # --- WHERE ----------------------------------------------------------- #
     where = sel.args.get("where")
@@ -305,7 +331,7 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
         # Uncorrelated ``x IN (SELECT ...)`` / ``x NOT IN (SELECT ...)`` conjuncts
         # fold into semi/anti joins on `plan`; the remaining conjuncts stay as a
         # Filter. See _apply_where_subqueries.
-        plan, residual = _apply_where_subqueries(plan, where.this, schema, aliases)
+        plan, residual = _apply_where_subqueries(plan, where.this, schema, aliases, ctes)
         if residual is not None:
             plan = Filter(plan, residual)
 
@@ -464,21 +490,26 @@ def _having_predicate(having, proj_items, group_keys, aggs):
 _SETOP_NAME = {"Union": "union", "Intersect": "intersect", "Except": "except"}
 
 
-def _build_query(node, schema: dict[str, list[str]] | None = None):
+def _build_query(node, schema: dict[str, list[str]] | None = None, ctes=None):
     """Dispatch a top-level query node (SELECT / set-op / parenthesized
     subquery) to the right builder. A ``Subquery`` wrapping a set-op or SELECT
     is unwrapped (``.this``) so ``SELECT ... UNION (SELECT ... UNION ...)``
-    parses -- the parenthesized right side arrives as an ``exp.Subquery``."""
+    parses -- the parenthesized right side arrives as an ``exp.Subquery``.
+
+    ``ctes`` is the in-scope CTE name -> built-subplan map (Phase F-2c), threaded
+    so a CTE reference resolves to a ``Derived`` wherever it appears -- the main
+    FROM, a join partner, a derived-table body, or an IN/EXISTS/scalar subquery
+    nested anywhere under this query."""
     if isinstance(node, exp.Select):
-        return _build_select(node, schema)
+        return _build_select(node, schema, ctes)
     if isinstance(node, (exp.Union, exp.Intersect, exp.Except)):
-        return _build_setop(node, schema)
+        return _build_setop(node, schema, ctes)
     if isinstance(node, exp.Subquery):
-        return _build_query(node.this, schema)
+        return _build_query(node.this, schema, ctes)
     raise ParseError(f"unsupported query: {type(node).__name__}")
 
 
-def _build_setop(node, schema: dict[str, list[str]] | None = None):
+def _build_setop(node, schema: dict[str, list[str]] | None = None, ctes=None):
     """Lower ``left {UNION|INTERSECT|EXCEPT} [ALL] right`` into a SetOp node.
 
     sqlglot gives every set-op node ``this`` (left), ``expression`` (right), and
@@ -489,8 +520,8 @@ def _build_setop(node, schema: dict[str, list[str]] | None = None):
     set-op wrap the SetOp via the shared ``_build_tail``."""
     op = _SETOP_NAME[type(node).__name__]
     distinct = bool(node.args.get("distinct"))
-    left = _build_query(node.this, schema)
-    right = _build_query(node.expression, schema)
+    left = _build_query(node.this, schema, ctes)
+    right = _build_query(node.expression, schema, ctes)
     plan = SetOp(left, right, op, distinct)
     return _build_tail(node, plan)
 
@@ -687,7 +718,7 @@ def _in(node, negated: bool) -> Expr:
 # --------------------------------------------------------------------------- #
 
 
-def _apply_where_subqueries(plan, where_node, schema, outer_aliases):
+def _apply_where_subqueries(plan, where_node, schema, outer_aliases, ctes=None):
     """Fold IN / NOT IN (uncorrelated) and correlated EXISTS / NOT EXISTS WHERE
     conjuncts into semi/anti joins on ``plan``; return ``(plan, residual)`` where
     ``residual`` is the conjoined non-subquery conjuncts (or None).
@@ -704,7 +735,7 @@ def _apply_where_subqueries(plan, where_node, schema, outer_aliases):
             residual.append(_expr(c))
             continue
         how, outer_key, inner_select = sub
-        subplan = _build_query(inner_select, schema)
+        subplan = _build_query(inner_select, schema, ctes)
         on_right = _subquery_output_col(subplan)
         plan = Join(plan, subplan, [outer_key], [on_right], how, None)
     return plan, (_conjoin_exprs(residual) if residual else None)
@@ -973,7 +1004,7 @@ def _subquery_output_col(subplan) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _flatten_outer_subqueries(plan, sel, schema, outer_aliases):
+def _flatten_outer_subqueries(plan, sel, schema, outer_aliases, ctes=None):
     """Flatten scalar / EXISTS subqueries of THIS select into joins on ``plan``,
     replacing each scalar subquery node with a Column ref. Correlated EXISTS
     nodes are left in place (``_apply_where_subqueries`` folds them as semi/anti
@@ -1005,7 +1036,7 @@ def _flatten_outer_subqueries(plan, sel, schema, outer_aliases):
                 continue
             n += 1
             name = f"_sq{n}"
-            subplan = _build_query(inner, schema)
+            subplan = _build_query(inner, schema, ctes)
             # COUNT(*) of <=1 row > 0: 1 iff the subquery has any row, else 0.
             # COUNT must be uppercase (the executor's _scalar_global_agg special-
             # cases ``func == "COUNT"`` with a Star arg); ``AGG_FUNCS`` (used by
@@ -1019,7 +1050,7 @@ def _flatten_outer_subqueries(plan, sel, schema, outer_aliases):
             if corr is None:
                 n += 1
                 name = f"_sq{n}"
-                subplan = _build_query(inner, schema)
+                subplan = _build_query(inner, schema, ctes)
                 _require_global_aggregate(subplan)
                 existing = _subquery_output_col(subplan)
                 # Rename the aggregate's single output column to the broadcast
@@ -1030,12 +1061,12 @@ def _flatten_outer_subqueries(plan, sel, schema, outer_aliases):
             else:
                 n += 1
                 name = f"_sq{n}"
-                plan, replacement = _decorrelate_scalar(plan, inner, corr, name, schema)
+                plan, replacement = _decorrelate_scalar(plan, inner, corr, name, schema, ctes)
                 node.replace(replacement)
     return plan
 
 
-def _decorrelate_scalar(plan, inner_select, corr, name, schema):
+def _decorrelate_scalar(plan, inner_select, corr, name, schema, ctes=None):
     """Rewrite a correlated scalar subquery (single equi-correlation, global
     aggregate, inner-only agg arg) into a LEFT join of ``plan`` onto a grouped
     aggregate. The correlation key becomes the GROUP BY key and the left-join key;
@@ -1053,7 +1084,7 @@ def _decorrelate_scalar(plan, inner_select, corr, name, schema):
     COALESCE default 0)."""
     outer_key, inner_key, local_conjuncts = corr
     _set_local_where(inner_select, local_conjuncts)
-    subplan = _build_query(inner_select, schema)
+    subplan = _build_query(inner_select, schema, ctes)
     _require_global_aggregate(subplan)
     # subplan is Aggregate(input, [], [(agg, orig_name)]) -- inject the correlation
     # key as the GROUP BY key. Peek through Sort/Limit to the global aggregate.
@@ -1352,22 +1383,34 @@ def _binop_symbol(node: exp.Binary) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _table_ref(node, schema) -> tuple[object, str, str]:
+def _table_ref(node, schema, ctes=None) -> tuple[object, str, str]:
     """Lower a FROM/JOIN table reference into ``(source, alias, name)``.
 
-    ``source`` is a ``Scan(name)`` for a real catalog table or a
-    ``Derived(subplan, alias)`` for a FROM-subquery. ``alias`` is the FROM alias.
-    ``name`` is the routing identity used by ``_join_spec`` / ``_route_join_cols``:
-    the real table name for a base table, or the alias for a derived table
-    (``schema.get(alias)`` is empty, so equi-key routing falls back to table
-    qualifiers -- correct for a derived table whose output columns carry no
-    schema entry). Derived tables require an alias (DuckDB does too)."""
+    ``source`` is a ``Scan(name)`` for a real catalog table, a
+    ``Derived(subplan, alias)`` for a FROM-subquery, or a ``Derived`` wrapping a
+    CTE's built subplan for a CTE reference (Phase F-2c). ``alias`` is the FROM
+    alias. ``name`` is the routing identity used by ``_join_spec`` /
+    ``_route_join_cols``: the real table name for a base table, or the alias for a
+    derived table / CTE reference (``schema.get(alias)`` is empty, so equi-key
+    routing falls back to table qualifiers -- correct for a relation whose output
+    columns carry no schema entry). Derived tables require an alias (DuckDB does
+    too); a CTE reference may use the CTE name as its alias or an explicit ``AS x``.
+    A CTE reference is a plain ``exp.Table`` whose ``name`` is in the in-scope CTE
+    map -- indistinguishable by type from a base table, so the map lookup happens
+    here. The built CTE subplan is shared across references (the optimizer rebuilds
+    rather than mutates, so each wrapping ``Derived`` gets its own optimized copy)."""
     if isinstance(node, exp.Subquery):
-        subplan = _build_query(node.this, schema)
+        subplan = _build_query(node.this, schema, ctes)
         alias = node.alias
         if not alias:
             raise ParseError("subquery in FROM must have an alias (e.g. FROM (...) AS t)")
         return Derived(subplan, alias), alias, alias
+    if isinstance(node, exp.Table) and ctes and node.name in ctes:
+        # A CTE reference: ``FROM cte1`` / ``FROM cte1 AS x`` -> Derived wrapping
+        # the CTE body's built subplan. Same lowering as a FROM-subquery, so all
+        # scope-barrier / pruning / routing semantics apply unchanged.
+        alias = node.alias or node.name
+        return Derived(ctes[node.name], alias), alias, alias
     if not isinstance(node, exp.Table):
         raise ParseError(f"expected a table reference, got {type(node).__name__}")
     name = node.name
