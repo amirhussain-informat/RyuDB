@@ -502,6 +502,62 @@ class Engine:
             parts.append(sub)
         return cudf.concat(parts, axis=0).reset_index(drop=True)
 
+    def _enforce_unique(self, table: str, frame: "cudf.DataFrame") -> None:
+        """Reject INSERT rows that violate a declared PRIMARY KEY or UNIQUE
+        constraint (Phase 2 step 8).
+
+        Declared-constraints-only: reads ``TableConstraints.primary_key`` and
+        ``TableConstraints.unique`` -- NOT ``is_unique_key``/``_pk_cache``, which
+        are data-uniqueness facts used as the fused star-join's dimension-PK
+        eligibility gate. Gating enforcement on those would reject duplicates on
+        any column whose data merely happens to be unique with no declared
+        constraint. Called in ``_insert`` BEFORE the WAL write / buffer append so
+        a rejected insert leaves no durable or in-transaction state
+        (all-or-nothing). PK columns are NOT NULL (set by ``set_primary_key``,
+        enforced earlier in ``_insert``); UNIQUE columns are nullable and NULLs
+        are exempt (standard SQL: NULL != NULL). Cost is a projection-pruned scan
+        of the key column(s) per constraint -- naive but correct;
+        index-accelerated enforcement is a future optimization.
+        """
+        info = self.catalog.get(table)
+        pk = info.constraints.primary_key
+        uniq = info.constraints.unique
+        if pk is None and not uniq:
+            return
+        constraints = ([pk] if pk is not None else []) + list(uniq)
+        for key_cols in constraints:
+            key_cols = list(key_cols)
+            # NULLs are exempt from UNIQUE (NULL != NULL); PK cols are NOT NULL so
+            # the dropna is a no-op for PK, but it keeps the UNIQUE check correct.
+            non_null = frame.dropna(subset=key_cols)
+            # (a) internal duplicates within this batch.
+            if len(non_null) != non_null[key_cols].drop_duplicates().shape[0]:
+                raise RuntimeError(
+                    f"UNIQUE violation: {table}.{key_cols} duplicate within INSERT batch"
+                )
+            # (b) collisions with the existing visible series. _scan(table, set)
+            # is projection-pruned and read-your-writes in a txn (includes
+            # already-buffered rows), so a 2nd in-txn INSERT colliding with a 1st
+            # buffered INSERT is caught.
+            existing = self._scan(table, set(key_cols))
+            existing_nn = existing.dropna(subset=key_cols)
+            if existing_nn.shape[0]:
+                new_keys = non_null[key_cols].reset_index(drop=True)
+                ex_keys = existing_nn[key_cols].reset_index(drop=True)
+                # Align the new batch's key dtypes to the existing (base) series
+                # before the join: the batch is built with nullable Int64
+                # (_arrow_match_dtype) while the base scan is int64, and cuDF
+                # merge cannot reconcile numpy Int64Dtype vs pandas Int64Dtype.
+                for c in key_cols:
+                    if str(new_keys[c].dtype) != str(ex_keys[c].dtype):
+                        new_keys[c] = new_keys[c].astype(ex_keys[c].dtype)
+                merged = new_keys.merge(ex_keys, on=key_cols, how="inner")
+                if merged.shape[0]:
+                    raise RuntimeError(
+                        f"UNIQUE violation: {table}.{key_cols} "
+                        f"{merged.shape[0]} row(s) already exist"
+                    )
+
     def _insert(self, node: Insert) -> int:
         """Append ``INSERT ... VALUES`` rows to the table's delta (Phase 2 step 3).
 
@@ -511,9 +567,11 @@ class Engine:
         target. Outside a transaction (autocommit) the batch is appended to
         ``self.delta`` under a fresh commit_ts and the next SELECT re-merges it
         in ``_scan``. Inside a transaction the batch is buffered on the txn
-        (read-your-writes) and flushed to ``self.delta`` at COMMIT. PK/UNIQUE
-        uniqueness is NOT enforced here (deferred); only NOT NULL + DEFAULT +
-        type coercion. Returns the row count appended.
+        (read-your-writes) and flushed to ``self.delta`` at COMMIT. Declared
+        PRIMARY KEY / UNIQUE uniqueness is enforced by ``_enforce_unique``
+        BEFORE the WAL write / buffer append (all-or-nothing: a rejected
+        insert leaves no durable or in-transaction state); only NOT NULL +
+        DEFAULT + type coercion otherwise. Returns the row count appended.
         """
         info = self.catalog.get(node.table)
         if info is None:
@@ -573,6 +631,10 @@ class Engine:
             else:
                 pdf[c] = pd.array(arr, dtype=dt)
         frame = cudf.DataFrame(pd.DataFrame(pdf))
+        # Phase 2 step 8: enforce declared PK/UNIQUE BEFORE the WAL write / buffer
+        # append so a rejected insert is all-or-nothing (no torn WAL record, no
+        # partial buffer). Runs on the typed frame; never mutates it.
+        self._enforce_unique(node.table, frame)
         # Phase 2 step 5: inside a transaction, buffer the frame (visible only to
         # this txn via read-your-writes; flushed to the shared delta at COMMIT).
         # Outside a txn (autocommit) append it to the delta now under a fresh
