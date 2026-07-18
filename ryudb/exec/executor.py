@@ -34,6 +34,7 @@ from ..sql.plan import (
     Sort,
     Star,
     TxnControl,
+    Update,
 )
 from ..storage import scan
 from ..transaction import Transaction
@@ -110,7 +111,11 @@ class Engine:
         max_ts = 0
         for cts, table, kind, frame in self._wal.replay():
             if kind == "tombstone":
-                self.delta.append_tombstone(table, frame, cts)
+                self.delta.append_tombstone(table, frame, cts, exclude_same_ts=False)
+            elif kind == "tombstone_update":
+                # step 10: an UPDATE tombstone removes rows with ins_ts < tomb_ts
+                # (strict), so the re-inserted row (same commit ts) survives.
+                self.delta.append_tombstone(table, frame, cts, exclude_same_ts=True)
             else:
                 self.delta.append(table, frame, cts)
             max_ts = max(max_ts, cts)
@@ -240,11 +245,15 @@ class Engine:
         # flush through _write_commit so the whole commit is one durable WAL
         # record (atomic on the disk side too), written+fsync'd before the
         # in-memory delta mutates. Step 9: batches are (table, kind, frame) so a
-        # mixed INSERT+DELETE commit is one record with per-batch kind.
+        # mixed INSERT+DELETE commit is one record with per-batch kind. Step 10:
+        # a tombstone's kind is ``"tombstone"`` (DELETE) or ``"tombstone_update"``
+        # (UPDATE) from its buffered ``exclude_same_ts`` flag.
         batches: list[tuple[str, str, cudf.DataFrame]] = [
             (t, "insert", f) for t in txn.tables() for f in txn.buffer_batches(t)
         ] + [
-            (t, "tombstone", f) for t in txn.tombstone_tables() for f in txn.tombstone_batches(t)
+            (t, "tombstone_update" if fl else "tombstone", f)
+            for t in txn.tombstone_tables()
+            for f, fl in txn.tombstone_batches_with_flag(t)
         ]
         self._write_commit(batches)
         self._txn = None
@@ -271,7 +280,11 @@ class Engine:
         self._wal.write_commit(ts, batches)  # durable BEFORE in-memory mutation
         for table, kind, frame in batches:
             if kind == "tombstone":
-                self.delta.append_tombstone(table, frame, ts)
+                self.delta.append_tombstone(table, frame, ts, exclude_same_ts=False)
+            elif kind == "tombstone_update":
+                # step 10: an UPDATE tombstone removes rows with ins_ts < tomb_ts
+                # (strict), so the re-inserted row (same commit ts) survives.
+                self.delta.append_tombstone(table, frame, ts, exclude_same_ts=True)
             else:
                 self.delta.append(table, frame, ts)
         for table in dict.fromkeys(t for t, _, _ in batches):
@@ -555,21 +568,35 @@ class Engine:
         Phase 2 step 9 (timestamp-aware tombstone anti-join): every visible row is
         tagged with an insertion ts (``_ins_ts``: base=0, each committed insert
         batch=its ``commit_ts``, in-txn buffered insert=``_INS_INF``). A tombstone
-        (PK values + its ``commit_ts``) removes a row iff a matching tombstone has
-        ``tomb_ts >= ins_ts`` -- i.e. only rows that existed at delete time. This
-        is what lets a DELETE followed by a same-PK reinsert (at a newer ts) work:
-        the reinsert's ``ins_ts`` exceeds the tombstone's ``ts``, so it survives.
-        Per PK we reduce the tombstones to ``max(tomb_ts)`` and keep rows where
-        that max is below the row's ``ins_ts`` (or no tombstone matches). cuDF merge
-        has no ``indicator=`` support, so the anti-join is a left merge on the PK
-        cols + a keep-where-null-or-less filter. Requires a declared PK (DELETE
-        enforces this); a tombstoned table with no PK is unreachable.
+        (PK values + its ``commit_ts`` + a ``exclude_same_ts`` flag) removes a row
+        iff a matching tombstone has ``tomb_ts >= ins_ts`` -- i.e. only rows that
+        existed at delete time. This is what lets a DELETE followed by a same-PK
+        reinsert (at a newer ts) work: the reinsert's ``ins_ts`` exceeds the
+        tombstone's ``ts``, so it survives. Per PK we reduce the tombstones to
+        ``max(tomb_ts)`` and keep rows where that max is below the row's ``ins_ts``
+        (or no tombstone matches). cuDF merge has no ``indicator=`` support, so
+        the anti-join is a left merge on the PK cols + a keep-where-null-or-less
+        filter. Requires a declared PK (DELETE/UPDATE enforce this); a tombstoned
+        table with no PK is unreachable.
+
+        Phase 2 step 10 (UPDATE tombstone flag): a tombstone carries an
+        ``exclude_same_ts`` flag -- ``False`` for a DELETE (removes
+        ``ins_ts <= tomb_ts``) and ``True`` for an UPDATE (removes
+        ``ins_ts < tomb_ts``, so the re-inserted row at the *same* commit ts
+        survives its own tombstone). Per PK we reduce the two kinds *separately*
+        to ``max(tomb_ts)``: ``_tomb_del`` over DELETE tombstones and ``_tomb_upd``
+        over UPDATE tombstones, then keep iff ``_tomb_del < ins_ts`` AND
+        ``_tomb_upd <= ins_ts``. Reducing the two kinds separately (rather than
+        tracking the flag at the overall max ts) is equivalent for every
+        reachable history and avoids a flag-at-max rejoin -- for all-DELETE
+        histories ``_tomb_upd`` is empty so the second clause is trivially true
+        and the path is byte-identical to step 9.
         """
         if self._txn is not None:
             ins_batches = self.delta.batches_at_with_ts(table, self._txn.snapshot_ts)
             buf_inserts = self._txn.buffer_batches(table)
             tomb = self.delta.tombstones_at_with_ts(table, self._txn.snapshot_ts)
-            buf_tomb = self._txn.tombstone_batches(table)
+            buf_tomb = self._txn.tombstone_batches_with_flag(table)
         else:
             ins_batches = self.delta.batches_with_ts(table)
             buf_inserts = []
@@ -597,39 +624,57 @@ class Engine:
             sub["_ins_ts"] = _INS_INF
             parts.append(sub)
         merged = cudf.concat(parts, axis=0).reset_index(drop=True)
-        # Tombstones: committed carry their ts, buffered carry +inf (removes
-        # committed rows + buffered inserts of the same PK -> read-your-writes).
-        tomb_entries: list[tuple[int, cudf.DataFrame]] = list(tomb) + [
-            (_INS_INF, t) for t in buf_tomb
+        # Tombstones: committed carry (ts, flag), buffered carry (+inf, flag)
+        # (removes committed rows + buffered inserts of the same PK -> read-your-
+        # writes). ``flag`` is 0 for a DELETE tombstone (removes ins_ts <= tomb_ts)
+        # and 1 for an UPDATE tombstone (removes ins_ts < tomb_ts, so the re-inserted
+        # row at the same commit ts survives its own tombstone -- step 10).
+        tomb_entries: list[tuple[int, cudf.DataFrame, int]] = list(tomb) + [
+            (_INS_INF, t, 1 if fl else 0) for t, fl in buf_tomb
         ]
         if tomb_entries:
             pk = self.catalog.get(table).constraints.primary_key
             if pk is not None:
                 tkeys_parts = []
-                for ts, t in tomb_entries:
+                for ts, t, fl in tomb_entries:
                     tt = t[list(pk)].copy()
                     tt["_tomb_ts"] = ts
+                    tt["_flag"] = fl
                     tkeys_parts.append(tt)
                 tkeys = cudf.concat(tkeys_parts, axis=0)
-                # max tombstone ts per PK (the most recent delete wins; older
-                # tombstones for the same PK are subsumed).
-                tomb_max = (
-                    tkeys.groupby(list(pk))["_tomb_ts"].max().reset_index()
+                # Newest DELETE tombstone (flag=0) and newest UPDATE tombstone
+                # (flag=1) per PK. A DELETE removes a row iff tomb_ts >= ins_ts
+                # (keep iff tomb_ts < ins_ts); an UPDATE removes iff tomb_ts > ins_ts
+                # (keep iff tomb_ts <= ins_ts). Keep iff BOTH keep. Reducing the two
+                # kinds separately (rather than the flag at the max ts) is equivalent
+                # for every reachable history and avoids a flag-at-max rejoin.
+                del_max = (
+                    tkeys[tkeys["_flag"] == 0]
+                    .groupby(list(pk), as_index=False)["_tomb_ts"].max()
+                    .rename(columns={"_tomb_ts": "_tomb_del"})
+                )
+                upd_max = (
+                    tkeys[tkeys["_flag"] == 1]
+                    .groupby(list(pk), as_index=False)["_tomb_ts"].max()
+                    .rename(columns={"_tomb_ts": "_tomb_upd"})
                 )
                 # Align tombstone key dtypes to the merged (base) series before
                 # the join -- same nullable-Int64-vs-int64 trap as _enforce_unique.
-                for c in pk:
-                    if str(tomb_max[c].dtype) != str(merged[c].dtype):
-                        tomb_max[c] = tomb_max[c].astype(merged[c].dtype)
-                merged = merged.merge(tomb_max, on=list(pk), how="left")
-                # Non-matching rows get NaN _tomb_ts; fill with -1 (below every
-                # real commit_ts >= 0) so a single clean comparison keeps them:
-                # keep iff the newest matching tombstone predates the row's
-                # insertion (``tomb_ts < ins_ts``). This avoids cuDF's NA-boolean
-                # ``|`` (which yields null, not True, for the isna side).
-                merged["_tomb_ts"] = merged["_tomb_ts"].fillna(-1)
-                keep = merged["_tomb_ts"] < merged["_ins_ts"]
-                merged = merged[keep].drop(columns=["_tomb_ts"])
+                for tomb in (del_max, upd_max):
+                    for c in pk:
+                        if str(tomb[c].dtype) != str(merged[c].dtype):
+                            tomb[c] = tomb[c].astype(merged[c].dtype)
+                merged = merged.merge(del_max, on=list(pk), how="left")
+                merged = merged.merge(upd_max, on=list(pk), how="left")
+                # Non-matching rows get NaN; fill with -1 (below every real
+                # commit_ts >= 0) so the corresponding clause is always satisfied.
+                # Avoids cuDF's NA-boolean ``&`` (which yields null, not True).
+                merged["_tomb_del"] = merged["_tomb_del"].fillna(-1)
+                merged["_tomb_upd"] = merged["_tomb_upd"].fillna(-1)
+                keep = (merged["_tomb_del"] < merged["_ins_ts"]) & (
+                    merged["_tomb_upd"] <= merged["_ins_ts"]
+                )
+                merged = merged[keep].drop(columns=["_tomb_del", "_tomb_upd"])
         return merged.drop(columns=["_ins_ts"]).reset_index(drop=True)
 
     def _enforce_unique(self, table: str, frame: "cudf.DataFrame") -> None:
@@ -832,6 +877,127 @@ class Engine:
             self._write_commit([(node.table, "tombstone", tombstone)])
         return len(targets)
 
+    def _typed_series(self, arrow_type, arr: list) -> "cudf.Series":
+        """Coerce a python value list to a cuDF Series following the base column
+        dtype families -- the same per-column path ``_insert`` uses (decimal/
+        float->float64, int->nullable Int64 so a NULL is ``pd.NA`` not a coercion
+        error, date->datetime64, else->object), so ``_merge_delta`` casts the
+        resulting batch column to base cleanly at read time. Used by ``_update``
+        to coerce each SET column's evaluated values. (Kept separate from
+        ``_insert``'s inline build to avoid perturbing the tested INSERT path.)"""
+        dt = _arrow_match_dtype(arrow_type)
+        if "datetime" in str(dt):
+            return cudf.Series(pd.to_datetime(arr, errors="coerce"))
+        if str(dt).startswith("int"):
+            # Nullable Int64: a NULL (on a nullable col) is pd.NA, not a coercion
+            # error; _merge_delta casts to base int64 at read time.
+            return cudf.Series(pd.array(arr, dtype="Int64"))
+        return cudf.Series(pd.array(arr, dtype=dt))
+
+    def _update(self, node: Update) -> int:
+        """Apply ``UPDATE t SET col = expr [, ...] [WHERE pred]`` (step 10).
+
+        v1 scope: autocommit only. An UPDATE inside an explicit transaction raises
+        ``NotImplementedError`` (correct per-row MVCC versioning would need the
+        two-ts split this version deliberately avoids -- see the step-10 plan).
+        Requires a declared PRIMARY KEY on ``t`` (row identity is by PK value,
+        mirroring DELETE): the matched rows are tombstoned by PK and the post-SET
+        rows are re-inserted as a fresh batch, both flushed under ONE commit_ts
+        so the re-insert (same ts) survives its own UPDATE tombstone via the
+        ``exclude_same_ts`` rule in ``_merge_delta`` (``tomb_upd <= ins_ts``).
+
+        Atomicity + read-your-writes enforcement: the autocommit UPDATE runs
+        inside an *implicit* transaction so the old rows' UPDATE tombstone is
+        visible to ``_enforce_unique`` (the old PKs are gone from the scan -> no
+        false self-collision when SET keeps the PK) and so the tombstone +
+        reinsert flush as one durable WAL record under one ts. A PK-changing
+        UPDATE that collides with a surviving row raises before any durable
+        state is written (the implicit txn is discarded). Returns the count of
+        rows matched (and updated).
+        """
+        info = self.catalog.get(node.table)
+        if info is None:
+            raise RuntimeError(f"unknown table: {node.table}")
+        pk = info.constraints.primary_key
+        if pk is None:
+            raise RuntimeError(
+                f"UPDATE requires a declared PRIMARY KEY on {node.table}"
+            )
+        if self._txn is not None:
+            raise NotImplementedError(
+                "UPDATE inside an explicit transaction is not supported in v1 "
+                "(needs per-row MVCC versioning); use autocommit UPDATE"
+            )
+        # Validate SET columns up front (cheap, before any scan).
+        all_cols = list(info.columns)
+        for col, _ in node.assignments:
+            if col not in all_cols:
+                raise ParseError(f"unknown column in UPDATE {node.table}: {col}")
+        if len({c for c, _ in node.assignments}) != len(node.assignments):
+            raise ParseError(
+                f"UPDATE {node.table} SET has duplicate columns: "
+                f"{[c for c, _ in node.assignments]}"
+            )
+
+        # Visible snapshot to update from (autocommit read path: all committed).
+        visible = self._scan(node.table, None)
+        if node.predicate is not None:
+            mask = eval_expr(node.predicate, visible)
+            if isinstance(mask, cudf.Series):
+                targets = visible[mask]
+            else:
+                targets = visible if mask else visible.iloc[0:0]
+        else:
+            targets = visible
+        if len(targets) == 0:
+            return 0
+        # reset_index so a later cuDF Series assignment aligns positionally (a
+        # boolean-masked frame keeps its pre-mask index, which would misalign a
+        # freshly-built SET series and silently fill NA).
+        targets = targets.reset_index(drop=True)
+
+        # Build the post-SET frame: copy the matched rows, override each SET
+        # column with the evaluated expression coerced to the column's base
+        # dtype family (same path _insert uses, so _merge_delta casts cleanly).
+        new_frame = targets.copy()
+        n = len(targets)
+        for col, expr in node.assignments:
+            val = eval_expr(expr, targets)
+            if isinstance(val, cudf.Series):
+                arr = val.to_pandas().tolist()
+            else:
+                arr = [val] * n
+            new_frame[col] = self._typed_series(info.types[col], arr)
+
+        # NOT NULL: a SET to NULL on a NOT NULL column (incl. PK) is rejected
+        # before any durable state is written. PK cols are NOT NULL; UNIQUE is
+        # NULL-exempt, so this also stops a NULL PK slipping past _enforce_unique's
+        # dropna.
+        for c in info.constraints.not_null:
+            if new_frame[c].isna().any():
+                raise RuntimeError(f"NOT NULL violation: {node.table}.{c}")
+
+        tombstone = targets[list(pk)]  # PK values of the rows being replaced
+
+        # Implicit transaction: buffer the UPDATE tombstone so _enforce_unique's
+        # read-your-writes scan sees the old rows as gone (no false self-collision
+        # when SET keeps the PK), enforce PK/UNIQUE on the new frame, then buffer
+        # the reinsert and COMMIT flushes both under one commit_ts (atomic +
+        # durable). On any failure the implicit txn is discarded (no half-applied
+        # state) and the error re-raised.
+        self._txn = Transaction(snapshot_ts=self._commit_ts)
+        try:
+            self._txn.tombstone_append(node.table, tombstone, exclude_same_ts=True)
+            self._enforce_unique(node.table, new_frame)
+            self._txn.buffer_append(node.table, new_frame)
+            self._invalidate_table_caches(node.table)
+            self._commit()
+        except BaseException:
+            self._txn = None
+            self._invalidate_table_caches(node.table)
+            raise
+        return len(targets)
+
     def sql(self, sql: str) -> "cudf.DataFrame | int | None":
         # Non-standard snapshot/restore bypass sqlglot entirely (no AST node).
         # Cheap prefix guard so the regex never runs on a SELECT/INSERT/BEGIN.
@@ -846,12 +1012,13 @@ class Engine:
                 self.restore(m.group(1))
                 return None
         plan = parse(sql, self.catalog.schema_dict())
-        # INSERT, DELETE, and TxnControl are non-relational leaves with no
+        # INSERT, DELETE, UPDATE, and TxnControl are non-relational leaves with no
         # predicate / projection / join to optimize; bypass the optimizer (the
         # rules are pass-through-safe today, but a future Select-shaped rule
-        # could choke on an Insert/Delete/TxnControl root). A DELETE's WHERE is a
-        # row-selector evaluated in _delete, not a relational Filter.
-        if not isinstance(plan, (Insert, Delete, TxnControl)):
+        # could choke on an Insert/Delete/Update/TxnControl root). A DELETE's or
+        # UPDATE's WHERE is a row-selector evaluated in _delete/_update, not a
+        # relational Filter.
+        if not isinstance(plan, (Insert, Delete, Update, TxnControl)):
             plan = optimize(
                 plan,
                 self.catalog.schema_dict(),
@@ -871,7 +1038,7 @@ class Engine:
             if m:
                 return f"RestoreToSnapshot({m.group(1)})"
         plan = parse(sql, self.catalog.schema_dict())
-        if not isinstance(plan, (Insert, Delete, TxnControl)):
+        if not isinstance(plan, (Insert, Delete, Update, TxnControl)):
             plan = optimize(plan, self.catalog.schema_dict(), self.catalog.stats_dict())
         return pretty(plan)
 
@@ -885,6 +1052,8 @@ class Engine:
             return self._insert(node)
         if isinstance(node, Delete):
             return self._delete(node)
+        if isinstance(node, Update):
+            return self._update(node)
         if isinstance(node, TxnControl):
             self._txn_control(node)
             return None

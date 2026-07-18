@@ -50,8 +50,12 @@ class DeltaStore:
 
     def __init__(self) -> None:
         self._batches: dict[str, list[tuple[int, "cudf.DataFrame"]]] = {}
-        # DELETE tombstones: per-table list of (commit_ts, PK-values frame).
-        self._tombstones: dict[str, list[tuple[int, "cudf.DataFrame"]]] = {}
+        # Tombstones: per-table list of (commit_ts, PK-values frame, exclude_same_ts).
+        # ``exclude_same_ts=False`` (DELETE, step 9) removes rows with
+        # ``ins_ts <= tomb_ts``; ``exclude_same_ts=True`` (UPDATE, step 10) removes
+        # rows with ``ins_ts < tomb_ts`` so the re-inserted row (same commit ts)
+        # survives its own tombstone (see ``Engine._merge_delta``).
+        self._tombstones: dict[str, list[tuple[int, "cudf.DataFrame", bool]]] = {}
 
     def has_unflushed(self, table: str) -> bool:
         # A table is pending if it has unflushed INSERTs OR tombstones.
@@ -99,33 +103,45 @@ class DeltaStore:
 
     # ----------------------------------------------------------- tombstones
 
-    def append_tombstone(self, table: str, frame: "cudf.DataFrame", commit_ts: int = 0) -> None:
-        """Append a committed DELETE tombstone (the PK-value frame of the removed
-        rows) tagged with ``commit_ts``. Same MVCC semantics as ``append``."""
-        self._tombstones.setdefault(table, []).append((commit_ts, frame))
+    def append_tombstone(
+        self,
+        table: str,
+        frame: "cudf.DataFrame",
+        commit_ts: int = 0,
+        exclude_same_ts: bool = False,
+    ) -> None:
+        """Append a committed tombstone (the PK-value frame of the removed rows)
+        tagged with ``commit_ts`` and ``exclude_same_ts``. Same MVCC semantics as
+        ``append``; ``exclude_same_ts`` selects the anti-join rule (see
+        ``_merge_delta``): ``False`` (DELETE) removes ``ins_ts <= tomb_ts``,
+        ``True`` (UPDATE) removes ``ins_ts < tomb_ts``."""
+        self._tombstones.setdefault(table, []).append((commit_ts, frame, exclude_same_ts))
 
     def has_tombstones(self, table: str) -> bool:
         return bool(self._tombstones.get(table))
 
     def tombstones(self, table: str) -> list["cudf.DataFrame"]:
         """ALL committed tombstone frames for ``table`` (autocommit read path)."""
-        return [f for _, f in self._tombstones.get(table) or []]
+        return [f for _, f, _ in self._tombstones.get(table) or []]
 
-    def tombstones_with_ts(self, table: str) -> list[tuple[int, "cudf.DataFrame"]]:
-        """Like ``tombstones`` but keeps each tombstone's ``commit_ts`` (step 9:
-        the anti-join only removes rows whose insertion ts is at-or-before the
-        tombstone's ts, so a reinsert of the same PK after the delete survives)."""
+    def tombstones_with_ts(self, table: str) -> list[tuple[int, "cudf.DataFrame", bool]]:
+        """Like ``tombstones`` but keeps each tombstone's ``commit_ts`` and
+        ``exclude_same_ts`` flag (step 9 + step 10): the anti-join only removes
+        rows whose insertion ts is at-or-before the tombstone's ts (DELETE), or
+        strictly before it (UPDATE), so a reinsert of the same PK at the same
+        commit ts (an UPDATE) survives its own tombstone."""
         return list(self._tombstones.get(table) or [])
 
     def tombstones_at(self, table: str, ts: int) -> list["cudf.DataFrame"]:
         """Committed tombstone frames for ``table`` with ``commit_ts <= ts`` (the
         transactional read path -- a snapshot sees deletes committed at-or-before
         its snapshot_ts)."""
-        return [f for cts, f in self._tombstones.get(table) or [] if cts <= ts]
+        return [f for cts, f, _ in self._tombstones.get(table) or [] if cts <= ts]
 
-    def tombstones_at_with_ts(self, table: str, ts: int) -> list[tuple[int, "cudf.DataFrame"]]:
-        """Like ``tombstones_at`` but keeps each tombstone's ``commit_ts`` (step 9)."""
-        return [(cts, f) for cts, f in self._tombstones.get(table) or [] if cts <= ts]
+    def tombstones_at_with_ts(self, table: str, ts: int) -> list[tuple[int, "cudf.DataFrame", bool]]:
+        """Like ``tombstones_at`` but keeps each tombstone's ``commit_ts`` and
+        ``exclude_same_ts`` flag (step 9 + step 10)."""
+        return [(cts, f, fl) for cts, f, fl in self._tombstones.get(table) or [] if cts <= ts]
 
     def rewind(self, ts: int) -> set[str]:
         """Full snapshot restore: drop every batch AND tombstone with
@@ -133,19 +149,20 @@ class DeltaStore:
         cache invalidation). Tables whose list becomes empty are popped. Correct
         because batches/tombstones are appended in monotonically increasing
         ``commit_ts`` order, so the dropped entries are always a tail suffix per
-        table per channel."""
+        table per channel. Tombstones keep their ``exclude_same_ts`` flag (step 10)."""
         touched: set[str] = set()
+        for table, lst in self._batches.items():
+            kept = [(cts, f) for cts, f in lst if cts <= ts]
+            if len(kept) != len(lst):
+                touched.add(table)
+            self._batches[table] = kept
+        for table, lst in self._tombstones.items():
+            kept = [(cts, f, fl) for cts, f, fl in lst if cts <= ts]
+            if len(kept) != len(lst):
+                touched.add(table)
+            self._tombstones[table] = kept
+        # drop now-empty table keys so has_unflushed/tables stay accurate.
         for store in (self._batches, self._tombstones):
-            for table, lst in store.items():
-                kept = [(cts, f) for cts, f in lst if cts <= ts]
-                if len(kept) != len(lst):
-                    touched.add(table)
-                if kept:
-                    store[table] = kept
-                else:
-                    # pop empty entries so has_unflushed/tables stay accurate.
-                    store[table] = []
-            # drop now-empty table keys entirely.
             for t in [t for t, lst in store.items() if not lst]:
                 del store[t]
         return touched
