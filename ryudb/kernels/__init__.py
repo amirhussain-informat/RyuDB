@@ -4,6 +4,12 @@ Loads ``fused.so`` (built by :mod:`ryudb.kernels.build`) and re-exports
 ``fused_agg``. If the extension is not built, importing this package raises
 ``ImportError`` with a clear build hint; callers should catch it and fall back to
 the Numba/cuDF paths (see :mod:`ryudb.exec.fused`).
+
+A staleness guard refuses to load a ``fused.so`` whose sources (``fused.cu`` or
+``pqpages.cpp``) are newer than the binary: a stale module with a changed ABI
+would feed wrong descriptors to the kernel (CUDA context poison), so it is
+treated as unavailable and the executor falls back to cuDF. Rebuild with
+``python -m ryudb.kernels.build`` after editing the sources.
 """
 
 from __future__ import annotations
@@ -11,13 +17,24 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-_EXT = Path(__file__).resolve().parent / "fused.so"
+_HERE = Path(__file__).resolve().parent
+_EXT = _HERE / "fused.so"
+_SRCS = (_HERE / "fused.cu", _HERE / "pqpages.cpp")
+
+
+def _stale() -> bool:
+    """True if a source is newer than the built extension (or it is missing)."""
+    if not _EXT.exists():
+        return True
+    so_mtime = _EXT.stat().st_mtime
+    return any(src.exists() and src.stat().st_mtime > so_mtime for src in _SRCS)
 
 
 def _load():
-    if not _EXT.exists():
+    if _stale():
+        missing = "" if _EXT.exists() else f" ({_EXT} missing)"
         raise ImportError(
-            f"C++ fused kernel not built ({_EXT} missing). "
+            f"C++ fused kernel not built or stale{missing}. "
             "Build it with:  python -m ryudb.kernels.build  "
             "(requires nvcc + a host compiler; see ryudb/kernels/build.py)."
         )

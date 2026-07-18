@@ -386,3 +386,171 @@ def test_fused_star_join_dim_agg_arg_defers(star_engine, star_duck):
     agg = _agg_node(STAR_DIM_ARG, star_engine)
     assert fused.fused_join_aggregate(agg, star_engine) is None
     _match(star_engine.sql(STAR_DIM_ARG), star_duck.execute(STAR_DIM_ARG).fetchdf())
+
+
+# --- Phase 2: fused LEFT-outer aggregate-over-join -------------------------- #
+#
+# Reuses the star snowflake (F -> D1 -> D2, GROUP BY D2.label) but with LEFT
+# joins: a fact row that misses D1 (f_key1 in 20..24) OR whose D1 row misses D2
+# (d1_next == 5) is NOT dropped -- it null-pads to a NULL group (label NULL).
+# The fused kernel routes a miss at a LEFT stage to group slot 0 (the NULL
+# group); a pure-inner stage still drops. Comparison is via conftest.as_sorted
+# (NULL -> None) because _match casts to float and cannot hold a NULL string key.
+
+LEFT_SNOWFLAKE = """
+    SELECT label, sum(f_val) AS revenue, count(*) AS n
+      FROM F
+      LEFT JOIN D1 ON f_key1 = d1_key
+      LEFT JOIN D2 ON d1_next = d2_key
+     GROUP BY label
+     ORDER BY revenue DESC
+"""
+
+LEFT_SNOWFLAKE_INNER = """
+    SELECT label, sum(f_val) AS revenue, count(*) AS n
+      FROM F
+      JOIN D1 ON f_key1 = d1_key
+      JOIN D2 ON d1_next = d2_key
+     GROUP BY label
+     ORDER BY revenue DESC
+"""
+
+
+def _sorted(df):
+    from .conftest import as_sorted
+    return as_sorted(df)
+
+
+def test_fused_left_outer_agg_hits_kernel(star_engine):
+    """The LEFT-outer snowflake-agg is now in fused scope (was inner-only): the
+    gate accepts how=left/right and returns a frame instead of None."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    agg = _agg_node(LEFT_SNOWFLAKE, star_engine)
+    assert fused.fused_join_aggregate(agg, star_engine) is not None, (
+        "LEFT-outer snowflake + SUM/COUNT should hit the C++ fused path")
+
+
+def test_fused_left_outer_agg_matches_duckdb(star_engine, star_duck):
+    """LEFT-outer snowflake-agg through the fused kernel matches DuckDB, including
+    the NULL group (label NULL) for fact rows that miss D1 or D2 -- the rows the
+    inner kernel used to drop."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    assert fused.fused_join_aggregate(_agg_node(LEFT_SNOWFLAKE, star_engine), star_engine) is not None
+    ryu = _sorted(star_engine.sql(LEFT_SNOWFLAKE))
+    duk = _sorted(star_duck.execute(LEFT_SNOWFLAKE).fetchdf())
+    assert ryu == duk
+    # Misses exist in the fixture (f_key1 20..24, d1_next 5) -> the NULL group is
+    # present; guards against the kernel silently dropping unmatched fact rows.
+    assert any(row[0] is None for row in ryu), "expected a NULL-group row"
+
+
+def test_fused_left_outer_differs_from_inner(star_engine, star_duck):
+    """The NULL group is exactly what distinguishes LEFT from INNER: LEFT has a
+    NULL-label row inner lacks. Both match DuckDB. This catches a regression to
+    the old inner-only drop semantics."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    left = _sorted(star_engine.sql(LEFT_SNOWFLAKE))
+    inner = _sorted(star_engine.sql(LEFT_SNOWFLAKE_INNER))
+    assert left != inner
+    assert any(row[0] is None for row in left)
+    assert not any(row[0] is None for row in inner)
+    assert left == _sorted(star_duck.execute(LEFT_SNOWFLAKE).fetchdf())
+    assert inner == _sorted(star_duck.execute(LEFT_SNOWFLAKE_INNER).fetchdf())
+
+
+@pytest.fixture(scope="module")
+def star_nomiss_dir(tmp_path_factory):
+    """All-matching snowflake: every fact key hits D1 and every D1 payload hits
+    D2, so a LEFT-outer produces NO NULL group -- the output must be identical to
+    the inner-join aggregate (the seen[0]==0 skip guard for slot 0)."""
+    d = tmp_path_factory.mktemp("ryudb_star_nomiss")
+    d2 = cudf.DataFrame({
+        "d2_key": np.arange(5, dtype=np.int64),
+        "label": np.array(["A", "B", "C", "D", "E"], dtype=object),
+    })
+    d1 = cudf.DataFrame({
+        "d1_key": np.arange(20, dtype=np.int64),
+        "d1_next": np.arange(20, dtype=np.int64) % 5,  # 0..4 -> all hit D2
+    })
+    f = cudf.DataFrame({
+        "f_key1": np.arange(20000, dtype=np.int64) % 20,  # 0..19 -> all hit D1
+        "f_val": np.arange(20000, dtype=np.float64),
+    })
+    for name, fr in [("D2", d2), ("D1", d1), ("F", f)]:
+        (d / name).mkdir()
+        fr.to_pandas().to_parquet(d / name / "0.parquet")
+    return d
+
+
+@pytest.fixture
+def nomiss_engine(star_nomiss_dir) -> Engine:
+    cat = Catalog(str(star_nomiss_dir))
+    for t in ("F", "D1", "D2"):
+        cat.register(t, str(star_nomiss_dir / t))
+    return Engine(cat)
+
+
+@pytest.fixture
+def nomiss_duck(star_nomiss_dir):
+    con = duckdb.connect()
+    for t in ("F", "D1", "D2"):
+        con.execute(f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{star_nomiss_dir}/{t}/*.parquet')")
+    return con
+
+
+LEFT_NOMISS = """
+    SELECT label, sum(f_val) AS revenue, count(*) AS n
+      FROM F
+      LEFT JOIN D1 ON f_key1 = d1_key
+      LEFT JOIN D2 ON d1_next = d2_key
+     GROUP BY label
+     ORDER BY label
+"""
+
+
+def test_fused_left_outer_no_miss_identical_to_inner(nomiss_engine, nomiss_duck):
+    """Zero misses -> no NULL group -> LEFT-outer fused output equals the inner
+    aggregate. The NULL slot (0) is allocated but not emitted (seen[0]==0), so
+    the +1 payload offset and the extra slot must not perturb the real groups --
+    the inner/star-snowflake regression guard."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    assert fused.fused_join_aggregate(_agg_node(LEFT_NOMISS, nomiss_engine), nomiss_engine) is not None
+    left = _sorted(nomiss_engine.sql(LEFT_NOMISS))
+    inner = _sorted(nomiss_duck.execute(LEFT_NOMISS.replace("LEFT JOIN", "JOIN")).fetchdf())
+    assert left == inner
+    assert not any(row[0] is None for row in left)
+
+
+def test_fused_left_outer_fallback_matches(star_engine, star_duck, monkeypatch):
+    """With the C++ kernel marked unavailable, the LEFT-outer aggregate falls back
+    to the cuDF merge+groupby path and still matches DuckDB -- correctness never
+    depends on the extension. (Patching _kernels.is_available makes the gate's
+    `if not _kernels.is_available: return None` fire at call time.)"""
+    monkeypatch.setattr(fused._kernels, "is_available", False)
+    ryu = _sorted(star_engine.sql(LEFT_SNOWFLAKE))
+    duk = _sorted(star_duck.execute(LEFT_SNOWFLAKE).fetchdf())
+    assert ryu == duk
+
+
+def test_stale_kernel_guard():
+    """The loader refuses a fused.so older than its sources: a stale binary after
+    an ABI change would feed wrong descriptors to the kernel (CUDA context
+    poison). _stale() reads file mtimes live; is_available is pinned at import."""
+    import os
+    import time
+    from ryudb import kernels
+    if not kernels.is_available:
+        pytest.skip("C++ fused kernel not built")
+    assert not kernels._stale(), "freshly built .so must not read stale"
+    so_mtime = kernels._EXT.stat().st_mtime
+    try:
+        old = so_mtime - 3600
+        os.utime(kernels._EXT, (old, old))
+        assert kernels._stale(), "a .so older than its .cu must read stale"
+    finally:
+        now = time.time()
+        os.utime(kernels._EXT, (now, now))

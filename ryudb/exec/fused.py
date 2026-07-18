@@ -933,10 +933,15 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     `Col` living in a dimension reached by the join chain; SUM / COUNT(*) over
     fact-table columns; every join key int64/int32; a linear snowflake chain
     from the fact table to the group-key dimension that covers every joined
-    table (no off-path branching dims, no pure-star legs); inner joins; no
-    Filter/Project/Sort under the Aggregate. Q3 (multi-key group + cross-table
-    filter), high-card group-from-join (HASH), non-int join keys, dimension agg
-    args, AVG/MIN/MAX/COUNT(col) over joins, and global-over-join all defer.
+    table (no off-path branching dims, no pure-star legs); INNER and LEFT/RIGHT
+    outer joins (RIGHT arrives via the optimizer's side-swap; the fact side is
+    streamed, the dim hashed, and a miss at an outer stage null-pads to a NULL
+    group slot instead of dropping the fact row); no Filter/Project/Sort under
+    the Aggregate. Q3 (multi-key group + cross-table filter), high-card group-
+    from-join (HASH), non-int join keys, dimension agg args, AVG/MIN/MAX/
+    COUNT(col) over joins, FULL/CROSS joins, outer joins whose preserved side is
+    the dimension (the fact would be null-supplying -> not streamable), and
+    global-over-join all defer.
     """
     import cudf
 
@@ -963,16 +968,19 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
         return None
 
     # Only Scan and Join may appear under the Aggregate (no Filter/Project/...).
-    # Each join must be a single-pair inner equi-join.
+    # Each join must be a single-pair equi-join; INNER or LEFT/RIGHT outer (FULL
+    # and CROSS defer to cuDF -- FULL needs an anti-dim pass, CROSS has no key).
+    # The how is carried per edge so the path walk can tell an INNER stage (a
+    # probe miss drops the fact row) from an outer stage (a miss null-pads).
     scans: list[Scan] = []
-    edges: list[tuple[str, str]] = []
+    edges: list[tuple[str, str, str]] = []
     for n in walk(node.input):
         if isinstance(n, Scan):
             scans.append(n)
         elif isinstance(n, Join):
-            if n.how != "inner" or len(n.on_left) != 1:
-                return None
-            edges.append((n.on_left[0], n.on_right[0]))
+            if n.how not in ("inner", "left", "right") or len(n.on_left) != 1:
+                return None  # full/cross/non-equi -> cuDF
+            edges.append((n.on_left[0], n.on_right[0], n.how))
         else:
             return None
     if not scans or len(edges) != len(scans) - 1:
@@ -999,25 +1007,28 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     if target_dim is None or target_dim == fact_table:
         return None  # group key must live in a joined dimension, not the fact
 
-    # Undirected adjacency over the join tree: table -> [(neigh, col_here, col_neigh)].
-    adj: dict[str, list[tuple[str, str, str]]] = {t: [] for t in scan_tables}
-    for a, b in edges:
+    # Undirected adjacency over the join tree. Each entry is (neigh, col_here,
+    # col_neigh, how, here_is_left): here_is_left marks whether the table we're
+    # expanding FROM is the LEFT child of that join (on_left_col is its col) --
+    # needed to decide which side an outer join preserves.
+    adj: dict[str, list[tuple[str, str, str, str, int]]] = {t: [] for t in scan_tables}
+    for a, b, how in edges:
         ta, tb = col_to_table.get(a), col_to_table.get(b)
         if ta is None or tb is None or ta == tb:
             return None
-        adj[ta].append((tb, a, b))
-        adj[tb].append((ta, b, a))
+        adj[ta].append((tb, a, b, how, 1))  # ta is the LEFT child (on_left col a)
+        adj[tb].append((ta, b, a, how, 0))  # tb is the RIGHT child
 
     # BFS from fact to the group-key dimension; record each step's parent edge.
-    parent: dict[str, tuple[str, str, str] | None] = {fact_table: None}
+    parent: dict[str, tuple[str, str, str, str, int] | None] = {fact_table: None}
     order = [fact_table]
     i = 0
     while i < len(order) and target_dim not in parent:
         cur = order[i]
         i += 1
-        for nb, ca, cb in adj[cur]:
+        for nb, ca, cb, how, here_is_left in adj[cur]:
             if nb not in parent:
-                parent[nb] = (cur, ca, cb)  # ca = col on cur's side, cb = col on nb's side
+                parent[nb] = (cur, ca, cb, how, here_is_left)
                 order.append(nb)
     if target_dim not in parent:
         return None  # group-key dim not reachable from fact -> defer
@@ -1026,13 +1037,30 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     # probe_key_col) where probe_key_col is on the already-connected side (fact
     # for j=0, dim j-1 for j>0). The kernel reads only the FIRST probe key from a
     # fact column; later probe keys are carried as the previous dim's payload.
+    # path_left[j] = 1 when stage j preserves the fact side (a LEFT/RIGHT join
+    # whose null-supplying side is this dimension -> a probe miss null-pads to
+    # the NULL group instead of dropping the fact row); 0 for an inner stage. An
+    # outer join that preserves the DIMENSION (fact side null-supplying) is not
+    # streamable as fact-streamed probing -> defer to cuDF.
     path_dims: list[tuple[str, str, str]] = []
+    path_left: list[int] = []
     cur = target_dim
     while cur != fact_table:
-        par, ca, cb = parent[cur]
+        par, ca, cb, how, fact_is_left = parent[cur]
+        if how == "inner":
+            lps = 0
+        else:
+            # LEFT preserves the LEFT child; RIGHT preserves the RIGHT child.
+            preserved = fact_is_left if how == "left" else (not fact_is_left)
+            if not preserved:
+                return None  # dim preserved, fact null-supplying -> not streamable
+            lps = 1
         path_dims.append((cur, cb, ca))
+        path_left.append(lps)
         cur = par
     path_dims.reverse()
+    path_left.reverse()
+    has_left = any(path_left)
     if path_dims[0][2] not in schema.get(fact_table, []):
         return None
     # Every scan must lie on the path (no off-path branching dims).
@@ -1165,11 +1193,18 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
                 return None  # bridging payload is the next join key -> must be int
             dim_payload_ptrs.append(_dev_ptr(_as_int64(pseries)))
         else:
-            # Last dim: payload = factorised group-key codes (dense 0..n_groups-1).
+            # Last dim: payload = factorised group-key codes (dense 0..n-1). For a
+            # LEFT-outer plan (has_left), offset the codes by +1 so dim rows occupy
+            # slots 1..n and slot 0 is reserved for the NULL group (fact rows that
+            # miss at an outer stage); n_groups grows by 1 to include that slot. A
+            # pure-inner plan skips the offset -- slot 0 is an ordinary group and
+            # the output is byte-identical to the inner-only kernel.
             codes, uniq = engine.get_codes(path_dims[j][0], payloads[j], dframe[payloads[j]])
+            if has_left:
+                codes = codes + 1  # int64; code 0 -> NULL group slot
             _kept.append(codes)
             dim_payload_ptrs.append(_dev_ptr(codes))
-            n_groups = len(uniq)
+            n_groups = len(uniq) + (1 if has_left else 0)
             gkey_uniques = uniq
 
         dn = len(dframe)
@@ -1231,6 +1266,7 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
             np.array(dim_key_ptrs, dtype=np.int64),
             np.array(dim_payload_ptrs, dtype=np.int64),
             np.array(dim_n, dtype=np.int32), np.array(ht_cap, dtype=np.int32),
+            np.array(path_left, dtype=np.int32),
             pred_col, pred_op, pred_lit,
             np.array(agg_kind, dtype=np.int32),
             np.array(agg_tok_start, dtype=np.int32),
@@ -1247,8 +1283,15 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
         return _empty_result({"group_keys": group_keys, "aggs": aggs})
 
     # --- assemble cuDF frame (single group key: code -> unique value) ---
+    # For a LEFT-outer plan, code 0 is the NULL group (unmatched fact rows); its
+    # group-key columns are NULL. A real dim group at code c (>=1) decodes to
+    # gkey_uniques[c-1] (the host offset the last dim's codes by +1).
     codes = np.asarray(keys_list[0], dtype=np.int64)
-    data: dict = {gname: cudf.Series([gkey_uniques[int(c)] for c in codes])}
+    if has_left:
+        key_vals = [None if int(c) == 0 else gkey_uniques[int(c) - 1] for c in codes]
+    else:
+        key_vals = [gkey_uniques[int(c)] for c in codes]
+    data: dict = {gname: cudf.Series(key_vals)}
     for a, (af, n_) in enumerate(aggs):
         vals = np.asarray(aggs_list[a], dtype=np.float64)
         if af.func == "COUNT" and isinstance(af.arg, Star):
