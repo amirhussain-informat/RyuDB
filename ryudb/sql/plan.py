@@ -92,6 +92,44 @@ class AggFunc(Expr):
 
 
 @dataclass(frozen=True)
+class WindowFunc(Expr):
+    """A window function call ``func(arg) OVER (PARTITION BY .. ORDER BY ..)``.
+
+    Each window function carries its OWN OVER clause (partition + order can
+    differ per function). ``func`` is one of ROW_NUMBER / RANK / DENSE_RANK /
+    LAG / LEAD / SUM / COUNT / AVG / MIN / MAX. ``arg`` is the function argument
+    (``Star()`` for COUNT(*), ``None`` for the no-argument rank funcs
+    ROW_NUMBER / RANK / DENSE_RANK). ``offset`` / ``default`` are LAG/LEAD's
+    optional integer offset (default 1) and default value (default NULL).
+    ``partition_keys`` / ``order_keys`` are the OVER clause's PARTITION BY and
+    ORDER BY (``order_keys`` is ``((Expr, ascending), ...)``); either may be
+    empty. F-1 scope: aggregate funcs (SUM/COUNT/AVG/MIN/MAX) require an EMPTY
+    ``order_keys`` (whole-partition broadcast); an ORDER BY on an aggregate
+    window (running/cumulative) is deferred.
+    """
+    func: str
+    arg: Expr | None
+    partition_keys: tuple[Expr, ...] = ()
+    order_keys: tuple[tuple[Expr, bool], ...] = ()
+    offset: Expr | None = None
+    default: Expr | None = None
+
+    def columns(self) -> set[str]:
+        cols: set[str] = set()
+        for p in self.partition_keys:
+            cols |= p.columns()
+        for e, _ in self.order_keys:
+            cols |= e.columns()
+        if self.arg is not None and not isinstance(self.arg, Star):
+            cols |= self.arg.columns()
+        if self.offset is not None:
+            cols |= self.offset.columns()
+        if self.default is not None:
+            cols |= self.default.columns()
+        return cols
+
+
+@dataclass(frozen=True)
 class IsNull(Expr):
     """``expr IS [NOT] NULL`` -- ``negated`` for IS NOT NULL."""
     expr: Expr
@@ -248,6 +286,25 @@ class Aggregate:
 
 
 @dataclass
+class Window:
+    """Window-function computation (Phase F). A row-preserving "compute" node:
+    it evaluates each window function over ``input`` and outputs the input
+    columns PLUS one column per window function (``funcs`` is
+    ``[(WindowFunc, output_name), ...]``). Unlike ``Aggregate`` it does NOT
+    collapse rows -- every input row produces one output row with the window
+    value attached, so the outer ``Project``/``Sort`` can reference both input
+    columns and window outputs by name. ``input`` columns are passed through
+    verbatim (the optimizer prunes scans below by what's referenced above).
+
+    F-1: ranking (ROW_NUMBER/RANK/DENSE_RANK) and offset (LAG/LEAD) require an
+    ORDER BY in the window; aggregate funcs (SUM/COUNT/AVG/MIN/MAX) broadcast
+    over the whole partition (no ORDER BY). Running/cumulative aggregates (an
+    ORDER BY on an aggregate window) and explicit frames are deferred."""
+    input: "PlanNode"
+    funcs: list[tuple[WindowFunc, str]]  # (window func, output_name)
+
+
+@dataclass
 class Sort:
     input: "PlanNode"
     keys: list[tuple[Expr, bool]]  # (expr, ascending)
@@ -341,7 +398,7 @@ class TxnControl:
     kind: str  # "begin" | "commit" | "rollback"
 
 
-PlanNode = Scan | Filter | Project | Join | Aggregate | Sort | Limit | SetOp | Insert | Delete | Update | TxnControl
+PlanNode = Scan | Filter | Project | Join | Aggregate | Window | Sort | Limit | SetOp | Insert | Delete | Update | TxnControl
 
 
 def walk(node: PlanNode):
@@ -358,9 +415,7 @@ def children(node: PlanNode) -> list[PlanNode]:
         return [node.left, node.right]
     if isinstance(node, SetOp):
         return [node.left, node.right]
-    if isinstance(node, Aggregate):
-        return [node.input]
-    if isinstance(node, Limit):
+    if isinstance(node, (Aggregate, Window, Limit)):
         return [node.input]
     return []
 
@@ -375,6 +430,8 @@ def exprs_in(node: PlanNode) -> list[Expr]:
         return [e for e, _ in node.group_keys] + [a for a, _ in node.aggs]
     if isinstance(node, Sort):
         return [e for e, _ in node.keys]
+    if isinstance(node, Window):
+        return [wf for wf, _ in node.funcs]
     if isinstance(node, Join):
         return [node.on_predicate] if node.on_predicate is not None else []
     if isinstance(node, Delete):
@@ -408,6 +465,9 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
         g = ", ".join(n for _, n in node.group_keys)
         a = ", ".join(f"{af.func}({_estr(af.arg)}) AS {n}" for af, n in node.aggs)
         return f"{pad}Aggregate(group=[{g}] aggs=[{a}])\n" + pretty(node.input, indent + 1)
+    if isinstance(node, Window):
+        fs = ", ".join(f"{_estr(wf)} AS {n}" for wf, n in node.funcs)
+        return f"{pad}Window({fs})\n" + pretty(node.input, indent + 1)
     if isinstance(node, Sort):
         k = ", ".join(f"{_estr(e)} {'ASC' if a else 'DESC'}" for e, a in node.keys)
         return f"{pad}Sort({k})\n" + pretty(node.input, indent + 1)
@@ -452,6 +512,16 @@ def _estr(e: Expr) -> str:
         return f"(NOT {_estr(e.expr)})"
     if isinstance(e, AggFunc):
         return f"{e.func}({_estr(e.arg)})"
+    if isinstance(e, WindowFunc):
+        arg = "" if e.arg is None else _estr(e.arg)
+        part = ", ".join(_estr(p) for p in e.partition_keys)
+        order = ", ".join(f"{_estr(o)} {'ASC' if a else 'DESC'}" for o, a in e.order_keys)
+        over = []
+        if part:
+            over.append(f"PARTITION BY {part}")
+        if order:
+            over.append(f"ORDER BY {order}")
+        return f"{e.func}({arg}) OVER ({' '.join(over)})"
     if isinstance(e, IsNull):
         return f"{_estr(e.expr)} IS {'NOT ' if e.negated else ''}NULL"
     if isinstance(e, In):

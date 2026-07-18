@@ -37,6 +37,8 @@ from ..sql.plan import (
     Star,
     TxnControl,
     Update,
+    Window,
+    WindowFunc,
 )
 from ..storage import scan
 from ..transaction import Transaction
@@ -1073,6 +1075,8 @@ class Engine:
             return self._join(node, left, right)
         if isinstance(node, Aggregate):
             return self._aggregate(node)
+        if isinstance(node, Window):
+            return self._window(node)
         if isinstance(node, Project):
             return self._project(node)
         if isinstance(node, Sort):
@@ -1402,6 +1406,148 @@ class Engine:
         pieces = [res[(c, f)].rename(n) for c, f, n in out_map]
         out = cudf.concat(pieces, axis=1).reset_index()
         return out[by_names + [n for _, n in aggs]]
+
+    # ------------------------------------------------------------------ #
+    # Window functions (Phase F-1). A row-preserving "compute" node: each
+    # window function is evaluated over the input frame and attached as a new
+    # column; the input columns pass through verbatim so the outer Project can
+    # reference both. Ranking/offset funcs sort by (partition, order) and
+    # compute position within partition via a global-position-minus-boundary
+    # method (NOT groupby.cumcount -- that returns NA for NULL-key partitions in
+    # cuDF); the original row order is restored via a position sentinel.
+    # Aggregate-over-partition (no ORDER BY) uses groupby(dropna=False).transform,
+    # which DOES include NULL-key partitions. Running/cumulative aggregates (an
+    # ORDER BY on an aggregate window) and explicit frames are deferred at parse
+    # time, so they never reach here.
+    # ------------------------------------------------------------------ #
+    def _window(self, node: Window) -> cudf.DataFrame:
+        df = self._exec(node.input)
+        out = df.reset_index(drop=True).copy()
+        for wf, name in node.funcs:
+            out[name] = self._window_column(wf, out)
+        return out.reset_index(drop=True)
+
+    def _window_column(self, wf: WindowFunc, df: cudf.DataFrame) -> cudf.Series:
+        part_names = [p.name for p in wf.partition_keys]
+        is_agg = wf.func in _AGG_METHOD
+        if is_agg and not wf.order_keys:
+            col = self._window_broadcast(wf, df, part_names)
+            return col.astype("int64") if wf.func == "COUNT" else col
+        # ranking / lag / lead: positioned path.
+        col = self._window_positioned(wf, df, part_names)
+        if wf.func in ("ROW_NUMBER", "RANK", "DENSE_RANK"):
+            return col.astype("int64")
+        return col
+
+    def _window_broadcast(self, wf, df, part_names):
+        """Aggregate over the (whole) partition -- no ORDER BY. Broadcast the
+        per-partition aggregate to every row (rows keep their order). NULL
+        partition keys form their own group (groupby dropna=False)."""
+        if not part_names:
+            # Whole-frame aggregate broadcast as a constant.
+            if wf.func == "COUNT":
+                if isinstance(wf.arg, Star):
+                    val = len(df)
+                else:
+                    val = int(eval_expr(wf.arg, df).notna().sum())
+            else:
+                val = getattr(eval_expr(wf.arg, df), _AGG_METHOD[wf.func])()
+            return cudf.Series([val] * len(df), index=df.index)
+        frame = df.copy()
+        if wf.func == "COUNT" and isinstance(wf.arg, Star):
+            frame["_wc"] = 1
+            col = frame.groupby(part_names, dropna=False)["_wc"].transform("sum")
+        elif wf.func == "COUNT":
+            frame["_wc"] = eval_expr(wf.arg, df).notna().astype("int64")
+            col = frame.groupby(part_names, dropna=False)["_wc"].transform("sum")
+        else:
+            frame["_wc"] = eval_expr(wf.arg, df)
+            col = frame.groupby(part_names, dropna=False)["_wc"].transform(
+                _AGG_METHOD[wf.func]
+            )
+        return col
+
+    def _window_positioned(self, wf, df, part_names):
+        """Ranking (ROW_NUMBER/RANK/DENSE_RANK) or offset (LAG/LEAD) funcs that
+        need an ORDER BY. Sort by (partition, order), compute via a
+        global-position-minus-partition-boundary method (null-safe -- no
+        groupby.cumcount, which breaks on NULL-key partitions), then restore the
+        original row order via a position sentinel."""
+        order_names = [e.name for e, _ in wf.order_keys]
+        asc = [a for _, a in wf.order_keys]
+        # DuckDB's default is NULLS LAST for BOTH ascending and descending
+        # (NULLs sort after every non-null value). cuDF sort_values takes a single
+        # na_position; NULLs in a non-leading order key follow the leading key's
+        # side, which matches DuckDB when the leading key has no NULLs (F-1 tests
+        # avoid NULLs in non-leading order keys for multi-key ORDER BY).
+        na_position = "last"
+        work = df.copy()
+        work["_pos"] = cudf.Series(range(len(work)), index=work.index)
+        by = part_names + order_names
+        work = work.sort_values(
+            by=by, ascending=[True] * len(part_names) + asc, na_position=na_position
+        ).reset_index(drop=True)
+        gpos = cudf.Series(range(len(work)), index=work.index)
+        boundary = self._partition_boundary(work, part_names, gpos)
+        pstart = gpos.where(boundary).ffill()
+        pos_in_part = gpos - pstart  # 0-based within partition (sorted order)
+
+        if wf.func in ("ROW_NUMBER", "RANK", "DENSE_RANK"):
+            if wf.func == "ROW_NUMBER":
+                result = pos_in_part + 1
+            else:
+                peer_bdry = boundary
+                for c in order_names:
+                    peer_bdry = peer_bdry | self._col_changed(work[c], work[c].shift(1))
+                if wf.func == "RANK":
+                    # Rank at a peer-group start = its 1-based position; forward-fill
+                    # within the peer group (resets at the next partition boundary).
+                    result = (pos_in_part + 1).where(peer_bdry).ffill()
+                else:  # DENSE_RANK
+                    dense_global = peer_bdry.astype("int64").cumsum()
+                    dense_at_start = dense_global.where(boundary).ffill()
+                    result = dense_global - dense_at_start + 1
+        else:  # LAG / LEAD
+            n_off = 1 if wf.offset is None else int(eval_expr(wf.offset, work))
+            arg_s = eval_expr(wf.arg, work)
+            shifted = arg_s.shift(n_off if wf.func == "LAG" else -n_off)
+            # Valid offset positions: within-partition, not the first/last n rows.
+            # Use partition size to bound LEAD; LAG bounds by position alone.
+            is_last = boundary.shift(-1).fillna(True)
+            pend = gpos.where(is_last).bfill()
+            psize = pend - pstart + 1
+            if wf.func == "LAG":
+                valid = pos_in_part >= n_off
+            else:
+                valid = pos_in_part <= (psize - 1 - n_off)
+            if wf.default is not None:
+                dval = eval_expr(wf.default, work)
+                result = shifted.where(valid, dval)
+            else:
+                result = shifted.where(valid)
+
+        work = work.copy()
+        work["_wf"] = result
+        restored = work.sort_values("_pos").reset_index(drop=True)
+        return restored["_wf"]
+
+    def _partition_boundary(self, work, part_names, gpos):
+        """Boolean Series: True at the first row of each partition in the sorted
+        frame (null-aware -- consecutive rows with NULL partition keys are the
+        same partition). The first row is always a boundary."""
+        boundary = (gpos == 0)
+        for c in part_names:
+            boundary = boundary | self._col_changed(work[c], work[c].shift(1))
+        return boundary
+
+    def _col_changed(self, s, prev):
+        """Null-aware "changed" test: True where ``s`` differs from ``prev``
+        treating NULL == NULL (so consecutive NULL-key rows are NOT a change)."""
+        either_na = s.isna() | prev.isna()
+        both_na = s.isna() & prev.isna()
+        one_na = either_na & ~both_na
+        val_neq = (s != prev).fillna(False)
+        return one_na | (~either_na & val_neq)
 
     def _project(self, node: Project) -> cudf.DataFrame:
         df = self._exec(node.input)
