@@ -228,6 +228,11 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
                 pushable_sides = right_tables
             elif how == "inner":
                 pushable_sides = left_tables | right_tables
+            elif how in ("semi", "anti"):
+                # Semi/anti preserve the left side only; the right side is the
+                # subquery (a separate scope). Push left conjuncts below; never
+                # push into the subquery.
+                pushable_sides = left_tables
             else:  # full / cross
                 pushable_sides = set()
 
@@ -284,6 +289,12 @@ def select_join_sides(plan: PlanNode, stats: Stats) -> PlanNode:
         if isinstance(node, Join):
             left = go(node.left)
             right = go(node.right)
+            if node.how in ("semi", "anti"):
+                # Semi/anti preserve the left side; swapping would flip which side
+                # is preserved (and the right side is a subquery, not a probe
+                # input). Keep the order, just recurse into children.
+                return Join(left, right, node.on_left, node.on_right,
+                            node.how, node.on_predicate)
             if est_rows(right) < est_rows(left):
                 # swap sides so the smaller subtree is the build (left) side.
                 # Swapping a LEFT/RIGHT join flips the preserved side, so rewrite

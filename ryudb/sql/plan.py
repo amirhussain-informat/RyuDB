@@ -223,7 +223,13 @@ class Join:
     right: "PlanNode"
     on_left: list[str]   # columns from the left input
     on_right: list[str]  # columns from the right input (same length)
-    how: str = "inner"   # inner | left | right | full | cross
+    how: str = "inner"   # inner | left | right | full | cross | semi | anti
+    # ``semi``/``anti`` are the IN/NOT IN subquery lowering: the right side is the
+    # subquery plan (a normal subtree the optimizer recurses into), the left side
+    # is preserved (semi/anti keep left rows only; the right side's columns are
+    # NOT in the output). on_left/on_right are the single IN key pair; on_predicate
+    # is None. Semi = keep left rows whose key is in the subquery set; anti = keep
+    # left rows whose key is not. See executor._join (cuDF ``isin``).
     # Residual ON predicate that is NOT a pure equi-key (e.g. ``ON a=b AND r.x>10``
     # folds the equi keys into on_left/on_right and the non-equi ``r.x>10`` here).
     # Kept *separate* from the WHERE Filter so outer-join semantics survive: an ON
