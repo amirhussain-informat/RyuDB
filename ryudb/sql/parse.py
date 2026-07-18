@@ -17,10 +17,15 @@ alongside equi keys (e.g. ``ON a.k=b.k AND b.x>10``) is kept on the Join as an
 ``on_predicate`` and applied *inside* the join so outer-join semantics survive
 (it filters only matched rows, never the null-padded unmatched rows).
 
-Not yet supported: subqueries, CTEs, window functions, HAVING, UNION, pure
-non-equi/theta joins (an ON with no equi key), correlated predicates,
-table-qualified column output (bare ``Col`` only). Unsupported constructs raise
-NotImplementedError with a clear message.
+Not yet supported: subqueries, CTEs, window functions, HAVING,
+INTERSECT ALL / EXCEPT ALL (multiset variants), pure non-equi/theta joins (an
+ON with no equi key), correlated predicates, table-qualified column output
+(bare ``Col`` only). Unsupported constructs raise NotImplementedError with a
+clear message.
+
+Set operators (UNION [ALL] / INTERSECT / EXCEPT) compose two SELECTs into a
+``SetOp`` node (see ``_build_query`` / ``_build_setop``); DISTINCT set ops use
+cuDF ``drop_duplicates``/``merge`` which are NULL-safe.
 """
 
 from __future__ import annotations
@@ -51,6 +56,7 @@ from .plan import (
     Or,
     Project,
     Scan,
+    SetOp,
     Sort,
     Star,
     TxnControl,
@@ -89,8 +95,8 @@ def parse(sql: str, schema: dict[str, list[str]] | None = None) -> object:
     if len(statements) != 1:
         raise ParseError(f"expected exactly one statement, got {len(statements)}")
     stmt = statements[0]
-    if isinstance(stmt, exp.Select):
-        return _build_select(stmt, schema)
+    if isinstance(stmt, (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery)):
+        return _build_query(stmt, schema)
     if isinstance(stmt, exp.Insert):
         return _build_insert(stmt)
     if isinstance(stmt, exp.Delete):
@@ -267,7 +273,6 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
     group = sel.args.get("group")
     group_exprs = list(group.expressions) if group else []
 
-    out_names = []
     if group_exprs or has_agg:
         if any(_is_star(it) for it in proj_items):
             raise NotImplementedError("SELECT * with GROUP BY/aggregates is not supported")
@@ -283,7 +288,6 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
                 aggs.append((e, alias))
             else:
                 group_keys.append((e, alias))
-            out_names.append(alias)
         plan = Aggregate(plan, group_keys=group_keys, aggs=aggs)
     else:
         if len(proj_items) == 1 and _is_star(proj_items[0]):
@@ -293,11 +297,61 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
             for it in proj_items:
                 e, alias = _proj_item(it)
                 items.append((e, alias))
-                out_names.append(alias)
             plan = Project(plan, items=items)
 
-    # --- ORDER BY -------------------------------------------------------- #
-    order = sel.args.get("order")
+    return _build_tail(sel, plan)
+
+
+# --------------------------------------------------------------------------- #
+# Set operators (UNION [ALL] / INTERSECT / EXCEPT) and the shared ORDER BY /
+# LIMIT tail. A top-level query may be a SELECT, a set-op of two queries, or a
+# parenthesized subquery wrapping either; ``_build_query`` dispatches and
+# unwraps. ORDER BY / LIMIT on a set-op attach to the set-op node itself
+# (sqlglot puts them in the Union/Intersect/Except ``args``, not the right
+# SELECT), so ``_build_tail`` reads them off whichever node it is given.
+# --------------------------------------------------------------------------- #
+
+
+_SETOP_NAME = {"Union": "union", "Intersect": "intersect", "Except": "except"}
+
+
+def _build_query(node, schema: dict[str, list[str]] | None = None):
+    """Dispatch a top-level query node (SELECT / set-op / parenthesized
+    subquery) to the right builder. A ``Subquery`` wrapping a set-op or SELECT
+    is unwrapped (``.this``) so ``SELECT ... UNION (SELECT ... UNION ...)``
+    parses -- the parenthesized right side arrives as an ``exp.Subquery``."""
+    if isinstance(node, exp.Select):
+        return _build_select(node, schema)
+    if isinstance(node, (exp.Union, exp.Intersect, exp.Except)):
+        return _build_setop(node, schema)
+    if isinstance(node, exp.Subquery):
+        return _build_query(node.this, schema)
+    raise ParseError(f"unsupported query: {type(node).__name__}")
+
+
+def _build_setop(node, schema: dict[str, list[str]] | None = None):
+    """Lower ``left {UNION|INTERSECT|EXCEPT} [ALL] right`` into a SetOp node.
+
+    sqlglot gives every set-op node ``this`` (left), ``expression`` (right), and
+    ``distinct`` (True unless ``ALL``). INTERSECT ALL / EXCEPT ALL (the multiset
+    variants) are deferred -- the executor raises ``NotImplementedError`` for
+    them rather than failing at parse time, so ``_build_setop`` records
+    ``distinct`` faithfully and lets the executor decide. ORDER BY / LIMIT on the
+    set-op wrap the SetOp via the shared ``_build_tail``."""
+    op = _SETOP_NAME[type(node).__name__]
+    distinct = bool(node.args.get("distinct"))
+    left = _build_query(node.this, schema)
+    right = _build_query(node.expression, schema)
+    plan = SetOp(left, right, op, distinct)
+    return _build_tail(node, plan)
+
+
+def _build_tail(stmt, plan):
+    """Apply ORDER BY then LIMIT/OFFSET from ``stmt.args`` (shared by SELECT and
+    set-op nodes). ORDER BY only supports column references that name an output
+    column; the executor's Sort resolves them against the produced frame. No-op
+    when neither clause is present."""
+    order = stmt.args.get("order")
     if order is not None:
         keys = []
         for o in order.expressions:
@@ -306,20 +360,14 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
             e = _expr(o.this)
             if not isinstance(e, Col):
                 raise NotImplementedError("ORDER BY only supports column references")
-            # resolve to an output column name (alias) when possible
-            name = e.name
-            if name not in out_names and len(out_names) == len(set(out_names)):
-                # fall back to the raw column name
-                pass
-            keys.append((Col(name), not o.args.get("desc", False)))
+            keys.append((Col(e.name), not o.args.get("desc", False)))
         plan = Sort(plan, keys=keys)
 
-    # --- LIMIT / OFFSET -------------------------------------------------- #
-    limit = sel.args.get("limit")
+    limit = stmt.args.get("limit")
     if limit is not None:
         n = int(_literal_value(_limit_value(limit)))
         off = 0
-        offset = sel.args.get("offset")
+        offset = stmt.args.get("offset")
         if offset is not None:
             off = int(_literal_value(_limit_value(offset)))
         plan = Limit(plan, n=n, offset=off)

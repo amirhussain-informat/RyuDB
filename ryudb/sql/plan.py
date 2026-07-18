@@ -255,6 +255,21 @@ class Limit:
 
 
 @dataclass
+class SetOp:
+    """UNION / INTERSECT / EXCEPT over two child relations. ``op`` is
+    "union" | "intersect" | "except"; ``distinct`` is False for UNION ALL (the
+    only ALL variant supported -- INTERSECT ALL / EXCEPT ALL raise). Output
+    column names come from the left child's projection; the executor renames the
+    right child's columns positionally. A predicate-pushdown *barrier*: nothing
+    crosses a set op, but the optimizer still recurses into each branch so
+    joins/projections *inside* a branch get optimized (see optimize.py)."""
+    left: "PlanNode"
+    right: "PlanNode"
+    op: str
+    distinct: bool = True
+
+
+@dataclass
 class Insert:
     """Write node: append literal value rows to a table's delta (Phase 2 step 3).
 
@@ -320,7 +335,7 @@ class TxnControl:
     kind: str  # "begin" | "commit" | "rollback"
 
 
-PlanNode = Scan | Filter | Project | Join | Aggregate | Sort | Limit | Insert | Delete | Update | TxnControl
+PlanNode = Scan | Filter | Project | Join | Aggregate | Sort | Limit | SetOp | Insert | Delete | Update | TxnControl
 
 
 def walk(node: PlanNode):
@@ -334,6 +349,8 @@ def children(node: PlanNode) -> list[PlanNode]:
     if isinstance(node, (Filter, Project, Sort)):
         return [node.input]
     if isinstance(node, (Join,)):
+        return [node.left, node.right]
+    if isinstance(node, SetOp):
         return [node.left, node.right]
     if isinstance(node, Aggregate):
         return [node.input]
@@ -390,6 +407,13 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
         return f"{pad}Sort({k})\n" + pretty(node.input, indent + 1)
     if isinstance(node, Limit):
         return f"{pad}Limit({node.n} offset={node.offset})\n" + pretty(node.input, indent + 1)
+    if isinstance(node, SetOp):
+        kw = "DISTINCT" if node.distinct else "ALL"
+        return (
+            f"{pad}SetOp({node.op} {kw})\n"
+            + pretty(node.left, indent + 1) + "\n"
+            + pretty(node.right, indent + 1)
+        )
     if isinstance(node, Insert):
         cols = ",".join(node.columns) if node.columns else "*"
         return f"{pad}Insert({node.table} cols={cols} rows={len(node.rows)})"

@@ -32,6 +32,7 @@ from ..sql.plan import (
     PlanNode,
     Project,
     Scan,
+    SetOp,
     Sort,
     Star,
     TxnControl,
@@ -1078,6 +1079,8 @@ class Engine:
             return self._sort(node)
         if isinstance(node, Limit):
             return self._limit(node)
+        if isinstance(node, SetOp):
+            return self._setop(node)
         raise NotImplementedError(f"no executor for {type(node).__name__}")
 
     # ------------------------------------------------------------------ #
@@ -1407,6 +1410,59 @@ class Engine:
         df = self._exec(node.input)
         end = node.offset + node.n
         return df.iloc[node.offset:end]
+
+    # ------------------------------------------------------------------ #
+    # Set operators (UNION [ALL] / INTERSECT / EXCEPT)
+    # ------------------------------------------------------------------ #
+    def _setop(self, node: SetOp) -> cudf.DataFrame:
+        """Lower a SetOp onto cuDF concat / drop_duplicates / merge (all on GPU).
+
+        UNION [ALL] is ``cudf.concat`` (ALL) or concat + ``drop_duplicates``
+        (DISTINCT). INTERSECT / EXCEPT are DISTINCT-only (ALL variants raise
+        ``NotImplementedError``) and use ``merge`` -- cuDF merge matches nulls,
+        so a row whose key column is NULL is intersected/excluded correctly with
+        no sentinel trick; both sides are deduped first so the result is the SQL
+        DISTINCT set. Output column names come from the left child's projection;
+        the right child's columns are renamed positionally (SQL names a set op's
+        outputs from the left side). ``cudf.concat`` auto-promotes int+float ->
+        float, matching DuckDB's UNION type coercion for compatible types.
+        """
+        left = self._exec(node.left)
+        right = self._exec(node.right)
+        op = node.op
+        if len(left.columns) != len(right.columns):
+            raise ParseError(
+                f"{op.upper()} column count mismatch: "
+                f"{len(left.columns)} vs {len(right.columns)}"
+            )
+        # Align the right side positionally to the left side's output names.
+        right = right.copy()
+        right.columns = list(left.columns)
+        cols = list(left.columns)
+
+        if op == "union":
+            out = cudf.concat([left, right], axis=0)
+            if node.distinct:
+                out = out.drop_duplicates()
+            return out.reset_index(drop=True)
+
+        if not node.distinct:
+            raise NotImplementedError(f"{op.upper()} ALL is not supported")
+
+        l_dd = left.drop_duplicates()
+        r_dd = right.drop_duplicates()
+        if op == "intersect":
+            m = l_dd.merge(r_dd, on=cols, how="inner")
+            return m.reset_index(drop=True)
+        # EXCEPT: left rows with no match in right (incl. null-keyed rows, which
+        # merge matches). cuDF merge has no ``indicator``/anti-join, and merging
+        # ``on=cols`` (every column is a key) leaves no right-only column to
+        # detect unmatched rows. Attach a constant marker to the right side and
+        # keep the left rows whose marker came back NULL (no match).
+        r_dd = r_dd.assign(_x=cudf.Series([1] * len(r_dd), index=r_dd.index))
+        m = l_dd.merge(r_dd, on=cols, how="left")
+        m = m[m["_x"].isna()].drop(columns=["_x"])
+        return m.reset_index(drop=True)
 
 
 def _scalar_agg(func: str, series) -> object:
