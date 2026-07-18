@@ -351,14 +351,22 @@ def test_3way_left_chain_vs_duckdb(jengine, jduck):
 # --------------------------------------------------------------------------- #
 
 
-def test_fused_gate_defers_outer_join(jengine, jduck, monkeypatch):
-    """A LEFT-join aggregate must defer to cuDF (the fused gate is inner-only).
-    Stubbing the fused entrypoint to None (what the real gate returns for outer)
-    must leave RyuDB's output identical -- proving the kernel never runs for
-    outer joins."""
+def test_fused_gate_defers_outer_join(jengine, jduck):
+    """A LEFT-join aggregate whose GROUP BY is on the FACT table (r.rid) defers to
+    cuDF: the fused kernel requires the group key to live in a joined dimension,
+    not the streamed fact. (Phase 2 widened the gate to accept LEFT/RIGHT when the
+    group key is in a dim; this shape still defers.) The cuDF path matches DuckDB."""
     from ryudb.exec import fused
+    from ryudb.sql.optimize import optimize
+    from ryudb.sql.parse import parse
+    from ryudb.sql.plan import Aggregate, walk
 
-    monkeypatch.setattr(fused, "fused_join_aggregate", lambda *a, **k: None)
     sql = ("SELECT r.rid, count(*) AS c FROM r LEFT JOIN s ON r.rid = s.sid "
            "GROUP BY r.rid ORDER BY r.rid")
+    if fused._kernels.is_available:
+        plan = optimize(parse(sql, jengine.catalog.schema_dict()),
+                        jengine.catalog.schema_dict(), jengine.catalog.stats_dict())
+        agg = next(n for n in walk(plan) if isinstance(n, Aggregate))
+        assert fused.fused_join_aggregate(agg, jengine) is None, (
+            "group key on the fact table must defer to cuDF")
     assert _ryu(jengine, sql) == _duck(jduck, sql)

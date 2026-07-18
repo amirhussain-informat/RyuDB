@@ -329,8 +329,25 @@ __global__ void build_ht_kernel(const long long *key, const long long *payload, 
 // pass_pred (no-op when n_pred==0) and eval_agg (reads fact cols at row i).
 // ht_key/ht_payload are device arrays of per-join device pointers; ht_cap the
 // per-join power-of-two capacity. first_probe_col is a fact DT_INT64 column.
+//
+// LEFT-outer routing: left_per_stage[j] is 1 when stage j's join preserves the
+// fact side (a LEFT/RIGHT join whose null-supplying side is the dimension being
+// probed), 0 for an inner join. On a miss at a LEFT stage the fact row is NOT
+// dropped: the carried key is set to HASH_EMPTY (the null-pad sentinel) and the
+// chain continues -- a later INNER stage still drops the row, a later LEFT stage
+// keeps it null-padded. After the chain, a sentinel key maps to group slot 0
+// (the NULL group); a real final payload maps to its group code. Slot 0 is
+// reserved for the NULL group by the host (dim payloads offset +1, n_groups =
+// n_dim_rows + 1); for a pure-inner plan no stage is LEFT, no sentinel is ever
+// set, and slot 0 is an ordinary group -- output is byte-identical to the
+// inner-only kernel.
+//
+// HASH_EMPTY (-1) is a safe sentinel: build_ht_kernel rejects a dim key of -1
+// with overflow (-> host falls back to cuDF), so -1 is never a stored dim key
+// and a carried -1 always probes to a miss -- identical to a real probe miss.
 __global__ void probe_agg_kernel(Plan p, const long long **ht_key, const long long **ht_payload,
                                  const int *ht_cap, int n_joins, int first_probe_col,
+                                 const int *left_per_stage,
                                  double *acc, int *seen, int n_groups, int nagg) {
     extern __shared__ double sh[];
     int t = threadIdx.x;
@@ -342,6 +359,12 @@ __global__ void probe_agg_kernel(Plan p, const long long **ht_key, const long lo
         long long key = ((const long long *)p.cols[first_probe_col])[i];
         bool dropped = false;
         for (int j = 0; j < n_joins; j++) {
+            if (key == HASH_EMPTY) {
+                // Null-padded from an earlier LEFT miss: a later INNER stage
+                // drops the row, a later LEFT stage keeps it null-padded.
+                if (left_per_stage[j]) continue;
+                dropped = true; break;
+            }
             int cap = ht_cap[j];
             unsigned long long h = (unsigned long long)key;
             h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
@@ -350,15 +373,18 @@ __global__ void probe_agg_kernel(Plan p, const long long **ht_key, const long lo
             int found = -1;
             for (int probe = 0; probe < 64; probe++) {
                 long long k = ht_key[j][slot];  // read-only HT
-                if (k == HASH_EMPTY) break;      // miss -> inner-join drop
+                if (k == HASH_EMPTY) break;      // miss
                 if (k == key) { found = slot; break; }
                 slot = (slot + 1) & (cap - 1);
             }
-            if (found < 0) { dropped = true; break; }
+            if (found < 0) {
+                if (left_per_stage[j]) { key = HASH_EMPTY; continue; }  // null-pad
+                dropped = true; break;                                  // inner drop
+            }
             key = ht_payload[j][found];  // carry payload -> next probe key
         }
         if (dropped) continue;
-        long long g = key;  // final payload = group code
+        long long g = (key == HASH_EMPTY) ? 0 : key;  // sentinel -> NULL group slot 0
         if (g < 0 || g >= n_groups) continue;
         for (int a = 0; a < p.nagg; a++) {
             int kind = p.agg_kind[a];
@@ -674,7 +700,10 @@ py::tuple fused_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes
 //   agg_kind,agg_tok_start,agg_tok_len : int32 (nagg)
 //   tok_kind:int32 (ntok) tok_col:int32 tok_lit:float64 tok_op:int32
 //   acc_init : float64 (n_groups*nagg) per-slot init
-//   n_groups : int (DENSE group count)   n_rows : int (fact row count)
+//   n_groups : int (DENSE group count; n_dim_rows + 1 when any LEFT stage
+//              reserves slot 0 for the NULL group)   n_rows : int (fact row count)
+//   left_per_stage : int32 (n_joins) -- 1 where stage j preserves the fact side
+//              (LEFT/RIGHT outer with the dim as null-supplying side), 0 for inner
 //
 // Returns (overflow:int, n_out:int, keys:py::list[int64 arrays (1 col, the codes)],
 //          aggs:py::list[float64 arrays]). overflow!=0 -> caller falls back to cuDF.
@@ -683,6 +712,7 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
                          py::array_t<long long> dim_key_ptrs,
                          py::array_t<long long> dim_payload_ptrs,
                          py::array_t<int> dim_n, py::array_t<int> ht_cap,
+                         py::array_t<int> left_per_stage,
                          py::array_t<int> pred_col, py::array_t<int> pred_op,
                          py::array_t<double> pred_lit, py::array_t<int> agg_kind,
                          py::array_t<int> agg_tok_start, py::array_t<int> agg_tok_len,
@@ -729,6 +759,8 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
     long long *dp_host = static_cast<long long *>(dp_info.ptr);
     int *dn_host = static_cast<int *>(dn_info.ptr);
     int *cap_host = static_cast<int *>(cap_info.ptr);
+    // Per-stage LEFT flag (device) -- forwarded to probe_agg_kernel.
+    int *d_left = np_dev(left_per_stage);
 
     const int THREADS = 256;
     int overflow = 0;
@@ -761,7 +793,7 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
 
     if (overflow != 0) {
         for (int j = 0; j < n_joins; j++) { cudaFree(ht_key[j]); cudaFree(ht_payload[j]); }
-        cudaFree(d_ovf);
+        cudaFree(d_ovf); cudaFree((void *)d_left);
         cudaFree((void *)p.dtypes); cudaFree((void *)p.pred_col); cudaFree((void *)p.pred_op);
         cudaFree((void *)p.pred_lit); cudaFree((void *)p.agg_kind); cudaFree((void *)p.agg_tok_start);
         cudaFree((void *)p.agg_tok_len); cudaFree((void *)p.tok_kind); cudaFree((void *)p.tok_col);
@@ -800,7 +832,7 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
     size_t shbytes = sizeof(double) * nga;
     probe_agg_kernel<<<blocks, THREADS, shbytes>>>(
         p, (const long long **)d_htkey, (const long long **)d_htpayload, d_htcap,
-        n_joins, first_probe_col, acc, seen, n_groups, nagg);
+        n_joins, first_probe_col, d_left, acc, seen, n_groups, nagg);
     check(cudaGetLastError(), "probe_agg_kernel launch");
     check(cudaDeviceSynchronize(), "probe sync");
 
@@ -825,7 +857,7 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
         aggs_list.append(py::array_t<double>(n_out, h_aggs[a].data()));
 
     // --- free everything ---
-    cudaFree(acc); cudaFree(seen); cudaFree(d_ovf);
+    cudaFree(acc); cudaFree(seen); cudaFree(d_ovf); cudaFree((void *)d_left);
     cudaFree(d_htkey); cudaFree(d_htpayload); cudaFree((void *)d_htcap);
     for (int j = 0; j < n_joins; j++) { cudaFree(ht_key[j]); cudaFree(ht_payload[j]); }
     cudaFree((void *)p.dtypes); cudaFree((void *)p.pred_col); cudaFree((void *)p.pred_op);
