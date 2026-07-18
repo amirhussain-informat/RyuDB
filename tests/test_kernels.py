@@ -541,19 +541,29 @@ def test_stale_kernel_guard():
     an ABI change would feed wrong descriptors to the kernel (CUDA context
     poison). _stale() reads file mtimes live; is_available is pinned at import."""
     import os
-    import time
     from ryudb import kernels
     if not kernels.is_available:
         pytest.skip("C++ fused kernel not built")
-    assert not kernels._stale(), "freshly built .so must not read stale"
+    # Pin the source mtimes relative to the .so so the test is deterministic
+    # regardless of how long ago the .so was actually built (the prior form set
+    # the .so back a fixed 3600s and asserted staleness, which only holds when
+    # the real build was within 3600s of a source mtime -- it flipped flaky as
+    # the .so aged or git reset a source mtime during checkout).
     so_mtime = kernels._EXT.stat().st_mtime
+    fresh_src = so_mtime - 1800        # sources 30 min older than the .so -> fresh
+    saved = [(p, p.stat().st_mtime) for p in (kernels._EXT, *kernels._SRCS)]
     try:
-        old = so_mtime - 3600
-        os.utime(kernels._EXT, (old, old))
-        assert kernels._stale(), "a .so older than its .cu must read stale"
+        for src in kernels._SRCS:
+            if src.exists():
+                os.utime(src, (fresh_src, fresh_src))
+        assert not kernels._stale(), "a .so newer than its sources must not read stale"
+        # Push the .so 3600s back so it is now older than the pinned sources.
+        os.utime(kernels._EXT, (so_mtime - 3600, so_mtime - 3600))
+        assert kernels._stale(), "a .so older than its sources must read stale"
     finally:
-        now = time.time()
-        os.utime(kernels._EXT, (now, now))
+        for p, m in saved:
+            if p.exists():
+                os.utime(p, (m, m))
 
 
 # --- Phase 3: fused FULL-outer aggregate-over-join -------------------------- #
