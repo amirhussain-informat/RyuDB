@@ -35,8 +35,13 @@ class Transaction:
 
     snapshot_ts: int
     _buffer: dict[str, list["cudf.DataFrame"]] = field(default_factory=dict)
-    # Buffered DELETE tombstones (PK-value frames), parallel to ``_buffer`` (step 9).
-    _tombstones: dict[str, list["cudf.DataFrame"]] = field(default_factory=dict)
+    # Buffered tombstones (PK-value frames), parallel to ``_buffer`` (step 9).
+    # Each entry is ``(frame, exclude_same_ts)``: a DELETE tombstone
+    # (``exclude_same_ts=False``, step 9) removes rows with ``ins_ts <= tomb_ts``;
+    # an UPDATE tombstone (``exclude_same_ts=True``, step 10) removes rows with
+    # ``ins_ts < tomb_ts`` so the re-inserted row (same commit ts) survives its
+    # own tombstone (see ``Engine._merge_delta``).
+    _tombstones: dict[str, list[tuple["cudf.DataFrame", bool]]] = field(default_factory=dict)
 
     def buffer_append(self, table: str, frame: "cudf.DataFrame") -> None:
         """Buffer an INSERT batch for ``table`` (visible to this txn only)."""
@@ -46,12 +51,26 @@ class Transaction:
         """This txn's buffered frames for ``table`` in append order (empty if none)."""
         return list(self._buffer.get(table) or [])
 
-    def tombstone_append(self, table: str, frame: "cudf.DataFrame") -> None:
-        """Buffer a DELETE tombstone for ``table`` (visible to this txn only)."""
-        self._tombstones.setdefault(table, []).append(frame)
+    def tombstone_append(
+        self, table: str, frame: "cudf.DataFrame", exclude_same_ts: bool = False
+    ) -> None:
+        """Buffer a tombstone for ``table`` (visible to this txn only).
+
+        ``exclude_same_ts=False`` (default, DELETE) removes rows with
+        ``ins_ts <= tomb_ts``; ``exclude_same_ts=True`` (UPDATE) removes rows
+        with ``ins_ts < tomb_ts`` so the re-inserted row survives."""
+        self._tombstones.setdefault(table, []).append((frame, exclude_same_ts))
 
     def tombstone_batches(self, table: str) -> list["cudf.DataFrame"]:
         """This txn's buffered tombstone frames for ``table`` in append order."""
+        return [f for f, _ in self._tombstones.get(table) or []]
+
+    def tombstone_batches_with_flag(
+        self, table: str
+    ) -> list[tuple["cudf.DataFrame", bool]]:
+        """This txn's buffered tombstones for ``table`` as ``(frame, exclude_same_ts)``
+        pairs in append order (step 10: the flag routes the tombstone to the
+        ``tombstone`` vs ``tombstone_update`` WAL kind at COMMIT)."""
         return list(self._tombstones.get(table) or [])
 
     def has_tombstone(self, table: str) -> bool:

@@ -178,6 +178,28 @@ class Delete:
 
 
 @dataclass
+class Update:
+    """Write node: ``UPDATE t SET col = expr [, ...] [WHERE pred]`` (step 10).
+
+    A non-relational leaf (no ``input``), like ``Insert``/``Delete``.
+    ``assignments`` is an ordered list of ``(column, Expr)`` pairs from
+    ``SET a = e, b = e``. ``predicate`` is the optional WHERE row-selector
+    (``None`` => update every visible row). The executor evaluates the predicate
+    against the visible snapshot, builds the post-SET rows, tombstones the matched
+    rows' old PKs and re-inserts the new rows in one atomic two-ts commit (tombstone
+    at ``T``, re-insert at ``T+1``), so the new row's ``ins_ts`` strictly exceeds
+    the tombstone's ``tomb_ts`` and survives ``_merge_delta``'s
+    ``keep = tomb_ts < ins_ts`` rule (see ``Engine._update``). Requires a declared
+    PRIMARY KEY on ``t`` (row identity is by PK value, not position), and is
+    supported in autocommit only (explicit-txn UPDATE raises
+    ``NotImplementedError`` in v1)."""
+
+    table: str
+    assignments: list[tuple[str, Expr]] = field(default_factory=list)
+    predicate: Expr | None = None
+
+
+@dataclass
 class TxnControl:
     """Transaction-control leaf (Phase 2 step 5): BEGIN / COMMIT / ROLLBACK.
 
@@ -189,7 +211,7 @@ class TxnControl:
     kind: str  # "begin" | "commit" | "rollback"
 
 
-PlanNode = Scan | Filter | Project | Join | Aggregate | Sort | Limit | Insert | Delete | TxnControl
+PlanNode = Scan | Filter | Project | Join | Aggregate | Sort | Limit | Insert | Delete | Update | TxnControl
 
 
 def walk(node: PlanNode):
@@ -225,6 +247,10 @@ def exprs_in(node: PlanNode) -> list[Expr]:
         return []
     if isinstance(node, Delete):
         return [node.predicate] if node.predicate is not None else []
+    if isinstance(node, Update):
+        return [e for _, e in node.assignments] + (
+            [node.predicate] if node.predicate is not None else []
+        )
     return []
 
 
@@ -260,6 +286,10 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
     if isinstance(node, Delete):
         pred = "" if node.predicate is None else f" WHERE {_estr(node.predicate)}"
         return f"{pad}Delete({node.table}{pred})"
+    if isinstance(node, Update):
+        sets = ", ".join(f"{c}={_estr(e)}" for c, e in node.assignments)
+        pred = "" if node.predicate is None else f" WHERE {_estr(node.predicate)}"
+        return f"{pad}Update({node.table} SET {sets}{pred})"
     if isinstance(node, TxnControl):
         return f"{pad}TxnControl({node.kind})"
     return f"{pad}<{type(node).__name__}>"

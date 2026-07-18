@@ -51,18 +51,26 @@ if TYPE_CHECKING:
 _WAL_NAME = "ryudb.wal"
 
 # Header: u32 payload_len, u32 crc32(payload). Payload: u64 commit_ts, u32
-# n_batches, then per batch u8 kind (0=insert, 1=tombstone -- step 9) + u32
-# name_len + name bytes + u32 arrow_len + arrow bytes. All little-endian.
+# n_batches, then per batch u8 kind (0=insert, 1=tombstone-DELETE, 2=tombstone-
+# UPDATE -- step 10) + u32 name_len + name bytes + u32 arrow_len + arrow bytes.
 _HEADER = struct.Struct("<II")
 _COMMIT_TS = struct.Struct("<Q")
 _U32 = struct.Struct("<I")
 _U8 = struct.Struct("<B")
 
-# kind byte <-> tag string. Tombstones (DELETE PK values) take the parallel
-# ``_tombstones`` channel in ``DeltaStore``; inserts stay on ``_batches``.
+# kind byte <-> tag string. Tombstones (PK values of removed rows) take the
+# parallel ``_tombstones`` channel in ``DeltaStore``; inserts stay on
+# ``_batches``. Step 10 splits tombstones into ``tombstone`` (DELETE: removes
+# rows with ins_ts <= tomb_ts) and ``tombstone_update`` (UPDATE: removes rows
+# with ins_ts < tomb_ts, so the re-inserted row at the same commit ts survives).
 _KIND_INSERT = 0
 _KIND_TOMBSTONE = 1
-_KIND_BY_TAG = {"insert": _KIND_INSERT, "tombstone": _KIND_TOMBSTONE}
+_KIND_TOMBSTONE_UPDATE = 2
+_KIND_BY_TAG = {
+    "insert": _KIND_INSERT,
+    "tombstone": _KIND_TOMBSTONE,
+    "tombstone_update": _KIND_TOMBSTONE_UPDATE,
+}
 _TAG_BY_KIND = {v: k for k, v in _KIND_BY_TAG.items()}
 
 
@@ -92,8 +100,9 @@ def _build_record(
     """Serialize one commit to its full on-disk record bytes (header + payload).
 
     ``batches`` are ``(table, kind, frame)`` triples where ``kind`` is
-    ``"insert"`` or ``"tombstone"`` (step 9 lets one commit mix INSERT and
-    DELETE batches; the per-batch kind byte preserves that split on disk)."""
+    ``"insert"``, ``"tombstone"`` (DELETE), or ``"tombstone_update"`` (step 10:
+    one commit may mix INSERT, DELETE, and UPDATE batches; the per-batch kind
+    byte preserves that split on disk)."""
     parts: list[bytes] = [_COMMIT_TS.pack(commit_ts), _U32.pack(len(batches))]
     for table, kind, frame in batches:
         name = table.encode("utf-8")
@@ -145,7 +154,8 @@ class WAL:
         offset** (cleans a crashed tail so later appends never strand behind a
         corrupt record), then seeks to EOF for appending. Returns
         ``[(commit_ts, table, kind, frame), ...]`` where ``kind`` is
-        ``"insert"`` or ``"tombstone"`` (step 9). No-op (empty) when disabled."""
+        ``"insert"``, ``"tombstone"``, or ``"tombstone_update"`` (step 10).
+        No-op (empty) when disabled."""
         fh = self._acquire(create=False)
         if fh is None:
             return []  # disabled, or no WAL file yet -> nothing to replay
@@ -188,11 +198,13 @@ class WAL:
     ) -> None:
         """Append one durable commit record. Empty ``batches`` is a no-op (an
         empty commit bumps the in-memory counter but persists no data; the
-        counter is recovered as ``max(replayed ts)``). Builds the full record in
-        memory, writes it in one call, then ``flush`` + ``fsync`` so the commit
-        is durable before the caller mutates the in-memory delta. On ANY error
-        the file is truncated back to the pre-write offset (no torn record left
-        behind) and the error re-raised. No-op when disabled."""
+        counter is recovered as ``max(replayed ts)``). ``batches`` are
+        ``(table, kind, frame)`` triples; ``kind`` is ``"insert"``,
+        ``"tombstone"``, or ``"tombstone_update"`` (step 10). Builds the full
+        record in memory, writes it in one call, then ``flush`` + ``fsync`` so
+        the commit is durable before the caller mutates the in-memory delta. On
+        ANY error the file is truncated back to the pre-write offset (no torn
+        record left behind) and the error re-raised. No-op when disabled."""
         if not batches:
             return  # empty commit -> persist nothing
         fh = self._acquire(create=True)
@@ -274,7 +286,7 @@ class WAL:
 
 def _parse_payload(payload: bytes) -> list[tuple[int, str, str, "cudf.DataFrame"]]:
     """Split a payload into its ``(commit_ts, table, kind, frame)`` records
-    (``kind`` is ``"insert"`` or ``"tombstone"``)."""
+    (``kind`` is ``"insert"``, ``"tombstone"``, or ``"tombstone_update"``)."""
     pos = 0
     (commit_ts,) = _COMMIT_TS.unpack_from(payload, pos)
     pos += _COMMIT_TS.size

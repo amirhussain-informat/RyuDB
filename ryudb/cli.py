@@ -104,11 +104,11 @@ def _run_statement(engine: Engine, stmt: str, quiet: bool) -> int:
         else:
             print("ok")
         return 0
-    # INSERT/DELETE return an int row count (the write path mutates the delta);
-    # SELECT returns a cuDF frame to print.
+    # INSERT/DELETE/UPDATE return an int row count (the write path mutates the
+    # delta); SELECT returns a cuDF frame to print.
     if isinstance(result, int):
         kw = stmt.lstrip().split(None, 1)[0].upper() if stmt.strip() else ""
-        verb = "deleted" if kw == "DELETE" else "inserted"
+        verb = "deleted" if kw == "DELETE" else "updated" if kw == "UPDATE" else "inserted"
         print(f"{verb} {result} rows")
         return 0
     _print_frame(result)

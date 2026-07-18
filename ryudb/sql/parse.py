@@ -40,6 +40,7 @@ from .plan import (
     Sort,
     Star,
     TxnControl,
+    Update,
 )
 from .plan import Aggregate  # noqa: E402 (kept separate for readability)
 
@@ -80,6 +81,8 @@ def parse(sql: str, schema: dict[str, list[str]] | None = None) -> object:
         return _build_insert(stmt)
     if isinstance(stmt, exp.Delete):
         return _build_delete(stmt)
+    if isinstance(stmt, exp.Update):
+        return _build_update(stmt)
     if isinstance(stmt, exp.Transaction):
         # sqlglot lowers BEGIN[/TRANSACTION/WORK/DEFERRED] to exp.Transaction;
         # this/modes/mark are ignored (no nested txns, no SAVEPOINTs yet).
@@ -92,7 +95,7 @@ def parse(sql: str, schema: dict[str, list[str]] | None = None) -> object:
         if stmt.args.get("savepoint"):
             raise NotImplementedError("ROLLBACK TO SAVEPOINT is not supported")
         return TxnControl("rollback")
-    raise ParseError(f"only SELECT/INSERT/DELETE/BEGIN/COMMIT/ROLLBACK is supported "
+    raise ParseError(f"only SELECT/INSERT/UPDATE/DELETE/BEGIN/COMMIT/ROLLBACK is supported "
                      f"(got {type(stmt).__name__})")
 
 
@@ -160,6 +163,49 @@ def _build_delete(stmt: exp.Delete) -> Delete:
     where = stmt.args.get("where")
     predicate = _expr(where.this) if where is not None else None
     return Delete(table=table, predicate=predicate)
+
+
+def _build_update(stmt: exp.Update) -> Update:
+    """Lower ``UPDATE t SET col = expr [, ...] [WHERE pred]`` into an Update node.
+
+    sqlglot puts the target table in ``stmt.this`` (an ``exp.Table``; ``.name`` is
+    the table name), the SET list in ``stmt.expressions`` (a list of bare ``exp.EQ``
+    -- one per ``col = expr``; ``eq.this`` is an ``exp.Column`` whose ``.name`` is
+    the target column, ``eq.expression`` is the value expression), and the optional
+    predicate in ``stmt.args["where"]`` (an ``exp.Where`` whose ``.this`` is the
+    predicate, or ``None``). Only the bare single-table form is supported:
+    FROM/JOIN/RETURNING/ORDER BY/LIMIT/WITH/OPTIONS raise (sqlglot ``exp.Update``
+    ``arg_types``: ``with_, this, expressions, from_, where, returning, order,
+    limit, options`` -- there is no ``joins`` key, but JOIN is rejected
+    defensively).
+    """
+    for arg in ("from_", "returning", "order", "limit", "with_", "options"):
+        if stmt.args.get(arg):
+            raise NotImplementedError(f"UPDATE with {arg.upper()} is not supported yet")
+    if stmt.args.get("joins"):
+        raise NotImplementedError("UPDATE with JOIN is not supported yet")
+    target = stmt.this
+    if not isinstance(target, exp.Table):
+        raise ParseError("UPDATE target is not a table")
+    table = target.name
+    if not table:
+        raise ParseError("UPDATE target has no table name")
+    sets = stmt.expressions or []
+    assignments: list[tuple[str, Expr]] = []
+    for eq in sets:
+        if not isinstance(eq, exp.EQ) or not isinstance(eq.this, exp.Column):
+            raise ParseError(
+                f"UPDATE SET clause must be `col = expr` (got {type(eq).__name__})"
+            )
+        assignments.append((eq.this.name, _expr(eq.expression)))
+    if not assignments:
+        raise ParseError("UPDATE has no SET assignments")
+    cols = [c for c, _ in assignments]
+    if len(set(cols)) != len(cols):
+        raise ParseError(f"UPDATE SET has duplicate columns: {cols}")
+    where = stmt.args.get("where")
+    predicate = _expr(where.this) if where is not None else None
+    return Update(table=table, assignments=assignments, predicate=predicate)
 
 
 def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
