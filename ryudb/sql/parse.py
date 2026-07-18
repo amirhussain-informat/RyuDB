@@ -17,11 +17,16 @@ alongside equi keys (e.g. ``ON a.k=b.k AND b.x>10``) is kept on the Join as an
 ``on_predicate`` and applied *inside* the join so outer-join semantics survive
 (it filters only matched rows, never the null-padded unmatched rows).
 
-Not yet supported: subqueries, CTEs, window functions, HAVING,
+Not yet supported: CTEs, window functions, HAVING,
 INTERSECT ALL / EXCEPT ALL (multiset variants), pure non-equi/theta joins (an
 ON with no equi key), correlated predicates, table-qualified column output
 (bare ``Col`` only). Unsupported constructs raise NotImplementedError with a
 clear message.
+
+Uncorrelated ``x IN (SELECT ...)`` / ``x NOT IN (SELECT ...)`` in WHERE lower to
+semi/anti joins (see ``_apply_where_subqueries``): the subquery becomes the
+Join's right child, a normal subtree the optimizer recurses into. EXISTS, scalar
+subqueries, correlated subqueries, and IN under OR are deferred.
 
 Set operators (UNION [ALL] / INTERSECT / EXCEPT) compose two SELECTs into a
 ``SetOp`` node (see ``_build_query`` / ``_build_setop``); DISTINCT set ops use
@@ -272,7 +277,12 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
     # --- WHERE ----------------------------------------------------------- #
     where = sel.args.get("where")
     if where is not None:
-        plan = Filter(plan, _expr(where.this))
+        # Uncorrelated ``x IN (SELECT ...)`` / ``x NOT IN (SELECT ...)`` conjuncts
+        # fold into semi/anti joins on `plan`; the remaining conjuncts stay as a
+        # Filter. See _apply_where_subqueries.
+        plan, residual = _apply_where_subqueries(plan, where.this, schema, aliases)
+        if residual is not None:
+            plan = Filter(plan, residual)
 
     # --- projection / aggregate ------------------------------------------ #
     proj_items = list(sel.expressions)
@@ -509,11 +519,143 @@ def _not(node) -> Expr:
 
 def _in(node, negated: bool) -> Expr:
     if node.args.get("query") is not None:
-        raise NotImplementedError("IN with a subquery is not supported yet")
+        # The WHERE top-conjunct path intercepts IN/NOT IN subqueries before
+        # _expr (see _apply_where_subqueries). Reaching here means the subquery
+        # is nested under something we don't fold (OR, CASE, projection, ...) --
+        # deferred.
+        raise NotImplementedError(
+            "IN with a subquery is only supported as a top-level WHERE conjunct"
+        )
     values = tuple(_expr(v) for v in node.expressions)
     if not values:
         raise ParseError("IN list is empty")
     return In(_expr(node.this), values, negated=negated)
+
+
+# --------------------------------------------------------------------------- #
+# Uncorrelated IN / NOT IN subqueries in WHERE -> semi/anti join. The subquery
+# becomes the Join's right child (a normal PlanNode subtree the optimizer
+# recurses into), so eval_expr stays engine-free. Semi/anti preserve the left
+# side; the right (subquery) side's columns are not in the output. EXISTS, scalar
+# subqueries, correlated subqueries, and IN under OR are deferred (E-2/E-3).
+# --------------------------------------------------------------------------- #
+
+
+def _apply_where_subqueries(plan, where_node, schema, outer_aliases):
+    """Fold uncorrelated ``x IN (SELECT ...)`` / ``x NOT IN (SELECT ...)`` WHERE
+    conjuncts into semi/anti joins on ``plan``; return ``(plan, residual)`` where
+    ``residual`` is the conjoined non-subquery conjuncts (or None).
+
+    Only AND-combined conjuncts fold (semi/anti are not distributive over OR); an
+    IN-subquery under OR stays in the residual and raises when ``_expr`` lowers
+    it. Correlated subqueries and non-bare-column IN keys are rejected."""
+    residual: list[Expr] = []
+    for c in _split_and_exp(where_node):
+        sub = _in_subquery_conjunct(c)
+        if sub is None:
+            residual.append(_expr(c))
+            continue
+        how, left_node, subq_node = sub
+        on_left = _in_subquery_key(left_node)
+        subq_select = subq_node.this if isinstance(subq_node, exp.Subquery) else subq_node
+        _reject_correlated(subq_select, outer_aliases)
+        subplan = _build_query(subq_select, schema)
+        on_right = _subquery_output_col(subplan)
+        plan = Join(plan, subplan, on_left, [on_right], how, None)
+    return plan, (_conjoin_exprs(residual) if residual else None)
+
+
+def _in_subquery_conjunct(c):
+    """If conjunct ``c`` is an IN/NOT IN subquery, return ``(how, left_node, subq)``."""
+    if isinstance(c, exp.In) and c.args.get("query") is not None:
+        return "semi", c.this, c.args["query"]
+    if (isinstance(c, exp.Not) and isinstance(c.this, exp.In)
+            and c.this.args.get("query") is not None):
+        return "anti", c.this.this, c.this.args["query"]
+    return None
+
+
+def _in_subquery_key(left_node):
+    if not isinstance(left_node, exp.Column):
+        raise NotImplementedError(
+            "IN-subquery key must be a bare column (expression keys are deferred)"
+        )
+    return [left_node.name]
+
+
+def _split_and_exp(node):
+    """Split a sqlglot predicate on top-level ``exp.And`` into conjuncts."""
+    if isinstance(node, exp.And):
+        return _split_and_exp(node.this) + _split_and_exp(node.expression)
+    return [node]
+
+
+def _conjoin_exprs(parts: list[Expr]) -> Expr:
+    acc = parts[0]
+    for p in parts[1:]:
+        acc = And(acc, p)
+    return acc
+
+
+def _reject_correlated(subq_select, outer_aliases):
+    """Raise if the subquery references an outer alias (a correlated subquery).
+
+    A qualified ``exp.Column`` whose ``table`` is not one of the subquery's own
+    FROM/JOIN aliases (and is an outer alias) is a correlation. Bare columns are
+    assumed local (the flat-column model); if one actually belongs outside,
+    execution raises a KeyError rather than silently producing wrong results."""
+    local = _local_aliases(subq_select)
+    outer = set(outer_aliases)
+    for col in subq_select.find_all(exp.Column):
+        tbl = col.table
+        if tbl is None:
+            continue
+        tname = tbl.name if hasattr(tbl, "name") else str(tbl)
+        if tname and tname not in local and tname in outer:
+            raise NotImplementedError("correlated subqueries are not supported yet")
+
+
+def _local_aliases(subq_select) -> set[str]:
+    """Aliases / table names declared in the subquery's own FROM and JOINs."""
+    names: set[str] = set()
+    f = subq_select.args.get("from")
+    if f is not None and f.this is not None:
+        names.add(_table_alias_name(f.this))
+    for j in subq_select.args.get("joins", []) or []:
+        if j.this is not None:
+            names.add(_table_alias_name(j.this))
+    return names
+
+
+def _table_alias_name(node) -> str:
+    if isinstance(node, exp.Table):
+        return node.alias or node.name
+    return getattr(node, "alias", "") or getattr(node, "name", "") or ""
+
+
+def _subquery_output_col(subplan) -> str:
+    """The single output column name of a one-column subquery plan.
+
+    Peeks through Sort/Limit (ORDER BY/LIMIT in an IN-subquery are meaningless;
+    DuckDB ignores them). Requires exactly one output column and an explicit
+    projection (``SELECT *`` is ambiguous and rejected)."""
+    node = subplan
+    while isinstance(node, (Sort, Limit)):
+        node = node.input
+    if isinstance(node, Project):
+        if len(node.items) != 1:
+            raise NotImplementedError("IN-subquery must project exactly one column")
+        return node.items[0][1]
+    if isinstance(node, Aggregate):
+        n = len(node.group_keys) + len(node.aggs)
+        if n != 1:
+            raise NotImplementedError("IN-subquery must project exactly one column")
+        return (node.aggs[0][1] if node.aggs else node.group_keys[0][1])
+    if isinstance(node, SetOp):
+        return _subquery_output_col(node.left)
+    raise NotImplementedError(
+        "IN-subquery must project a single named column (SELECT * is ambiguous)"
+    )
 
 
 def _between(node, negated: bool) -> Expr:

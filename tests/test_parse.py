@@ -6,6 +6,7 @@ from ryudb.sql.parse import parse
 from ryudb.sql.plan import (
     AggFunc,
     BinOp,
+    Join,
 )
 
 
@@ -52,7 +53,10 @@ def test_star_no_project():
     assert _types(plan) == ["Scan"]
 
 
-def test_unsupported_raises():
-    import pytest
-    with pytest.raises(NotImplementedError):
-        parse("SELECT * FROM t WHERE a IN (SELECT b FROM u)")
+def test_in_subquery_lowers_to_semi_join():
+    # Uncorrelated IN (SELECT ...) in WHERE folds to a semi join (Phase E-1).
+    plan = parse("SELECT * FROM t WHERE a IN (SELECT b FROM u)")
+    assert isinstance(plan, Join)
+    assert plan.how == "semi"
+    assert plan.on_left == ["a"]
+    assert plan.on_right == ["b"]

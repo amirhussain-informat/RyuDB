@@ -1104,6 +1104,21 @@ class Engine:
         merge_how = "outer" if how == "full" else how
         pred = node.on_predicate
 
+        if how in ("semi", "anti"):
+            # IN / NOT IN subquery lowering. The right side is the subquery frame
+            # (a single key column); the left side is preserved. ``dropna()`` on
+            # the key set makes IN NULL-safe: a NULL left key never matches (DuckDB
+            # ``NULL IN (...)`` is NULL -> filtered out by WHERE), and NULLs in the
+            # subquery set never spuriously match a non-NULL key. NOT IN is only
+            # correct for non-NULL keys on both sides (a NULL in the set makes
+            # DuckDB return NULL for every non-matching row, which ~isin does not
+            # reproduce) -- the parser/tests guard that.
+            keys = right[node.on_right[0]].dropna()
+            mask = left[node.on_left[0]].isin(keys)
+            if how == "anti":
+                mask = ~mask
+            return left[mask]
+
         if how == "cross":
             m = left.merge(right, how="cross", suffixes=("_x", "_y"))
             return self._filter_on_predicate(m, pred)
