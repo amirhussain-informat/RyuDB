@@ -9,9 +9,11 @@ they compare against cuDF date32/datetime64 columns.
 from __future__ import annotations
 
 
+import math
 import re
 
 import cudf
+import numpy as np
 import pandas as pd
 
 from ..sql.plan import (
@@ -23,6 +25,7 @@ from ..sql.plan import (
     Coalesce,
     Col,
     Expr,
+    Func,
     In,
     IsNull,
     Like,
@@ -65,6 +68,8 @@ def eval_expr(e: Expr, df: cudf.DataFrame):
         return _coalesce(e, df)
     if isinstance(e, Cast):
         return _cast(e, df)
+    if isinstance(e, Func):
+        return _func(e, df)
     if isinstance(e, AggFunc):
         raise ValueError("aggregate used outside of GROUP BY / aggregate context")
     raise NotImplementedError(f"cannot evaluate {type(e).__name__}")
@@ -148,6 +153,11 @@ def _series_arith(op, lv, rv):
         return lv * rv
     if op == "/":
         return lv / rv
+    if op == "%":
+        # DuckDB MOD takes the sign of the dividend (truncated mod); Python/cuDF
+        # `%` is floored (sign of the divisor), so -2.5 % 3 = 0.5 here vs -2.5 in
+        # DuckDB. Match DuckDB: x - y * trunc(x / y).
+        return lv - rv * np.trunc(lv / rv)
     raise NotImplementedError(f"unsupported arithmetic operator {op}")
 
 
@@ -160,6 +170,9 @@ def _py_arith(op, lv, rv):
         return lv * rv
     if op == "/":
         return lv / rv
+    if op == "%":
+        # Truncated mod (DuckDB sign-of-dividend convention); see _series_arith.
+        return lv - rv * math.trunc(lv / rv)
     raise NotImplementedError(f"unsupported arithmetic operator {op}")
 
 
@@ -317,3 +330,154 @@ def _cast(e: Cast, df: cudf.DataFrame):
     if tag == "bool":
         return bool(v)
     return str(v)
+
+
+# --------------------------------------------------------------------------- #
+# Scalar functions (UPPER/LOWER/LENGTH/SUBSTR/TRIM/CONCAT/||/REPLACE/POSITION/
+# LEFT/RIGHT/INITCAP/REVERSE/ABS/ROUND/CEIL/FLOOR). Dispatched by Func.name to a
+# cuDF Series op (numpy ufuncs for ceil/floor/sign). NULL operands propagate NA
+# for the str accessors and ||; CONCAT fills NA with "" (NULL-ignoring, matching
+# DuckDB). SUBSTR/LEFT/RIGHT bounds are scalar-only (cuDF str.slice requires
+# scalar bounds). ROUND uses half-away-from-zero (cuDF Series.round is banker's
+# rounding, which mismatches DuckDB on .5).
+# --------------------------------------------------------------------------- #
+
+
+def _as_str_series(v, df: cudf.DataFrame) -> cudf.Series:
+    """Coerce an evaluated arg to a string Series aligned to df (casts ints /
+    floats / scalars to str; broadcasts scalars). Lets CONCAT / || mix string
+    and numeric args the way DuckDB does."""
+    s = _as_series(v, df)
+    if not isinstance(s, cudf.Series):
+        # pandas Series fallback -> wrap as cudf
+        s = cudf.Series(s, index=df.index)
+    if not pd.api.types.is_string_dtype(s.dtype):
+        s = s.astype("str")
+    return s
+
+
+def _scalar_int(v):
+    """An int bound for SUBSTR/LEFT/RIGHT. Must be a python scalar (cuDF
+    str.slice takes scalar bounds); a column-typed bound is unsupported."""
+    if isinstance(v, (cudf.Series, pd.Series)):
+        raise NotImplementedError("SUBSTR/LEFT/RIGHT with a column-typed bound is not supported")
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    return int(v)
+
+
+def _func(e: Func, df: cudf.DataFrame):
+    name = e.name
+    args = e.args
+
+    # --- single-arg string transforms ----------------------------------- #
+    if name == "upper":
+        v = eval_expr(args[0], df)
+        return v.str.upper() if isinstance(v, cudf.Series) else (None if v is None else str(v).upper())
+    if name == "lower":
+        v = eval_expr(args[0], df)
+        return v.str.lower() if isinstance(v, cudf.Series) else (None if v is None else str(v).lower())
+    if name == "initcap":
+        v = eval_expr(args[0], df)
+        return v.str.title() if isinstance(v, cudf.Series) else (None if v is None else str(v).title())
+    if name == "reverse":
+        v = eval_expr(args[0], df)
+        if isinstance(v, cudf.Series):
+            return v.str.slice(None, None, -1)
+        return None if v is None else str(v)[::-1]
+    if name == "length":
+        v = eval_expr(args[0], df)
+        return v.str.len() if isinstance(v, cudf.Series) else (None if v is None else len(str(v)))
+
+    # --- multi-arg string funcs ----------------------------------------- #
+    if name == "substr":
+        s = _as_str_series(eval_expr(args[0], df), df)
+        start = _scalar_int(eval_expr(args[1], df))
+        if start is None:
+            return cudf.Series([None] * len(df), index=df.index)
+        st = start - 1  # SQL 1-based -> cuDF 0-based
+        if st < 0:
+            st = 0
+        if len(args) > 2:
+            ln = _scalar_int(eval_expr(args[2], df))
+            if ln is None:
+                return cudf.Series([None] * len(df), index=df.index)
+            if ln < 0:
+                ln = 0
+            return s.str.slice(st, st + ln)
+        return s.str.slice(st)
+    if name == "left":
+        s = _as_str_series(eval_expr(args[0], df), df)
+        n = _scalar_int(eval_expr(args[1], df))
+        if n is None:
+            return cudf.Series([None] * len(df), index=df.index)
+        if n < 0:
+            n = 0
+        return s.str.slice(0, n)
+    if name == "right":
+        s = _as_str_series(eval_expr(args[0], df), df)
+        n = _scalar_int(eval_expr(args[1], df))
+        if n is None:
+            return cudf.Series([None] * len(df), index=df.index)
+        if n <= 0:
+            return s.str.slice(0, 0)
+        # cuDF rejects a negative slice start; reverse, take the prefix, reverse.
+        return s.str.slice(None, None, -1).str.slice(0, n).str.slice(None, None, -1)
+    if name == "replace":
+        s = _as_str_series(eval_expr(args[0], df), df)
+        frm = str(eval_expr(args[1], df))
+        to = str(eval_expr(args[2], df))
+        return s.str.replace(frm, to)
+    if name == "strpos":
+        hay = _as_str_series(eval_expr(args[0], df), df)
+        needle = str(eval_expr(args[1], df))
+        return hay.str.find(needle) + 1  # 0-based -1 (not found) -> 0; NA stays NA
+    if name == "trim":
+        s = _as_str_series(eval_expr(args[0], df), df)
+        chars = eval_expr(args[1], df)  # None for whitespace
+        side = eval_expr(args[2], df)
+        to_strip = None if chars is None else str(chars)
+        if side == "LEADING":
+            fn = s.str.lstrip
+        elif side == "TRAILING":
+            fn = s.str.rstrip
+        else:
+            fn = s.str.strip
+        return fn(to_strip) if to_strip is not None else fn()
+    if name in ("concat", "concat_pipe"):
+        parts = [_as_str_series(eval_expr(a, df), df) for a in args]
+        if name == "concat":
+            # DuckDB CONCAT ignores NULLs (treat as empty).
+            parts = [p.fillna("") for p in parts]
+        acc = parts[0]
+        for p in parts[1:]:
+            acc = acc.str.cat(p)
+        return acc
+
+    # --- numeric funcs --------------------------------------------------- #
+    if name == "abs":
+        v = eval_expr(args[0], df)
+        return v.abs() if isinstance(v, cudf.Series) else (None if v is None else abs(v))
+    if name == "ceil":
+        v = eval_expr(args[0], df)
+        if isinstance(v, cudf.Series):
+            return np.ceil(v)
+        return None if v is None else math.ceil(v)
+    if name == "floor":
+        v = eval_expr(args[0], df)
+        if isinstance(v, cudf.Series):
+            return np.floor(v)
+        return None if v is None else math.floor(v)
+    if name == "round":
+        v = eval_expr(args[0], df)
+        d = int(eval_expr(args[1], df)) if len(args) > 1 else 0
+        f = 10 ** d
+        if isinstance(v, cudf.Series):
+            # Half-away-from-zero (DuckDB); cuDF Series.round is banker's rounding.
+            return np.floor(v.abs() * f + 0.5) / f * np.sign(v)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        sign = -1.0 if v < 0 else 1.0
+        return math.floor(abs(v) * f + 0.5) / f * sign
+
+    raise NotImplementedError(f"unsupported scalar function: {name}")
