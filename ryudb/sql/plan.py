@@ -174,6 +174,24 @@ class Cast(Expr):
         return self.expr.columns()
 
 
+@dataclass(frozen=True)
+class Func(Expr):
+    """A scalar function call ``name(arg, arg, ...)``. ``name`` is a RyuDB
+    function tag (upper/lower/length/substr/trim/concat/concat_pipe/replace/
+    strpos/left/right/initcap/reverse/abs/round/ceil/floor); the tag selects the
+    cuDF op in ``ops._func``. Using one generic node (rather than a dataclass per
+    function) keeps the AST small -- the parse/ops tables carry the per-function
+    specifics, and ``columns()``/``_estr`` work for free."""
+    name: str
+    args: tuple[Expr, ...]
+
+    def columns(self) -> set[str]:
+        cols: set[str] = set()
+        for a in self.args:
+            cols |= a.columns()
+        return cols
+
+
 # --------------------------------------------------------------------------- #
 # Plan nodes
 # --------------------------------------------------------------------------- #
@@ -422,4 +440,6 @@ def _estr(e: Expr) -> str:
         return f"COALESCE({', '.join(_estr(a) for a in e.args)})"
     if isinstance(e, Cast):
         return f"CAST({_estr(e.expr)} AS {e.dtype})"
+    if isinstance(e, Func):
+        return f"{e.name}({', '.join(_estr(a) for a in e.args)})"
     return repr(e)

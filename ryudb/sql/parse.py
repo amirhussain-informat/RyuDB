@@ -39,6 +39,7 @@ from .plan import (
     Delete,
     Expr,
     Filter,
+    Func,
     In,
     Insert,
     IsNull,
@@ -374,6 +375,17 @@ def _expr(node) -> Expr:
         return Coalesce(tuple(args))
     if isinstance(node, exp.Case):
         return _case(node)
+    # Scalar functions. DPipe (``||``) and Mod are exp.Binary subclasses, so they
+    # must be matched before the generic exp.Binary branch; Trim and the
+    # _SCALAR_FUNC_BUILDERS table are exp.Func (not Binary). exp.Mod is NOT in the
+    # table -- it falls through to exp.Binary -> BinOp("%", ...) (the _BINOP map
+    # already has exp.Mod: "%").
+    if isinstance(node, exp.DPipe):
+        return Func("concat_pipe", (_expr(node.this), _expr(node.expression)))
+    if isinstance(node, exp.Trim):
+        return _trim(node)
+    if type(node) in _SCALAR_FUNC_BUILDERS:
+        return _SCALAR_FUNC_BUILDERS[type(node)](node)
     if isinstance(node, exp.Binary):
         op = _binop_symbol(node)
         return BinOp(op, _expr(node.this), _expr(node.expression))
@@ -448,6 +460,74 @@ def _case(node) -> Expr:
         branches.append((cond, then))
     default = _expr(node.args.get("default")) if node.args.get("default") is not None else None
     return Case(operand, tuple(branches), default)
+
+
+# --------------------------------------------------------------------------- #
+# Scalar functions (UPPER/LOWER/LENGTH/SUBSTR/TRIM/CONCAT/||/REPLACE/POSITION/
+# LEFT/RIGHT/INITCAP/REVERSE/ABS/ROUND/CEIL/FLOOR). Each maps a sqlglot node to
+# a generic ``Func(tag, args)``; the per-tag cuDF op lives in ``ops._func``.
+# sqlglot node shapes were confirmed by introspection (v28.10.1).
+# --------------------------------------------------------------------------- #
+
+
+def _trim(node) -> Expr:
+    """Lower ``TRIM`` / ``LTRIM`` / ``RTRIM`` / ``TRIM(LEADING x FROM s)``.
+
+    sqlglot unifies these as ``exp.Trim``: ``position`` is the side
+    (``"LEADING"``/``"TRAILING"``/``"BOTH"``/``None`` for default both),
+    ``expression`` is the trim-chars expr (``None`` -> whitespace). Encoded as
+    ``Func("trim", (this, chars_or_NoneLit, sideLit))`` so ops has both without a
+    sub-dataclass; ``args[1]`` is the chars expr, ``args[2]`` the side.
+    """
+    pos = node.args.get("position") or "BOTH"
+    chars = node.args.get("expression")
+    chars_expr = _expr(chars) if chars is not None else Lit(None, "str")
+    return Func("trim", (_expr(node.this), chars_expr, Lit(pos, "str")))
+
+
+def _scalar_unary(tag: str):
+    """Builder for a 1-arg scalar func: ``F(x)`` -> ``Func(tag, (_expr(x),))``."""
+    def build(node) -> Expr:
+        return Func(tag, (_expr(node.this),))
+    return build
+
+
+def _substr(node) -> Expr:
+    start = node.args.get("start")
+    length = node.args.get("length")
+    args = [_expr(node.this), _expr(start)]
+    if length is not None:
+        args.append(_expr(length))
+    return Func("substr", tuple(args))
+
+
+def _round(node) -> Expr:
+    decimals = node.args.get("decimals")
+    if decimals is not None:
+        return Func("round", (_expr(node.this), _expr(decimals)))
+    return Func("round", (_expr(node.this),))
+
+
+# exp.Type -> (node) -> Func. Looked up by exact type in ``_expr``.
+_SCALAR_FUNC_BUILDERS = {
+    exp.Upper: _scalar_unary("upper"),
+    exp.Lower: _scalar_unary("lower"),
+    exp.Length: _scalar_unary("length"),
+    exp.Abs: _scalar_unary("abs"),
+    exp.Ceil: _scalar_unary("ceil"),
+    exp.Floor: _scalar_unary("floor"),
+    exp.Initcap: _scalar_unary("initcap"),
+    exp.Reverse: _scalar_unary("reverse"),
+    exp.Substring: _substr,
+    exp.Round: _round,
+    exp.Concat: lambda n: Func("concat", tuple(_expr(x) for x in n.expressions)),
+    exp.Replace: lambda n: Func(
+        "replace", (_expr(n.this), _expr(n.expression), _expr(n.args["replacement"]))
+    ),
+    exp.StrPosition: lambda n: Func("strpos", (_expr(n.this), _expr(n.args["substr"]))),
+    exp.Left: lambda n: Func("left", (_expr(n.this), _expr(n.expression))),
+    exp.Right: lambda n: Func("right", (_expr(n.this), _expr(n.expression))),
+}
 
 
 _SQLGLOT_TYPE_TAG = {
