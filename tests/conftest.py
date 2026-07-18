@@ -8,12 +8,25 @@ join/aggregate paths are exercised.
 from __future__ import annotations
 
 
+import os
+
 import cudf
 import duckdb
 import pandas as pd
 import pytest
 
 from ryudb import Catalog, Engine
+
+
+def _clear_wal(data_dir) -> None:
+    """Remove a leftover ``ryudb.wal`` from the data dir so each test starts with
+    an empty WAL. Needed only for fixtures whose Engine is function-scoped over
+    a session/module-scoped dir: the WAL persists committed INSERTs to that shared
+    dir, so without a clear, test A's commits would replay into test B's fresh
+    Engine. The catalog file is idempotent so it does NOT need clearing."""
+    wal = os.path.join(str(data_dir), "ryudb.wal")
+    if os.path.exists(wal):
+        os.remove(wal)
 
 # A small but non-trivial dataset. Row counts are intentionally modest so tests
 # run in well under a second on the GPU.
@@ -78,6 +91,7 @@ def data_dir(tmp_path_factory):
 
 @pytest.fixture
 def engine(data_dir) -> Engine:
+    _clear_wal(data_dir)  # session dir reused across tests -> start each with empty WAL
     cat = Catalog(str(data_dir))
     cat.register("orders", str(data_dir / "orders"))
     cat.register("lineitem", str(data_dir / "lineitem"))
@@ -132,6 +146,7 @@ def typed_lineitem_dir(tmp_path_factory):
 
 @pytest.fixture
 def typed_engine(typed_lineitem_dir) -> Engine:
+    _clear_wal(typed_lineitem_dir)  # session dir reused -> start with empty WAL
     cat = Catalog(str(typed_lineitem_dir))
     cat.register("lineitem", str(typed_lineitem_dir / "lineitem"))
     return Engine(cat)

@@ -32,7 +32,7 @@ import duckdb
 from ryudb import Catalog, Engine
 from ryudb.exec import fused
 
-from .conftest import assert_same
+from .conftest import _clear_wal, assert_same
 
 CPP = fused._kernels.is_available
 
@@ -105,6 +105,7 @@ def hc_dir(tmp_path_factory):
 
 @pytest.fixture
 def hc_engine(hc_dir) -> Engine:
+    _clear_wal(hc_dir)  # module dir reused across tests -> start with empty WAL
     cat = Catalog(str(hc_dir))
     cat.register("lineitem", str(hc_dir / "lineitem"))
     return Engine(cat)
