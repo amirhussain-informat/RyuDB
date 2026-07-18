@@ -30,7 +30,14 @@ deferred. Uncorrelated scalar subqueries (single-row aggregates such as
 ``SELECT COUNT(*)/MAX(...) FROM ...``) and ``EXISTS (SELECT ...)`` -- anywhere a
 boolean/value is legal in WHERE or projection -- are flattened into cross-joins
 of a 1-row relation onto the outer plan (see ``_flatten_outer_subqueries``);
-NOT EXISTS falls out via ``Not``. Correlated subqueries are deferred (E-3).
+NOT EXISTS falls out via ``Not``.
+
+Correlated subqueries with a single equi-correlation ``inner.col = outer.col`` are
+decorrelated at parse time into uncorrelated joins (Phase E-3, no outer-scope
+binding needed): correlated ``EXISTS``/``NOT EXISTS`` -> semi/anti join on the
+correlation key; correlated scalar (single-row aggregate) -> LEFT join onto a
+grouped aggregate. Multi-equi / non-equi correlation, correlated IN, and outer
+refs outside the WHERE are deferred.
 
 Set operators (UNION [ALL] / INTERSECT / EXCEPT) compose two SELECTs into a
 ``SetOp`` node (see ``_build_query`` / ``_build_setop``); DISTINCT set ops use
@@ -550,36 +557,84 @@ def _in(node, negated: bool) -> Expr:
 
 
 # --------------------------------------------------------------------------- #
-# Uncorrelated IN / NOT IN subqueries in WHERE -> semi/anti join. The subquery
-# becomes the Join's right child (a normal PlanNode subtree the optimizer
+# WHERE subquery conjuncts -> semi/anti join. ``x IN (SELECT ...)`` / ``x NOT IN
+# (SELECT ...)`` (uncorrelated, E-1) and correlated ``EXISTS (SELECT ...)`` /
+# ``NOT EXISTS (SELECT ...)`` (E-3) fold into semi/anti joins on ``plan``: the
+# subquery is the Join's right child (a normal PlanNode subtree the optimizer
 # recurses into), so eval_expr stays engine-free. Semi/anti preserve the left
-# side; the right (subquery) side's columns are not in the output. EXISTS, scalar
-# subqueries, correlated subqueries, and IN under OR are deferred (E-2/E-3).
+# side; the right (subquery) side's columns are not in the output.
+#
+# A correlated EXISTS/NOT EXISTS with a single equi-correlation ``inner.k =
+# outer.k`` decorrelates to a semi/anti join on those columns -- the correlation
+# predicate *is* the join key (the subquery's WHERE is reduced to its local
+# conjuncts, its projection replaced by the inner key column since the SELECT
+# list is irrelevant to EXISTS). NOT EXISTS -> anti-join is NULL-correct (a NULL
+# outer key matches nothing -> NOT EXISTS true -> anti-join keeps it; matches
+# DuckDB). IN under OR, correlated IN, non-equi/multi correlation, and
+# non-bare-column IN keys are deferred.
 # --------------------------------------------------------------------------- #
 
 
 def _apply_where_subqueries(plan, where_node, schema, outer_aliases):
-    """Fold uncorrelated ``x IN (SELECT ...)`` / ``x NOT IN (SELECT ...)`` WHERE
+    """Fold IN / NOT IN (uncorrelated) and correlated EXISTS / NOT EXISTS WHERE
     conjuncts into semi/anti joins on ``plan``; return ``(plan, residual)`` where
     ``residual`` is the conjoined non-subquery conjuncts (or None).
 
-    Only AND-combined conjuncts fold (semi/anti are not distributive over OR); an
-    IN-subquery under OR stays in the residual and raises when ``_expr`` lowers
-    it. Correlated subqueries and non-bare-column IN keys are rejected."""
+    Only AND-combined conjuncts fold (semi/anti are not distributive over OR); a
+    subquery conjunct under OR stays in the residual and raises when ``_expr``
+    lowers it. Uncorrelated EXISTS conjuncts never reach here --
+    ``_flatten_outer_subqueries`` already replaced them with ``col > 0`` (E-2) --
+    so an ``exp.Exists`` conjunct here is correlated by construction."""
     residual: list[Expr] = []
     for c in _split_and_exp(where_node):
-        sub = _in_subquery_conjunct(c)
+        sub = _where_subquery_conjunct(c, outer_aliases)
         if sub is None:
             residual.append(_expr(c))
             continue
-        how, left_node, subq_node = sub
-        on_left = _in_subquery_key(left_node)
-        subq_select = subq_node.this if isinstance(subq_node, exp.Subquery) else subq_node
-        _reject_correlated(subq_select, outer_aliases)
-        subplan = _build_query(subq_select, schema)
+        how, outer_key, inner_select = sub
+        subplan = _build_query(inner_select, schema)
         on_right = _subquery_output_col(subplan)
-        plan = Join(plan, subplan, on_left, [on_right], how, None)
+        plan = Join(plan, subplan, [outer_key], [on_right], how, None)
     return plan, (_conjoin_exprs(residual) if residual else None)
+
+
+def _where_subquery_conjunct(c, outer_aliases):
+    """If conjunct ``c`` folds to a semi/anti join, return
+    ``(how, outer_key, inner_select)``; else None (it stays in the residual).
+
+    ``outer_key`` is the outer-side join key column name; ``inner_select`` is the
+    sqlglot select for the Join's right side (already decorrelated for EXISTS:
+    correlation stripped from its WHERE, projection set to the inner key)."""
+    # Correlated EXISTS / NOT EXISTS.
+    if isinstance(c, exp.Exists):
+        return _exists_conjunct(c, negated=False, outer_aliases=outer_aliases)
+    if isinstance(c, exp.Not) and isinstance(c.this, exp.Exists):
+        return _exists_conjunct(c.this, negated=True, outer_aliases=outer_aliases)
+    # Uncorrelated IN / NOT IN (correlated IN is deferred).
+    in_sub = _in_subquery_conjunct(c)
+    if in_sub is not None:
+        how, left_node, subq_node = in_sub
+        subq_select = subq_node.this if isinstance(subq_node, exp.Subquery) else subq_node
+        if _classify_correlation(subq_select, outer_aliases) is not None:
+            raise NotImplementedError("correlated IN subqueries are not supported yet")
+        on_left = _in_subquery_key(left_node)  # raises if not a bare column
+        return how, on_left[0], subq_select
+    return None
+
+
+def _exists_conjunct(exists_node, negated, outer_aliases):
+    """Decorrelate a correlated ``EXISTS``/``NOT EXISTS`` to a semi/anti join.
+    Returns ``(how, outer_key, inner_select)`` or None (uncorrelated -> residual)."""
+    inner = exists_node.this
+    corr = _classify_correlation(inner, outer_aliases)
+    if corr is None:
+        return None  # uncorrelated (already handled by _flatten_outer_subqueries)
+    outer_key, inner_key, local_conjuncts = corr
+    _set_local_where(inner, local_conjuncts)
+    # The SELECT list is irrelevant to EXISTS -- project the inner key so the
+    # right side exposes it as the join key column.
+    inner.set("expressions", [exp.column(inner_key)])
+    return ("anti" if negated else "semi"), outer_key, inner
 
 
 def _in_subquery_conjunct(c):
@@ -614,22 +669,125 @@ def _conjoin_exprs(parts: list[Expr]) -> Expr:
     return acc
 
 
-def _reject_correlated(subq_select, outer_aliases):
-    """Raise if the subquery references an outer alias (a correlated subquery).
+def _classify_correlation(subq_select, outer_aliases):
+    """Classify a subquery's correlation with the outer scope.
 
-    A qualified ``exp.Column`` whose ``table`` is not one of the subquery's own
-    FROM/JOIN aliases (and is an outer alias) is a correlation. Bare columns are
-    assumed local (the flat-column model); if one actually belongs outside,
-    execution raises a KeyError rather than silently producing wrong results."""
+    Returns ``(outer_key, inner_key, local_conjuncts)`` for a subquery whose only
+    outer reference is a single equi-correlation ``inner.col = outer.col`` conjunct
+    in its WHERE (both sides bare columns, one referencing an outer alias, the
+    other local); ``local_conjuncts`` are the remaining (non-correlated) WHERE
+    conjuncts. Returns ``None`` for an uncorrelated subquery. Raises
+    ``NotImplementedError`` for the deferred forms: more than one equi-correlation,
+    a non-equi outer reference in the WHERE, or any outer reference outside the
+    WHERE (SELECT list / aggregate args / GROUP BY / HAVING / ORDER BY).
+
+    Bare (unqualified) columns are assumed local (the flat-column model); a bare
+    column that actually belongs outside raises a KeyError at execution rather
+    than silently producing wrong results."""
     local = _local_aliases(subq_select)
     outer = set(outer_aliases)
-    for col in subq_select.find_all(exp.Column):
+    where = subq_select.args.get("where")
+
+    equi: tuple[str, str] | None = None
+    local_conjuncts: list = []
+    if where is not None:
+        for conj in _split_and_exp(where.this):
+            if _references_outer(conj, outer, local):
+                pair = _equi_correlation_pair(conj, outer, local)
+                if pair is None:
+                    raise NotImplementedError(
+                        "correlated subqueries are only supported with a single "
+                        "equality correlation (inner.col = outer.col); non-equi "
+                        "correlations are not supported yet"
+                    )
+                if equi is not None:
+                    raise NotImplementedError(
+                        "correlated subqueries with multiple correlation "
+                        "predicates are not supported yet"
+                    )
+                equi = pair
+            else:
+                local_conjuncts.append(conj)
+
+    # Outer references outside the WHERE can't be turned into an equi-join key.
+    for part in _non_where_subquery_parts(subq_select):
+        if _references_outer(part, outer, local):
+            raise NotImplementedError(
+                "correlated subqueries are only supported when the outer reference "
+                "is a WHERE equality (outer refs in the SELECT list, aggregate "
+                "arguments, or HAVING are not supported yet)"
+            )
+
+    if equi is None:
+        return None  # uncorrelated
+    return (*equi, local_conjuncts)
+
+
+def _references_outer(node, outer, local) -> bool:
+    """True if ``node`` contains a qualified column whose table is an outer alias
+    (and not one of the subquery's own FROM/JOIN aliases)."""
+    for col in node.find_all(exp.Column):
         tbl = col.table
-        if tbl is None:
-            continue
-        tname = tbl.name if hasattr(tbl, "name") else str(tbl)
-        if tname and tname not in local and tname in outer:
-            raise NotImplementedError("correlated subqueries are not supported yet")
+        if tbl and tbl not in local and tbl in outer:
+            return True
+    return False
+
+
+def _equi_correlation_pair(conj, outer, local):
+    """If ``conj`` is ``inner.col = outer.col`` (bare columns, exactly one side
+    referencing an outer alias), return ``(outer_key, inner_key)``; else None."""
+    if not isinstance(conj, exp.EQ):
+        return None
+    lhs, rhs = conj.this, conj.expression
+    if not (isinstance(lhs, exp.Column) and isinstance(rhs, exp.Column)):
+        return None
+    lhs_outer = _col_table_is_outer(lhs, outer, local)
+    rhs_outer = _col_table_is_outer(rhs, outer, local)
+    if lhs_outer and not rhs_outer:
+        return rhs.name, lhs.name  # rhs is outer, lhs is inner
+    if rhs_outer and not lhs_outer:
+        return lhs.name, rhs.name  # lhs is outer, rhs is inner
+    return None  # both outer or both inner -> not a single correlation pair
+
+
+def _col_table_is_outer(col, outer, local) -> bool:
+    tbl = col.table
+    return bool(tbl and tbl not in local and tbl in outer)
+
+
+def _non_where_subquery_parts(subq_select):
+    """The subquery's expression-bearing parts OUTSIDE its WHERE (SELECT list,
+    GROUP BY, HAVING, ORDER BY) -- checked for outer references that can't be
+    turned into an equi-join key."""
+    parts: list = list(subq_select.expressions)  # SELECT list
+    group = subq_select.args.get("group")
+    if group is not None:
+        parts.extend(group.expressions)
+    having = subq_select.args.get("having")
+    if having is not None:
+        parts.append(having.this)
+    order = subq_select.args.get("order")
+    if order is not None:
+        parts.extend(order.expressions)
+    return parts
+
+
+def _set_local_where(inner_select, local_conjuncts):
+    """Rewrite the inner select's WHERE to only the local (non-correlated)
+    conjuncts -- the equi-correlation has been lifted out as the join key. Drops
+    the WHERE when no local conjuncts remain."""
+    if not local_conjuncts:
+        inner_select.args.pop("where", None)
+    else:
+        inner_select.set("where", exp.Where(this=_conjoin_exp_nodes(local_conjuncts)))
+
+
+def _conjoin_exp_nodes(nodes):
+    """Rebuild an ``exp.And`` tree from a list of sqlglot predicate nodes."""
+    acc = nodes[0]
+    for n in nodes[1:]:
+        acc = exp.And(this=acc, expression=n)
+    return acc
 
 
 def _local_aliases(subq_select) -> set[str]:
@@ -676,35 +834,38 @@ def _subquery_output_col(subplan) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Uncorrelated scalar / EXISTS subqueries -> cross-join broadcast (Phase E-2).
-# A scalar subquery (a single-row aggregate such as ``SELECT COUNT(*)/MAX(...)
-# FROM ...``) or an ``EXISTS (SELECT ...)`` that appears in THIS select's WHERE or
-# projection is flattened into a cross-join of a 1-row relation onto the running
-# ``plan``; the subquery sqlglot node is replaced in place by a bare Column
-# reference to the broadcast column. Keeping it relational (a Join.right subtree
-# the optimizer recurses into) -- not an Expr-embedded subplan -- leaves
-# ``eval_expr`` engine-free, consistent with the IN/NOT IN lowering (E-1).
+# Scalar / EXISTS subqueries -> cross-join broadcast (Phase E-2) or left-join
+# decorrelation (Phase E-3). A subquery that appears in THIS select's WHERE or
+# projection is flattened into a join on the running ``plan``; the subquery
+# sqlglot node is replaced in place by a bare Column reference to the broadcast
+# column. Keeping it relational (a Join.right subtree the optimizer recurses
+# into) -- not an Expr-embedded subplan -- leaves ``eval_expr`` engine-free,
+# consistent with the IN/NOT IN lowering (E-1).
 #
-# EXISTS becomes ``(SELECT COUNT(*) FROM (subquery) LIMIT 1) > 0``: a 1-row
-# aggregate whose value is 1 iff the subquery has any row, 0 otherwise. Replacing
-# the ``exp.Exists`` node with ``exp.GT(col, 0)`` (rather than a dedicated node)
-# means EXISTS works wherever a boolean is legal -- under AND/OR/NOT, in a
-# comparison, in projection -- not only as a top-level WHERE conjunct (unlike IN,
-# which is restricted to AND-conjuncts). NOT EXISTS falls out for free: the
-# wrapping ``exp.Not`` becomes ``Not(GT(col, 0))``, and since the count is a
-# non-NULL int ``Not`` inverts it correctly.
+# Uncorrelated forms (E-2):
+#   * scalar (single-row aggregate) -> cross-join broadcast of the 1-row
+#     aggregate; node -> ``Col(_sqN)``.
+#   * EXISTS -> ``(SELECT COUNT(*) FROM (subq) LIMIT 1) > 0``; node -> ``col > 0``
+#     so EXISTS works under AND/OR/NOT and in projection (not just as a top-level
+#     WHERE conjunct). NOT EXISTS falls out via ``Not`` (count is non-NULL int).
 #
-# Scalar subqueries are restricted to *single-row aggregates* (the only shape with
-# a guaranteed 1 row, so the cross-join broadcasts exactly one value per outer
-# row). Non-aggregate scalars (``SELECT k FROM b`` -- 0+ rows) and GROUP BY
-# scalars (``SELECT k FROM b GROUP BY k`` -- N rows) are deferred. Correlated
-# subqueries are rejected (outer-scope column binding is E-3).
+# Correlated forms (E-3): a single equi-correlation ``inner.k = outer.k`` is
+# decorrelated at parse time into an uncorrelated join -- no outer-scope binding:
+#   * scalar -> LEFT join onto a grouped aggregate (the subquery's aggregate, now
+#     grouped by the correlation key); node -> ``Col(_sqN)`` (NULL for unmatched
+#     outer rows, matching DuckDB).
+#   * EXISTS -> left for ``_apply_where_subqueries`` to fold as a semi/anti join
+#     on the correlation key (the node is NOT replaced here).
+# Non-aggregate / GROUP BY scalars are deferred; multi-equi / non-equi correlation
+# and outer refs outside the WHERE are deferred (see ``_classify_correlation``).
 # --------------------------------------------------------------------------- #
 
 
 def _flatten_outer_subqueries(plan, sel, schema, outer_aliases):
-    """Flatten uncorrelated scalar / EXISTS subqueries of THIS select into
-    cross-joins on ``plan``, replacing each subquery node with a Column ref.
+    """Flatten scalar / EXISTS subqueries of THIS select into joins on ``plan``,
+    replacing each scalar subquery node with a Column ref. Correlated EXISTS
+    nodes are left in place (``_apply_where_subqueries`` folds them as semi/anti
+    joins); uncorrelated EXISTS are replaced with ``col > 0``.
 
     Only subqueries that belong to ``sel`` itself are collected -- ones nested
     inside an inner SELECT (a subquery's own body, or an IN-subquery's body) are
@@ -720,11 +881,18 @@ def _flatten_outer_subqueries(plan, sel, schema, outer_aliases):
 
     n = 0
     for kind, node in acc:
-        n += 1
-        name = f"_sq{n}"
+        # exp.Exists.this is the inner Select directly; a scalar exp.Subquery.this
+        # is the inner query (Select / set-op / nested Subquery) -> unwrap once.
+        inner = node.this if kind == "exists" else (
+            node.this if isinstance(node, exp.Subquery) else node
+        )
+        corr = _classify_correlation(inner, outer_aliases)
         if kind == "exists":
-            inner = node.this  # the exp.Select under exp.Exists
-            _reject_correlated(inner, outer_aliases)
+            if corr is not None:
+                # Correlated EXISTS: leave for _apply_where_subqueries (semi/anti).
+                continue
+            n += 1
+            name = f"_sq{n}"
             subplan = _build_query(inner, schema)
             # COUNT(*) of <=1 row > 0: 1 iff the subquery has any row, else 0.
             # COUNT must be uppercase (the executor's _scalar_global_agg special-
@@ -736,17 +904,75 @@ def _flatten_outer_subqueries(plan, sel, schema, outer_aliases):
             plan = Join(plan, count_plan, [], [], "cross", None)
             node.replace(exp.GT(this=exp.column(name), expression=exp.Literal.number(0)))
         else:  # scalar
-            inner = node.this if isinstance(node, exp.Subquery) else node
-            _reject_correlated(inner, outer_aliases)
-            subplan = _build_query(inner, schema)
-            _require_global_aggregate(subplan)
-            existing = _subquery_output_col(subplan)
-            # Rename the aggregate's single output column to the broadcast name
-            # via a 1-item Project so the cross-joined column is referenced cleanly.
-            renamed = Project(subplan, [(Col(existing), name)])
-            plan = Join(plan, renamed, [], [], "cross", None)
-            node.replace(exp.column(name))
+            if corr is None:
+                n += 1
+                name = f"_sq{n}"
+                subplan = _build_query(inner, schema)
+                _require_global_aggregate(subplan)
+                existing = _subquery_output_col(subplan)
+                # Rename the aggregate's single output column to the broadcast
+                # name via a 1-item Project so the cross-joined column is clean.
+                renamed = Project(subplan, [(Col(existing), name)])
+                plan = Join(plan, renamed, [], [], "cross", None)
+                node.replace(exp.column(name))
+            else:
+                n += 1
+                name = f"_sq{n}"
+                plan, replacement = _decorrelate_scalar(plan, inner, corr, name, schema)
+                node.replace(replacement)
     return plan
+
+
+def _decorrelate_scalar(plan, inner_select, corr, name, schema):
+    """Rewrite a correlated scalar subquery (single equi-correlation, global
+    aggregate, inner-only agg arg) into a LEFT join of ``plan`` onto a grouped
+    aggregate. The correlation key becomes the GROUP BY key and the left-join key;
+    the aggregate output and the group key are renamed to unique ``_sqN`` names so
+    they never collide with the outer frame's columns in the merge.
+
+    Returns ``(plan, replacement)`` where ``replacement`` is the sqlglot node to
+    substitute for the subquery. ``COUNT`` yields ``COALESCE(_sqN, 0)`` because
+    COUNT over an empty correlation is 0, not NULL; any other aggregate yields
+    ``_sqN`` (NULL over an empty correlation, matching DuckDB). The grouped
+    aggregate's NULL-key group is dropped before the join so the LEFT join is
+    NULL-safe: SQL ``inner.k = outer.k`` matches nothing when either side is NULL,
+    but cuDF ``merge`` would match NULL==NULL, so the NULL-key group is removed and
+    a NULL outer key finds no match -> null-pad (MAX/MIN/SUM -> NULL; COUNT -> the
+    COALESCE default 0)."""
+    outer_key, inner_key, local_conjuncts = corr
+    _set_local_where(inner_select, local_conjuncts)
+    subplan = _build_query(inner_select, schema)
+    _require_global_aggregate(subplan)
+    # subplan is Aggregate(input, [], [(agg, orig_name)]) -- inject the correlation
+    # key as the GROUP BY key. Peek through Sort/Limit to the global aggregate.
+    core = subplan
+    while isinstance(core, (Sort, Limit)):
+        core = core.input
+    agg_expr, orig_name = core.aggs[0]
+    grouped = Aggregate(
+        core.input,
+        [(Col(inner_key), name + "_k")],
+        [(agg_expr, orig_name)],
+    )
+    # Rename both outputs to unique names (avoid the optimizer's global column-
+    # name-uniqueness assumption and merge suffix collisions).
+    renamed = Project(
+        grouped,
+        [(Col(orig_name), name), (Col(name + "_k"), name + "_k")],
+    )
+    # Drop the NULL-key group so the left join is NULL-safe (SQL ``=`` matches
+    # nothing on NULL; cuDF merge would match NULL==NULL).
+    renamed = Filter(renamed, IsNull(Col(name + "_k"), negated=True))
+    plan = Join(plan, renamed, [outer_key], [name + "_k"], "left", None)
+    # COUNT over an empty correlation is 0, not the null-pad NULL; COALESCE the
+    # broadcast column to 0 for COUNT only (MAX/MIN/SUM stay NULL over empty).
+    if agg_expr.func == "COUNT":
+        replacement = exp.Coalesce(
+            this=exp.column(name), expressions=[exp.Literal.number(0)]
+        )
+    else:
+        replacement = exp.column(name)
+    return plan, replacement
 
 
 def _collect_outer_subqueries(node, acc):
