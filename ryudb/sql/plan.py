@@ -163,6 +163,21 @@ class Insert:
 
 
 @dataclass
+class Delete:
+    """Write node: tombstone rows of ``DELETE FROM t [WHERE pred]`` (step 9).
+
+    A non-relational leaf (no ``input``), like ``Insert``. ``predicate`` is the
+    optional WHERE row-selector (``None`` => delete every visible row). The
+    executor evaluates it against the visible snapshot, collects the PK values
+    of the matched rows, and stores them as a tombstone batch (see
+    ``Engine._delete``). Requires a declared PRIMARY KEY on ``t`` (row identity
+    is by PK value, not position)."""
+
+    table: str
+    predicate: Expr | None = None
+
+
+@dataclass
 class TxnControl:
     """Transaction-control leaf (Phase 2 step 5): BEGIN / COMMIT / ROLLBACK.
 
@@ -174,7 +189,7 @@ class TxnControl:
     kind: str  # "begin" | "commit" | "rollback"
 
 
-PlanNode = Scan | Filter | Project | Join | Aggregate | Sort | Limit | Insert | TxnControl
+PlanNode = Scan | Filter | Project | Join | Aggregate | Sort | Limit | Insert | Delete | TxnControl
 
 
 def walk(node: PlanNode):
@@ -208,6 +223,8 @@ def exprs_in(node: PlanNode) -> list[Expr]:
         return [e for e, _ in node.keys]
     if isinstance(node, Join):
         return []
+    if isinstance(node, Delete):
+        return [node.predicate] if node.predicate is not None else []
     return []
 
 
@@ -240,6 +257,9 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
     if isinstance(node, Insert):
         cols = ",".join(node.columns) if node.columns else "*"
         return f"{pad}Insert({node.table} cols={cols} rows={len(node.rows)})"
+    if isinstance(node, Delete):
+        pred = "" if node.predicate is None else f" WHERE {_estr(node.predicate)}"
+        return f"{pad}Delete({node.table}{pred})"
     if isinstance(node, TxnControl):
         return f"{pad}TxnControl({node.kind})"
     return f"{pad}<{type(node).__name__}>"

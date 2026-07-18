@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 
 import cudf
 import pandas as pd
@@ -22,6 +23,7 @@ from ..sql.parse import ParseError, parse
 from ..sql.plan import (
     Aggregate,
     Col,
+    Delete,
     Filter,
     Insert,
     Join,
@@ -46,6 +48,15 @@ from .fused import (
 from .ops import _literal, eval_expr
 
 _AGG_METHOD = {"SUM": "sum", "AVG": "mean", "MIN": "min", "MAX": "max", "COUNT": "count"}
+
+# Insertion-timestamp sentinel for in-txn buffered writes (step 9). The
+# timestamp-aware DELETE anti-join only removes a row when a matching tombstone
+# has ``tomb_ts >= ins_ts``; a buffered insert (no commit_ts yet) is tagged
+# ``+inf`` so it survives every committed tombstone (it is newer than anything
+# committed), and a buffered tombstone (also ``+inf``) removes every committed
+# row and every buffered insert of the same PK (read-your-writes). ``1 << 62``
+# is far above any realistic monotonic commit_ts (which starts at 1).
+_INS_INF = 1 << 62
 
 # Non-standard snapshot/restore SQL (sqlglot has no node for these). Pre-compiled
 # and guarded by a cheap prefix check in Engine.sql/explain so the regex never
@@ -97,8 +108,11 @@ class Engine:
         # Disabled (no-op) when there is no data dir, mirroring Catalog gating.
         self._wal: WAL = WAL(wal_path(catalog.data_dir))
         max_ts = 0
-        for cts, table, frame in self._wal.replay():
-            self.delta.append(table, frame, cts)
+        for cts, table, kind, frame in self._wal.replay():
+            if kind == "tombstone":
+                self.delta.append_tombstone(table, frame, cts)
+            else:
+                self.delta.append(table, frame, cts)
             max_ts = max(max_ts, cts)
         self._commit_ts = max_ts
 
@@ -218,37 +232,49 @@ class Engine:
         txn = self._txn
         if txn is None:
             raise RuntimeError("COMMIT without an active transaction")
-        # Flush the txn's buffered batches to the shared delta under one new ts ->
-        # atomic commit (all-or-nothing). Buffer append order is preserved, so the
-        # post-commit visible series (base ++ batches_at(snapshot) ++ buffer) is
+        # Flush the txn's buffered INSERTs AND DELETE tombstones to the shared
+        # delta under one new ts -> atomic commit (all-or-nothing). Buffer append
+        # order is preserved, so the post-commit visible series
+        # (base ++ insert_batches_at) anti-join tombstone_batches_at is
         # byte-identical to the in-txn read-your-writes series. Step 6 routes the
         # flush through _write_commit so the whole commit is one durable WAL
         # record (atomic on the disk side too), written+fsync'd before the
-        # in-memory delta mutates.
-        batches = [(t, f) for t in txn.tables() for f in txn.buffer_batches(t)]
+        # in-memory delta mutates. Step 9: batches are (table, kind, frame) so a
+        # mixed INSERT+DELETE commit is one record with per-batch kind.
+        batches: list[tuple[str, str, cudf.DataFrame]] = [
+            (t, "insert", f) for t in txn.tables() for f in txn.buffer_batches(t)
+        ] + [
+            (t, "tombstone", f) for t in txn.tombstone_tables() for f in txn.tombstone_batches(t)
+        ]
         self._write_commit(batches)
         self._txn = None
 
-    def _write_commit(self, batches: list[tuple[str, cudf.DataFrame]]) -> int:
-        """The single durable-commit seam used by both the autocommit INSERT path
-        and the explicit txn COMMIT path.
+    def _write_commit(self, batches: list[tuple[str, str, cudf.DataFrame]]) -> int:
+        """The single durable-commit seam used by both the autocommit INSERT/DELETE
+        paths and the explicit txn COMMIT path.
 
-        Allocates one new commit_ts, writes+fsyncs a single WAL record holding
-        every batch in ``batches`` (one record per commit => commit atomicity is
-        either a fully CRC-valid durable record or a discarded torn tail), and
-        ONLY THEN appends the batches to the in-memory delta in the given order.
-        A crash after the fsync but before the in-memory append is recovered by
-        WAL replay; a crash during the write leaves a torn tail the next replay
-        discards -- so a commit is all-or-nothing on both sides of a restart. The
-        in-memory append order is identical to today's, preserving the MVCC
-        byte-identical invariant. Empty ``batches`` bumps the counter but writes
-        no WAL record (the counter is recovered as max replayed ts). Returns ts.
+        ``batches`` is a list of ``(table, kind, frame)`` where ``kind`` is
+        ``"insert"`` or ``"tombstone"`` (step 9). Allocates one new commit_ts,
+        writes+fsyncs a single WAL record holding every batch with its kind (one
+        record per commit => commit atomicity is either a fully CRC-valid durable
+        record or a discarded torn tail), and ONLY THEN appends the batches to the
+        in-memory delta in the given order -- inserts to ``delta.append``,
+        tombstones to ``delta.append_tombstone``. A crash after the fsync but
+        before the in-memory append is recovered by WAL replay; a crash during
+        the write leaves a torn tail the next replay discards -- so a commit is
+        all-or-nothing on both sides of a restart. The in-memory append order is
+        identical to today's, preserving the MVCC byte-identical invariant. Empty
+        ``batches`` bumps the counter but writes no WAL record (the counter is
+        recovered as max replayed ts). Returns ts.
         """
         ts = self._next_commit_ts()
         self._wal.write_commit(ts, batches)  # durable BEFORE in-memory mutation
-        for table, frame in batches:
-            self.delta.append(table, frame, ts)
-        for table in dict.fromkeys(t for t, _ in batches):
+        for table, kind, frame in batches:
+            if kind == "tombstone":
+                self.delta.append_tombstone(table, frame, ts)
+            else:
+                self.delta.append(table, frame, ts)
+        for table in dict.fromkeys(t for t, _, _ in batches):
             self._invalidate_table_caches(table)
         return ts
 
@@ -367,7 +393,30 @@ class Engine:
                 continue
             info = self.catalog.get(table)
             merged = self._scan(table, None)  # base ++ ALL committed batches (no txn active)
-            tbl = pa.Table.from_pandas(merged.to_pandas(), preserve_index=False).cast(info.schema)
+            # Cast the merged frame to the on-disk dtypes from ``info.schema``
+            # (DECIMAL/DATE fidelity) WITHOUT adopting its pandas metadata
+            # verbatim: ``info.schema`` was captured from the ORIGINAL base, so
+            # its ``index_columns`` encodes that base's RangeIndex ``stop`` (the
+            # original row count). After any INSERT/DELETE the row count differs,
+            # and cudf would reconstruct a wrong-length index on re-read
+            # ("Length mismatch"). Drop the ``index_columns`` hint (cudf then
+            # builds a default RangeIndex from the actual row count) while
+            # keeping the per-column dtype hints that make the typed re-read
+            # faithful. (Step 9: surfaced by delete-then-checkpoint, but the same
+            # bug affected insert-checkpoint on object-string tables.)
+            src = pa.Table.from_pandas(merged.to_pandas(), preserve_index=False)
+            md = dict(info.schema.metadata or {})
+            pandas_bytes = md.get(b"pandas")
+            if pandas_bytes is not None:
+                # Only touch pandas metadata when info.schema already carries it
+                # (the typed-engine schema has none -- adding a partial dict
+                # missing ``columns`` would break cudf's reader). Zero out
+                # ``index_columns`` so cudf builds a default RangeIndex from the
+                # actual row count; keep the per-column ``columns`` hints.
+                pm = json.loads(pandas_bytes)
+                pm["index_columns"] = []
+                md[b"pandas"] = json.dumps(pm).encode()
+            tbl = src.cast(pa.schema(list(info.schema), metadata=md or None))
             d = os.path.dirname(info.paths[0])
             final = os.path.join(d, "ryudb_base.parquet")
             tmp = final + ".tmp"
@@ -462,6 +511,24 @@ class Engine:
         # read and a future append is visible with no invalidation. No pending
         # rows -> return base unchanged (zero cost).
         if self.has_pending(table):
+            # Step 9: a DELETE tombstone is anti-joined in _merge_delta on ALL
+            # primary-key columns, but a column-projected base may have dropped
+            # some PK cols (e.g. ``SELECT count(*)`` projects to one column). When
+            # tombstones are live, read the FULL base so every PK col is present,
+            # merge, then re-project to the requested columns in storage.scan's
+            # sorted order. Insert-only deltas don't reference PK cols, so the
+            # projected base is kept for them (column pruning + warm cache
+            # preserved). Tombstones are transient (cleared at checkpoint), so the
+            # full-base read only applies during a live tombstone.
+            has_tomb = self.delta.has_tombstones(table) or (
+                self._txn is not None and self._txn.has_tombstone(table)
+            )
+            if has_tomb:
+                full_base = scan(self.catalog.get(table), None)
+                merged = self._merge_delta(full_base, table)
+                if columns is not None:
+                    merged = merged[sorted(columns)]
+                return merged
             return self._merge_delta(base, table)
         return base
 
@@ -484,23 +551,86 @@ class Engine:
         frames are appended in the same order at COMMIT, so the visible series is
         byte-identical pre/post commit -- which is what makes COMMIT/ROLLBACK/
         RESTORE cache invalidation a safe over-invalidation.
+
+        Phase 2 step 9 (timestamp-aware tombstone anti-join): every visible row is
+        tagged with an insertion ts (``_ins_ts``: base=0, each committed insert
+        batch=its ``commit_ts``, in-txn buffered insert=``_INS_INF``). A tombstone
+        (PK values + its ``commit_ts``) removes a row iff a matching tombstone has
+        ``tomb_ts >= ins_ts`` -- i.e. only rows that existed at delete time. This
+        is what lets a DELETE followed by a same-PK reinsert (at a newer ts) work:
+        the reinsert's ``ins_ts`` exceeds the tombstone's ``ts``, so it survives.
+        Per PK we reduce the tombstones to ``max(tomb_ts)`` and keep rows where
+        that max is below the row's ``ins_ts`` (or no tombstone matches). cuDF merge
+        has no ``indicator=`` support, so the anti-join is a left merge on the PK
+        cols + a keep-where-null-or-less filter. Requires a declared PK (DELETE
+        enforces this); a tombstoned table with no PK is unreachable.
         """
         if self._txn is not None:
-            batches = self.delta.batches_at(table, self._txn.snapshot_ts) \
-                + self._txn.buffer_batches(table)
+            ins_batches = self.delta.batches_at_with_ts(table, self._txn.snapshot_ts)
+            buf_inserts = self._txn.buffer_batches(table)
+            tomb = self.delta.tombstones_at_with_ts(table, self._txn.snapshot_ts)
+            buf_tomb = self._txn.tombstone_batches(table)
         else:
-            batches = self.delta.batches(table)
-        if not batches:
+            ins_batches = self.delta.batches_with_ts(table)
+            buf_inserts = []
+            tomb = self.delta.tombstones_with_ts(table)
+            buf_tomb = []
+        if not ins_batches and not buf_inserts and not tomb and not buf_tomb:
             return base
         cols = list(base.columns)
-        parts = [base]
-        for b in batches:
+        # Tag every source with its insertion ts (base=0, committed batch=ts,
+        # buffered insert=+inf). ``base.assign`` returns a fresh frame so the
+        # cached base is never mutated; batch slices are copies (see _insert).
+        parts: list[cudf.DataFrame] = [base.assign(_ins_ts=0)]
+        for ts, b in ins_batches:
             sub = b[cols]
             for c in cols:
                 if sub[c].dtype != base[c].dtype:
                     sub[c] = sub[c].astype(base[c].dtype)
+            sub["_ins_ts"] = ts
             parts.append(sub)
-        return cudf.concat(parts, axis=0).reset_index(drop=True)
+        for b in buf_inserts:
+            sub = b[cols]
+            for c in cols:
+                if sub[c].dtype != base[c].dtype:
+                    sub[c] = sub[c].astype(base[c].dtype)
+            sub["_ins_ts"] = _INS_INF
+            parts.append(sub)
+        merged = cudf.concat(parts, axis=0).reset_index(drop=True)
+        # Tombstones: committed carry their ts, buffered carry +inf (removes
+        # committed rows + buffered inserts of the same PK -> read-your-writes).
+        tomb_entries: list[tuple[int, cudf.DataFrame]] = list(tomb) + [
+            (_INS_INF, t) for t in buf_tomb
+        ]
+        if tomb_entries:
+            pk = self.catalog.get(table).constraints.primary_key
+            if pk is not None:
+                tkeys_parts = []
+                for ts, t in tomb_entries:
+                    tt = t[list(pk)].copy()
+                    tt["_tomb_ts"] = ts
+                    tkeys_parts.append(tt)
+                tkeys = cudf.concat(tkeys_parts, axis=0)
+                # max tombstone ts per PK (the most recent delete wins; older
+                # tombstones for the same PK are subsumed).
+                tomb_max = (
+                    tkeys.groupby(list(pk))["_tomb_ts"].max().reset_index()
+                )
+                # Align tombstone key dtypes to the merged (base) series before
+                # the join -- same nullable-Int64-vs-int64 trap as _enforce_unique.
+                for c in pk:
+                    if str(tomb_max[c].dtype) != str(merged[c].dtype):
+                        tomb_max[c] = tomb_max[c].astype(merged[c].dtype)
+                merged = merged.merge(tomb_max, on=list(pk), how="left")
+                # Non-matching rows get NaN _tomb_ts; fill with -1 (below every
+                # real commit_ts >= 0) so a single clean comparison keeps them:
+                # keep iff the newest matching tombstone predates the row's
+                # insertion (``tomb_ts < ins_ts``). This avoids cuDF's NA-boolean
+                # ``|`` (which yields null, not True, for the isna side).
+                merged["_tomb_ts"] = merged["_tomb_ts"].fillna(-1)
+                keep = merged["_tomb_ts"] < merged["_ins_ts"]
+                merged = merged[keep].drop(columns=["_tomb_ts"])
+        return merged.drop(columns=["_ins_ts"]).reset_index(drop=True)
 
     def _enforce_unique(self, table: str, frame: "cudf.DataFrame") -> None:
         """Reject INSERT rows that violate a declared PRIMARY KEY or UNIQUE
@@ -650,8 +780,57 @@ class Engine:
             self._txn.buffer_append(node.table, frame)
             self._invalidate_table_caches(node.table)
         else:
-            self._write_commit([(node.table, frame)])
+            self._write_commit([(node.table, "insert", frame)])
         return len(frame)
+
+    def _delete(self, node: Delete) -> int:
+        """Delete rows matching ``DELETE FROM t [WHERE pred]`` (Phase 2 step 9).
+
+        Evaluates the predicate (if any) against the currently-visible snapshot
+        of ``t`` (base ++ committed inserts, tombstones already applied, in-txn
+        read-your-writes), collects the **primary-key values** of the matched
+        rows, and stores them as a tombstone batch. The read path anti-joins
+        tombstones out in ``_merge_delta``. Only rows existing at delete time are
+        tombstoned (correct MVCC: a future INSERT of the same PK is allowed --
+        ``_enforce_unique`` sees the tombstoned PK as gone). Autocommit routes
+        through ``_write_commit`` (durable, all-or-nothing); in a txn the
+        tombstone is buffered (read-your-writes). Returns the count of rows
+        deleted (matched the predicate against the visible snapshot).
+
+        Requires a declared PRIMARY KEY (row identity is by PK value, not row
+        position -- ``storage.scan`` has no row ids and ``_merge_delta`` resets
+        the index). Cost is a full-column scan of the visible snapshot (naive,
+        like step 8's PK scan -- correct first; index-accelerated DELETE is a
+        future optimization).
+        """
+        info = self.catalog.get(node.table)
+        if info is None:
+            raise RuntimeError(f"unknown table: {node.table}")
+        pk = info.constraints.primary_key
+        if pk is None:
+            raise RuntimeError(
+                f"DELETE requires a declared PRIMARY KEY on {node.table}"
+            )
+        # Visible snapshot to delete from. _scan applies committed tombstones
+        # already, so a second DELETE with the same predicate sees fewer rows.
+        visible = self._scan(node.table, None)
+        if node.predicate is not None:
+            mask = eval_expr(node.predicate, visible)
+            if isinstance(mask, cudf.Series):
+                targets = visible[mask]
+            else:
+                targets = visible if mask else visible.iloc[0:0]
+        else:
+            targets = visible
+        if len(targets) == 0:
+            return 0
+        tombstone = targets[list(pk)]  # PK values of the rows to delete
+        if self._txn is not None:
+            self._txn.tombstone_append(node.table, tombstone)
+            self._invalidate_table_caches(node.table)
+        else:
+            self._write_commit([(node.table, "tombstone", tombstone)])
+        return len(targets)
 
     def sql(self, sql: str) -> "cudf.DataFrame | int | None":
         # Non-standard snapshot/restore bypass sqlglot entirely (no AST node).
@@ -667,11 +846,12 @@ class Engine:
                 self.restore(m.group(1))
                 return None
         plan = parse(sql, self.catalog.schema_dict())
-        # INSERT and TxnControl are non-relational leaves with no predicate /
-        # projection / join to optimize; bypass the optimizer (the rules are
-        # pass-through-safe today, but a future Select-shaped rule could choke on
-        # an Insert/TxnControl root).
-        if not isinstance(plan, (Insert, TxnControl)):
+        # INSERT, DELETE, and TxnControl are non-relational leaves with no
+        # predicate / projection / join to optimize; bypass the optimizer (the
+        # rules are pass-through-safe today, but a future Select-shaped rule
+        # could choke on an Insert/Delete/TxnControl root). A DELETE's WHERE is a
+        # row-selector evaluated in _delete, not a relational Filter.
+        if not isinstance(plan, (Insert, Delete, TxnControl)):
             plan = optimize(
                 plan,
                 self.catalog.schema_dict(),
@@ -691,7 +871,7 @@ class Engine:
             if m:
                 return f"RestoreToSnapshot({m.group(1)})"
         plan = parse(sql, self.catalog.schema_dict())
-        if not isinstance(plan, (Insert, TxnControl)):
+        if not isinstance(plan, (Insert, Delete, TxnControl)):
             plan = optimize(plan, self.catalog.schema_dict(), self.catalog.stats_dict())
         return pretty(plan)
 
@@ -703,6 +883,8 @@ class Engine:
             return self._scan(node.table, node.columns)
         if isinstance(node, Insert):
             return self._insert(node)
+        if isinstance(node, Delete):
+            return self._delete(node)
         if isinstance(node, TxnControl):
             self._txn_control(node)
             return None
