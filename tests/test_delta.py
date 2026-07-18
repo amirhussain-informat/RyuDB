@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import cudf
 import pandas as pd
-import pytest
 
 from ryudb.delta import DeltaStore
 

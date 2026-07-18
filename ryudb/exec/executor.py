@@ -24,6 +24,7 @@ from ..sql.plan import (
     Aggregate,
     Col,
     Delete,
+    Derived,
     Distinct,
     Expr,
     Filter,
@@ -1053,6 +1054,12 @@ class Engine:
     def _exec(self, node: PlanNode) -> "cudf.DataFrame | int | None":
         if isinstance(node, Scan):
             return self._scan(node.table, node.columns)
+        if isinstance(node, Derived):
+            # A FROM-subquery: the subplan's output frame IS the derived relation
+            # (its columns are named by the subplan's top Project/Aggregate). No
+            # caching -- a derived table re-executes per call, like the semi/anti
+            # join subplans.
+            return self._exec(node.input)
         if isinstance(node, Insert):
             return self._insert(node)
         if isinstance(node, Delete):
