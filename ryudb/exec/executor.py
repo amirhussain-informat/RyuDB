@@ -24,6 +24,7 @@ from ..sql.plan import (
     Aggregate,
     Col,
     Delete,
+    Expr,
     Filter,
     Insert,
     Join,
@@ -1066,13 +1067,7 @@ class Engine:
         if isinstance(node, Join):
             left = self._exec(node.left)
             right = self._exec(node.right)
-            return left.merge(
-                right,
-                left_on=node.on_left,
-                right_on=node.on_right,
-                how=node.how,
-                suffixes=("_x", "_y"),
-            )
+            return self._join(node, left, right)
         if isinstance(node, Aggregate):
             return self._aggregate(node)
         if isinstance(node, Project):
@@ -1082,6 +1077,167 @@ class Engine:
         if isinstance(node, Limit):
             return self._limit(node)
         raise NotImplementedError(f"no executor for {type(node).__name__}")
+
+    # ------------------------------------------------------------------ #
+    # Joins
+    # ------------------------------------------------------------------ #
+    def _join(self, node: Join, left: cudf.DataFrame, right: cudf.DataFrame) -> cudf.DataFrame:
+        """Lower a Join node onto cuDF ``merge`` (all on GPU).
+
+        ``how`` is the cuDF merge kind; cuDF spells FULL OUTER as ``"outer"`` (it
+        has no ``"full"``). An ON residual (``node.on_predicate``) is applied
+        *inside* the join: for inner/cross it is a plain post-filter (no
+        null-padding to protect), but for outer joins it must filter only matched
+        rows and leave the null-padded unmatched rows alone -- otherwise the
+        residual would silently turn the outer join into an inner join. cuDF merge
+        cannot report which rows matched (no ``indicator``) and same-named keys
+        collapse to one column, so the outer-with-residual case renames both
+        sides' keys to temp columns, computes a matched mask from their nullness,
+        applies the residual to matched rows only, then restores the key names.
+        """
+        how = node.how
+        merge_how = "outer" if how == "full" else how
+        pred = node.on_predicate
+
+        if how == "cross":
+            m = left.merge(right, how="cross", suffixes=("_x", "_y"))
+            return self._filter_on_predicate(m, pred)
+
+        if how == "inner" or pred is None:
+            # No outer null-padding to protect. Pure-equi outer joins have pred
+            # None and rely on cuDF merge alone (FULL -> "outer").
+            m = left.merge(
+                right,
+                left_on=node.on_left,
+                right_on=node.on_right,
+                how=merge_how,
+                suffixes=("_x", "_y"),
+            )
+            return self._filter_on_predicate(m, pred)
+
+        return self._outer_join_with_predicate(node, left, right)
+
+    def _filter_on_predicate(self, m: cudf.DataFrame, pred: Expr | None) -> cudf.DataFrame:
+        """Apply a predicate as a plain post-filter (inner/cross semantics: a row
+        with an NA predicate result is dropped -- SQL three-valued logic)."""
+        if pred is None:
+            return m
+        mask = eval_expr(pred, m)
+        if isinstance(mask, cudf.Series):
+            return m[mask.fillna(False)]
+        return m if mask else m.iloc[0:0]
+
+    def _outer_join_with_predicate(
+        self, node: Join, left: cudf.DataFrame, right: cudf.DataFrame
+    ) -> cudf.DataFrame:
+        """Outer join with a non-equi ON residual.
+
+        Semantics: a preserved-side row survives iff it has at least one match on
+        the equi keys whose ON residual is true (it is emitted joined to that
+        match); otherwise it is emitted once, null-padded on the other side. This
+        differs from a naive ``merge(how=left)`` + filter: a left row whose key
+        matches a right row but whose residual is false must still be null-padded,
+        not dropped. So we build the *satisfied* joined rows (inner key-join,
+        filtered by the residual) and then null-pad every preserved-side row that
+        has no satisfied match (by row id, so duplicate keys are handled).
+
+        FULL outer null-pads both sides; RIGHT null-pads the right (the optimizer
+        rewrites RIGHT to LEFT on side-swap, but a user-written RIGHT JOIN reaches
+        us directly). cuDF has no merge ``indicator``, so matchedness is derived
+        from row-id membership, not a merge flag.
+        """
+        how = node.how
+        on_left, on_right = node.on_left, node.on_right
+        # Temp key names so both sides' keys survive (cuDF collapses same-named
+        # keys to one column). rename(columns=) maps old->new -> {original: temp}.
+        l_rename = {lk: f"__ryu_l{i}" for i, lk in enumerate(on_left)}
+        r_rename = {rk: f"__ryu_r{i}" for i, rk in enumerate(on_right)}
+        lcols = list(l_rename.values())
+        rcols = list(r_rename.values())
+        lr = left.rename(columns=l_rename).reset_index(drop=True)
+        rr = right.rename(columns=r_rename).reset_index(drop=True)
+        # Row ids identify preserved-side rows for null-padding (handles duplicate
+        # keys correctly -- each row is independent, not deduped by key value).
+        lr["__lrid"] = cudf.Series(range(len(lr)), dtype="int64")
+        rr["__rrid"] = cudf.Series(range(len(rr)), dtype="int64")
+
+        # Satisfied rows = inner equi-join filtered by the ON residual.
+        m = lr.merge(rr, left_on=lcols, right_on=rcols, how="inner", suffixes=("_x", "_y"))
+        if len(m):
+            pred_mask = eval_expr(node.on_predicate, m)
+            if isinstance(pred_mask, cudf.Series):
+                pred_mask = pred_mask.fillna(False)
+            else:
+                pred_mask = cudf.Series([bool(pred_mask)] * len(m), dtype="bool")
+            sat = m[pred_mask]
+        else:
+            sat = m  # no key matches at all -> everything gets null-padded below
+
+        sat_lrids = sat["__lrid"] if "__lrid" in sat.columns else cudf.Series([], dtype="int64")
+        sat_rrids = sat["__rrid"] if "__rrid" in sat.columns else cudf.Series([], dtype="int64")
+        target_cols = list(sat.columns)
+        dtypes = {c: sat[c].dtype for c in target_cols}
+        lr_cols = list(lr.columns)
+        rr_cols = list(rr.columns)
+
+        pieces: list[cudf.DataFrame] = [sat]
+        if how in ("left", "full"):
+            mask = ~lr["__lrid"].isin(sat_lrids)
+            pieces.append(self._null_pad_rows(lr[mask], keep_cols=lr_cols,
+                                              target_cols=target_cols, dtypes=dtypes))
+        if how in ("right", "full"):
+            mask = ~rr["__rrid"].isin(sat_rrids)
+            pieces.append(self._null_pad_rows(rr[mask], keep_cols=rr_cols,
+                                              target_cols=target_cols, dtypes=dtypes))
+
+        nonempty = [p for p in pieces if len(p)]
+        out = cudf.concat(nonempty, axis=0) if nonempty else sat.iloc[0:0]
+        out = out.drop(columns=["__lrid", "__rrid"], errors="ignore")
+        return self._restore_join_keys(out, on_left, on_right)
+
+    def _null_pad_rows(
+        self, sub: cudf.DataFrame, keep_cols: list[str],
+        target_cols: list[str], dtypes: dict,
+    ) -> cudf.DataFrame:
+        """Build null-padded rows: keep ``keep_cols`` from ``sub``, set the rest of
+        ``target_cols`` to all-NA, typed to match ``dtypes`` so ``cudf.concat``
+        aligns cleanly. Int/bool columns become float NaN, matching cuDF's own
+        outer-merge null-padding. Empty ``sub`` yields an empty frame (filtered
+        out of the concat by the caller)."""
+        if len(sub) == 0:
+            return cudf.DataFrame({c: self._na_series(0, dtypes.get(c)) for c in target_cols})
+        keep = set(keep_cols)
+        cols: dict[str, cudf.Series] = {}
+        for c in target_cols:
+            if c in keep:
+                cols[c] = sub[c].reset_index(drop=True)
+            else:
+                cols[c] = self._na_series(len(sub), dtypes.get(c))
+        return cudf.DataFrame(cols)
+
+    def _na_series(self, n: int, dtype) -> cudf.Series:
+        import numpy as np
+        # int/float/bool -> float NaN (nullable); everything else -> object NA.
+        if dtype is not None and (np.issubdtype(dtype, np.number) or np.issubdtype(dtype, np.bool_)):
+            return cudf.Series([float("nan")] * n, dtype="float64")
+        return cudf.Series([None] * n, dtype="object")
+
+    def _restore_join_keys(
+        self, m: cudf.DataFrame, on_left: list[str], on_right: list[str]
+    ) -> cudf.DataFrame:
+        """Collapse the temp key columns back to the original names. Same-named
+        keys (USING/NATURAL/``ON a.k=b.k``) coalesce into one column (preferring
+        the preserved side's value, falling back to the other for null padding);
+        differently-named keys are restored to both names (matches cuDF's native
+        distinct-key merge output)."""
+        for i, (lk, rk) in enumerate(zip(on_left, on_right)):
+            lc, rc = f"__ryu_l{i}", f"__ryu_r{i}"
+            if lk == rk:
+                m[lc] = m[lc].fillna(m[rc])
+                m = m.drop(columns=[rc]).rename(columns={lc: lk})
+            else:
+                m = m.rename(columns={lc: lk, rc: rk})
+        return m
 
     # ------------------------------------------------------------------ #
     def _aggregate(self, node: Aggregate) -> cudf.DataFrame:

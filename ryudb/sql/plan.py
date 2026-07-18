@@ -122,7 +122,15 @@ class Join:
     right: "PlanNode"
     on_left: list[str]   # columns from the left input
     on_right: list[str]  # columns from the right input (same length)
-    how: str = "inner"   # inner (Phase 1)
+    how: str = "inner"   # inner | left | right | full | cross
+    # Residual ON predicate that is NOT a pure equi-key (e.g. ``ON a=b AND r.x>10``
+    # folds the equi keys into on_left/on_right and the non-equi ``r.x>10`` here).
+    # Kept *separate* from the WHERE Filter so outer-join semantics survive: an ON
+    # residual filters only matched rows, never the null-padded unmatched rows.
+    # ``None`` for USING/NATURAL (no residual) and CROSS. The executor applies it
+    # inside the join (see ``Engine._apply_on_predicate``); the optimizer never
+    # pushes it down (it is not a Filter).
+    on_predicate: Expr | None = None
 
 
 @dataclass
@@ -244,7 +252,7 @@ def exprs_in(node: PlanNode) -> list[Expr]:
     if isinstance(node, Sort):
         return [e for e, _ in node.keys]
     if isinstance(node, Join):
-        return []
+        return [node.on_predicate] if node.on_predicate is not None else []
     if isinstance(node, Delete):
         return [node.predicate] if node.predicate is not None else []
     if isinstance(node, Update):
@@ -266,8 +274,9 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
         return f"{pad}Project({items})\n" + pretty(node.input, indent + 1)
     if isinstance(node, Join):
         on = " AND ".join(f"{lk}={rk}" for lk, rk in zip(node.on_left, node.on_right))
+        on_pred = "" if node.on_predicate is None else f" [{_estr(node.on_predicate)}]"
         return (
-            f"{pad}Join({node.how} on {on})\n"
+            f"{pad}Join({node.how} on {on}{on_pred})\n"
             + pretty(node.left, indent + 1) + "\n"
             + pretty(node.right, indent + 1)
         )

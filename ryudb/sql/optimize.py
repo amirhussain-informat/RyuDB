@@ -4,8 +4,14 @@ Phase 1 rules:
   1. Projection pruning  — each Scan reads only the columns referenced above it.
   2. Predicate pushdown  — conjuncts in a Filter above a Join that reference a
      single table are pushed down to a Filter directly above that table's Scan.
+     For OUTER joins a conjunct is pushed only into the *preserved* side (LEFT ->
+     left, RIGHT -> right); a conjunct on the null-supplying side would drop the
+     null-padded rows and silently turn the outer join into an inner join, so it
+     stays above. FULL/CROSS have no preserved side, so nothing is pushed.
   3. Join-side selection  — when row-count statistics are available, the smaller
-     subtree is placed on the left (build) side of each Join.
+     subtree is placed on the left (build) side of each Join. Swapping a
+     LEFT/RIGHT join rewrites ``how`` (left<->right) so the preserved side stays
+     correct; inner/cross/full are symmetric.
 
 The optimizer assumes unqualified column names are unique across the tables in
 a query (true for TPC-H). If a column name is ambiguous (present in >1 table),
@@ -69,7 +75,8 @@ def prune_projections(plan: PlanNode, schema: Schema) -> PlanNode:
             cols = referenced & table_cols if table_cols else None
             return replace(node, columns=cols)
         if isinstance(node, Join):
-            return Join(rewrite(node.left), rewrite(node.right), node.on_left, node.on_right, node.how)
+            return Join(rewrite(node.left), rewrite(node.right), node.on_left,
+                        node.on_right, node.how, node.on_predicate)
         if isinstance(node, Filter):
             return Filter(rewrite(node.input), node.predicate)
         if isinstance(node, Project):
@@ -104,6 +111,8 @@ def _all_referenced_columns(plan: PlanNode) -> set[str]:
         elif isinstance(node, Join):
             cols.update(node.on_left)
             cols.update(node.on_right)
+            if node.on_predicate is not None:
+                cols |= node.on_predicate.columns()
     return cols
 
 
@@ -145,6 +154,7 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
                 plan.on_left,
                 plan.on_right,
                 plan.how,
+                plan.on_predicate,
             )
         if isinstance(plan, Filter):
             # Push past existing filters; they re-wrap below.
@@ -172,21 +182,44 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
         elif isinstance(node, Limit):
             node = Limit(go(node.input), node.n, node.offset)
         elif isinstance(node, Join):
-            node = Join(go(node.left), go(node.right), node.on_left, node.on_right, node.how)
+            node = Join(go(node.left), go(node.right), node.on_left,
+                        node.on_right, node.how, node.on_predicate)
 
         if isinstance(node, Filter) and isinstance(node.input, Join):
+            join = node.input
+            how = join.how
+            left_tables = subtree_tables(join.left)
+            right_tables = subtree_tables(join.right)
+            join_tables = left_tables | right_tables
+            # A conjunct is safe to push below an OUTER join only into the
+            # *preserved* side. Pushing into the null-supplying side would filter
+            # out the null-padded unmatched rows an outer join must keep, silently
+            # turning it into an inner join. FULL/CROSS have no preserved side, so
+            # nothing is pushed (every conjunct stays above as a true WHERE).
+            if how == "left":
+                pushable_sides = left_tables
+            elif how == "right":
+                pushable_sides = right_tables
+            elif how == "inner":
+                pushable_sides = left_tables | right_tables
+            else:  # full / cross
+                pushable_sides = set()
+
             conjuncts = _split_and(node.predicate)
             pushable: dict[str, list[Expr]] = {}
             remaining: list[Expr] = []
-            join_tables = subtree_tables(node.input)
             for c in conjuncts:
                 ts = tables_of(c) & join_tables
                 if len(ts) == 1:
-                    pushable.setdefault(next(iter(ts)), []).append(c)
+                    t = next(iter(ts))
+                    if t in pushable_sides:
+                        pushable.setdefault(t, []).append(c)
+                    else:
+                        remaining.append(c)
                 else:
                     remaining.append(c)
             if pushable:
-                new_input = insert(node.input, pushable)
+                new_input = insert(join, pushable)
                 if remaining:
                     return Filter(new_input, _conjoin(remaining))
                 return new_input
@@ -220,9 +253,18 @@ def select_join_sides(plan: PlanNode, stats: Stats) -> PlanNode:
             left = go(node.left)
             right = go(node.right)
             if est_rows(right) < est_rows(left):
-                # swap sides so the smaller subtree is the build (left) side
-                return Join(right, left, node.on_right, node.on_left, node.how)
-            return Join(left, right, node.on_left, node.on_right, node.how)
+                # swap sides so the smaller subtree is the build (left) side.
+                # Swapping a LEFT/RIGHT join flips the preserved side, so rewrite
+                # how to match (left<->right); inner/cross/full are symmetric.
+                how = node.how
+                if how == "left":
+                    how = "right"
+                elif how == "right":
+                    how = "left"
+                return Join(right, left, node.on_right, node.on_left,
+                            how, node.on_predicate)
+            return Join(left, right, node.on_left, node.on_right,
+                        node.how, node.on_predicate)
         if isinstance(node, Filter):
             return Filter(go(node.input), node.predicate)
         if isinstance(node, Project):

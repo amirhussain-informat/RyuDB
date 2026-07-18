@@ -177,6 +177,12 @@ def as_sorted(df) -> list[tuple]:
     pdf = df.to_pandas() if hasattr(df, "to_pandas") and not isinstance(df, pd.DataFrame) else df
     if len(pdf) == 0:
         return []
+    # Normalize NULL representations across engines: cuDF null-pads an int/float
+    # column to NaN, DuckDB null-pads a nullable-int column to pd.NA, and both use
+    # NaT for dates. Convert the frame to object and replace every null with
+    # Python None so a row compares equal regardless of which engine produced it.
+    # (1 == 1.0 at tuple comparison, so int/float homogenization is harmless.)
+    pdf = pdf.astype(object).where(pdf.notna(), None)
     pdf = pdf.sort_values(list(pdf.columns)).reset_index(drop=True)
     rows = []
     for _, row in pdf.iterrows():
@@ -187,11 +193,13 @@ def as_sorted(df) -> list[tuple]:
 def _clean(v):
     """Round floats for stable comparison across GPU/CPU float differences.
 
-    A SQL NULL in a decimal/float column arrives as NaN (cuDF ``_coerce_decimals``
-    null -> NaN; DuckDB too); ``NaN != NaN`` would otherwise make every row with a
-    NULL compare unequal to itself, so normalize NaN -> None. The engine never
-    stores a distinct NaN *value* (decimals are finite), so NaN always means NULL.
+    A SQL NULL arrives here already normalized to Python None by ``as_sorted``;
+    any residual NaN (a float column that escaped the object cast) is also
+    normalized to None. The engine never stores a distinct NaN *value* (decimals
+    are finite), so NaN always means NULL.
     """
+    if v is None:
+        return None
     if isinstance(v, float):
         if v != v:  # NaN (SQL NULL in a decimal/float column)
             return None
