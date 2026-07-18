@@ -356,6 +356,28 @@ def _as_str_series(v, df: cudf.DataFrame) -> cudf.Series:
     return s
 
 
+def _as_dt_series(v, df: cudf.DataFrame) -> cudf.Series:
+    """Coerce an evaluated arg to a nanosecond datetime Series aligned to df.
+
+    Storage DATE/TIMESTAMP columns arrive from ``Engine._scan`` as cuDF
+    ``datetime64[ms]`` (storage.scan) or ``datetime64[s]`` (cold-cache path) --
+    never date32/object. Normalizing to ``datetime64[ns]`` makes the EPOCH and
+    DATEDIFF int64 formulas (validated on [ns]) unit-correct: a [ms] column
+    ``.astype('int64')`` gives ms, not ns, so without normalization EPOCH would
+    be off by 1e6. Object/string dates parse via ``cudf.to_datetime``. Scalars
+    broadcast to a Series; a NULL scalar (None/NaT) yields a NaT Series.
+    """
+    if isinstance(v, cudf.Series):
+        s = v
+        if not pd.api.types.is_datetime64_any_dtype(s.dtype):
+            s = cudf.to_datetime(s)  # parse string/object dates
+        if str(s.dtype) != "datetime64[ns]":
+            s = s.astype("datetime64[ns]")
+        return s
+    ts = v if isinstance(v, pd.Timestamp) else pd.Timestamp(v)
+    return cudf.Series([ts] * len(df), index=df.index).astype("datetime64[ns]")
+
+
 def _scalar_int(v):
     """An int bound for SUBSTR/LEFT/RIGHT. Must be a python scalar (cuDF
     str.slice takes scalar bounds); a column-typed bound is unsupported."""
@@ -480,4 +502,183 @@ def _func(e: Func, df: cudf.DataFrame):
         sign = -1.0 if v < 0 else 1.0
         return math.floor(abs(v) * f + 0.5) / f * sign
 
+    # --- date/time functions ------------------------------------------- #
+    if name == "extract":
+        return _extract(args, df)
+    if name in ("date_trunc", "date_add", "date_sub", "datediff",
+                "dayname", "monthname", "last_day", "strftime",
+                "current_date", "current_timestamp"):
+        return _datetime_func(name, args, df)
+
     raise NotImplementedError(f"unsupported scalar function: {name}")
+
+
+# --------------------------------------------------------------------------- #
+# Date/time functions (EXTRACT/YEAR/.../DATE_TRUNC/DATEDIFF/date +/- INTERVAL/
+# DAYNAME/MONTHNAME/LAST_DAY/STRFTIME/CURRENT_DATE/CURRENT_TIMESTAMP). Storage
+# DATE/TIMESTAMP columns arrive as cuDF datetime64 (normalized to [ns] by
+# _as_dt_series); most parts use the GPU ``.dt`` accessor. cuDF ``.dt.floor``
+# lacks 'Y'/'M', so year/month truncation and month/year interval addition use a
+# pandas ``to_period``/``DateOffset`` fallback. NULL -> NaT -> NaN (normalized
+# to None by conftest.as_sorted); the manual int64 paths (EPOCH, DATEDIFF
+# hour/min/sec) mask NaT explicitly since ``astype('int64')`` turns NaT into a
+# sentinel, not NaN.
+# --------------------------------------------------------------------------- #
+
+_EXTRACT_FIELD = {
+    "YEAR": "year", "MONTH": "month", "DAY": "day",
+    "HOUR": "hour", "MINUTE": "minute", "SECOND": "second",
+}
+
+
+def _extract(args, df: cudf.DataFrame):
+    v = eval_expr(args[0], df)
+    field = str(eval_expr(args[1], df)).upper()
+    if not isinstance(v, cudf.Series):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        ts = pd.Timestamp(v)
+        if field == "DOW":
+            return int((ts.weekday() + 1) % 7)
+        if field == "DOY":
+            return int(ts.timetuple().tm_yday)
+        if field == "EPOCH":
+            return float(ts.timestamp())
+        return int(getattr(ts, _EXTRACT_FIELD[field]))
+    s = _as_dt_series(v, df)
+    if field in _EXTRACT_FIELD:
+        return getattr(s.dt, _EXTRACT_FIELD[field])
+    if field == "DOY":
+        return s.dt.dayofyear
+    if field == "DOW":
+        return (s.dt.dayofweek + 1) % 7
+    if field == "EPOCH":
+        # s is [ns]; int64 is nanoseconds. Mask NaT (-> sentinel) to NaN.
+        r = s.astype("int64") / 1e9
+        return r.where(s.notna())
+    raise NotImplementedError(f"unsupported EXTRACT field: {field}")
+
+
+# Fixed-length interval units -> nanoseconds per unit (for GPU timedelta). Month/
+# year are variable-length and handled separately via a pandas DateOffset.
+_FIXED_UNIT_NS = {
+    "day": 86_400, "days": 86_400,
+    "week": 7 * 86_400, "weeks": 7 * 86_400,
+    "hour": 3_600, "hours": 3_600,
+    "minute": 60, "minutes": 60,
+    "second": 1, "seconds": 1,
+}
+# cuDF .dt.floor unit codes (no 'Y'/'M' -- those use the pandas to_period path).
+_TRUNC_FLOOR = {"day": "D", "hour": "h", "minute": "min", "second": "s"}
+
+
+def _datetime_func(name, args, df: cudf.DataFrame):
+    if name == "current_date":
+        return pd.Timestamp.now().normalize()
+    if name == "current_timestamp":
+        return pd.Timestamp.now()
+
+    v = eval_expr(args[0], df)
+
+    if name == "dayname":
+        if isinstance(v, cudf.Series):
+            return _as_dt_series(v, df).dt.day_name()
+        return None if v is None or pd.isna(v) else pd.Timestamp(v).day_name()
+    if name == "monthname":
+        if isinstance(v, cudf.Series):
+            return _as_dt_series(v, df).dt.month_name()
+        return None if v is None or pd.isna(v) else pd.Timestamp(v).month_name()
+    if name == "strftime":
+        fmt = str(eval_expr(args[1], df))
+        if isinstance(v, cudf.Series):
+            return _as_dt_series(v, df).dt.strftime(fmt)
+        return None if v is None or pd.isna(v) else pd.Timestamp(v).strftime(fmt)
+    if name == "last_day":
+        if isinstance(v, cudf.Series):
+            s = _as_dt_series(v, df)
+            # MonthEnd(0) rolls to the current month's last day but keeps the time
+            # component; DuckDB LAST_DAY returns a DATE at midnight, so floor.
+            last = (s.to_pandas() + pd.offsets.MonthEnd(0)).dt.floor("D")
+            return cudf.Series(last, index=df.index).astype("datetime64[ns]")
+        if v is None or pd.isna(v):
+            return None
+        return (pd.Timestamp(v) + pd.offsets.MonthEnd(0)).normalize()
+
+    if name == "date_trunc":
+        unit = str(eval_expr(args[1], df)).lower()
+        if isinstance(v, cudf.Series):
+            s = _as_dt_series(v, df)
+            if unit in ("year", "years"):
+                return cudf.Series(s.to_pandas().dt.to_period("Y").dt.to_timestamp(),
+                                   index=df.index).astype("datetime64[ns]")
+            if unit in ("month", "months"):
+                return cudf.Series(s.to_pandas().dt.to_period("M").dt.to_timestamp(),
+                                   index=df.index).astype("datetime64[ns]")
+            if unit in _TRUNC_FLOOR:
+                return s.dt.floor(_TRUNC_FLOOR[unit])
+            raise NotImplementedError(f"unsupported DATE_TRUNC unit: {unit}")
+        if v is None or pd.isna(v):
+            return None
+        ts = pd.Timestamp(v)
+        if unit in ("year", "years"):
+            return ts.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        if unit in ("month", "months"):
+            return ts.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if unit in ("day", "days"):
+            return ts.normalize()
+        if unit in ("hour", "hours"):
+            return ts.replace(minute=0, second=0, microsecond=0)
+        if unit in ("minute", "minutes"):
+            return ts.replace(second=0, microsecond=0)
+        if unit in ("second", "seconds"):
+            return ts.replace(microsecond=0)
+        raise NotImplementedError(f"unsupported DATE_TRUNC unit: {unit}")
+
+    if name in ("date_add", "date_sub"):
+        n = int(eval_expr(args[1], df))
+        unit = str(eval_expr(args[2], df)).lower()
+        sign = 1 if name == "date_add" else -1
+        if unit in _FIXED_UNIT_NS:
+            nsec = n * _FIXED_UNIT_NS[unit] * 10**9
+            off = np.timedelta64(nsec, "ns")
+            if isinstance(v, cudf.Series):
+                return _as_dt_series(v, df) + sign * off
+            if v is None or pd.isna(v):
+                return None
+            return pd.Timestamp(v) + sign * pd.Timedelta(nanoseconds=nsec)
+        if unit in ("month", "months"):
+            off = pd.DateOffset(months=n)
+        elif unit in ("year", "years"):
+            off = pd.DateOffset(years=n)
+        else:
+            raise NotImplementedError(f"unsupported INTERVAL unit: {unit}")
+        delta = off if sign == 1 else -off
+        if isinstance(v, cudf.Series):
+            return cudf.Series(_as_dt_series(v, df).to_pandas() + delta,
+                               index=df.index).astype("datetime64[ns]")
+        if v is None or pd.isna(v):
+            return None
+        return pd.Timestamp(v) + delta
+
+    if name == "datediff":
+        start = eval_expr(args[0], df)
+        end = eval_expr(args[1], df)
+        unit = str(eval_expr(args[2], df)).lower()
+        factor = {"day": 86_400, "hour": 3_600, "minute": 60, "second": 1}.get(
+            unit.rstrip("s") if unit.endswith("s") else unit)
+        if factor is None:
+            raise NotImplementedError(f"unsupported DATEDIFF unit: {unit}")
+        if isinstance(end, cudf.Series) or isinstance(start, cudf.Series):
+            delta = _as_dt_series(end, df) - _as_dt_series(start, df)  # timedelta64[ns]
+            if unit in ("day", "days"):
+                return delta.dt.days
+            r = delta.astype("int64") // (factor * 10**9)
+            return r.where(delta.notna())
+        if end is None or pd.isna(end) or start is None or pd.isna(start):
+            return None
+        delta = pd.Timestamp(end) - pd.Timestamp(start)
+        if unit in ("day", "days"):
+            return int(delta.days)
+        return int(delta.total_seconds() // factor)
+
+    raise NotImplementedError(f"unsupported date function: {name}")

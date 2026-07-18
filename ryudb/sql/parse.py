@@ -26,6 +26,13 @@ clear message.
 Set operators (UNION [ALL] / INTERSECT / EXCEPT) compose two SELECTs into a
 ``SetOp`` node (see ``_build_query`` / ``_build_setop``); DISTINCT set ops use
 cuDF ``drop_duplicates``/``merge`` which are NULL-safe.
+
+Date/time functions (EXTRACT, YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/DAYOFWEEK/
+DAYOFYEAR, DATE_TRUNC, DATEDIFF, date +/- INTERVAL, DAYNAME/MONTHNAME, LAST_DAY,
+STRFTIME, CURRENT_DATE/CURRENT_TIMESTAMP/NOW) lower to the generic ``Func`` node
+(see ``_SCALAR_FUNC_BUILDERS`` and ``_interval_arith``); the cuDF lowering lives
+in ``ops._func``. ``SELECT`` without FROM is still unsupported, so CURRENT_DATE
+etc. require a FROM table (the scalar broadcasts per row).
 """
 
 from __future__ import annotations
@@ -423,6 +430,38 @@ def _expr(node) -> Expr:
         return Coalesce(tuple(args))
     if isinstance(node, exp.Case):
         return _case(node)
+    # sqlglot's *default* dialect (which RyuDB uses) parses several date funcs
+    # oddly: STRFTIME is an exp.Anonymous, DATEDIFF('u', a, b) is a typed but
+    # MANGLED exp.DateDiff (see the exp.DateDiff branch below), and DATE_TRUNC is
+    # a typed exp.DateTrunc (handled in _SCALAR_FUNC_BUILDERS). The anonymous
+    # forms are intercepted here by name so any of these funcs also works when a
+    # dialect emits Anonymous. Other anonymous funcs (AGE, DATE_FORMAT, ...)
+    # still fall through to NotImplementedError below.
+    if isinstance(node, exp.Anonymous):
+        up = node.name.upper()
+        xs = node.expressions
+        if up == "NOW":
+            return Func("current_timestamp", ())
+        if up == "STRFTIME" and len(xs) == 2:
+            return Func("strftime", (_expr(xs[0]), _expr(xs[1])))
+        if up == "DATE_TRUNC" and len(xs) == 2:
+            return Func("date_trunc", (_expr(xs[1]), Lit(xs[0].name.lower(), "str")))
+        if up == "DATEDIFF" and len(xs) == 3:
+            return Func("datediff", (_expr(xs[1]), _expr(xs[2]),
+                                    Lit(xs[0].name.lower(), "str")))
+    # DATEDIFF('unit', start, end): the default dialect mis-parses this as
+    # exp.DateDiff(this=Literal('unit'), expression=start, unit=Var(end)) -- the
+    # end column lands in the `unit` slot, uppercased as if it were a unit
+    # keyword. Reconstruct positionally (end coerced back to a lowercase Col).
+    if isinstance(node, exp.DateDiff):
+        return _datediff(node)
+    # Date +/- INTERVAL: ``d + INTERVAL '1' DAY`` is an exp.Add/Sub whose operand
+    # is an exp.Interval. Intercept before the generic exp.Binary branch (Add/Sub
+    # are Binary subclasses) and lower to a date_add/date_sub Func.
+    if isinstance(node, (exp.Add, exp.Sub)) and (
+        isinstance(node.expression, exp.Interval) or isinstance(node.this, exp.Interval)
+    ):
+        return _interval_arith(node)
     # Scalar functions. DPipe (``||``) and Mod are exp.Binary subclasses, so they
     # must be matched before the generic exp.Binary branch; Trim and the
     # _SCALAR_FUNC_BUILDERS table are exp.Func (not Binary). exp.Mod is NOT in the
@@ -556,6 +595,63 @@ def _round(node) -> Expr:
     return Func("round", (_expr(node.this),))
 
 
+def _interval_arith(node) -> Expr:
+    """Lower ``date +/- INTERVAL n UNIT`` into a ``date_add``/``date_sub`` Func.
+
+    sqlglot gives ``exp.Add``/``exp.Sub`` with an ``exp.Interval`` operand
+    (``Interval(this=Literal(n), unit=Var(UNIT))``). The interval may sit on
+    either side for ``+`` (commutative); for ``-`` only interval-on-the-right is
+    sensible (``INTERVAL - date`` is not), so that raises. Encoded as
+    ``Func(tag, (date_expr, Lit(n,"int"), Lit(unit,"str")))``; the executor picks
+    a GPU timedelta for fixed units (day/week/hour/minute/second) and a pandas
+    ``DateOffset`` fallback for variable units (month/year).
+    """
+    left_iv = isinstance(node.this, exp.Interval)
+    right_iv = isinstance(node.expression, exp.Interval)
+    if right_iv:
+        date_side, iv = node.this, node.expression
+    else:
+        date_side, iv = node.expression, node.this
+    n = int(_literal_value(iv.this))
+    unit = iv.args["unit"].name.lower()
+    if isinstance(node, exp.Add):
+        tag = "date_add"
+    else:
+        if left_iv:
+            raise NotImplementedError("INTERVAL - date is not supported")
+        tag = "date_sub"
+    return Func(tag, (_expr(date_side), Lit(n, "int"), Lit(unit, "str")))
+
+
+def _datediff(node) -> Expr:
+    """Lower ``DATEDIFF(unit, start, end)`` into ``Func("datediff", (start, end, unit))``.
+
+    sqlglot's *default* dialect mis-parses the 3-arg form as
+    ``exp.DateDiff(this=Literal('unit'), expression=start, unit=Var(end))`` -- the
+    end column lands in the ``unit`` slot, uppercased as if it were a unit keyword
+    (DAY/MONTH). Reconstruct positionally: ``start`` from ``expression``, ``end``
+    from the ``unit`` slot coerced back to a lowercase ``Col`` (Var uppercases it;
+    a clean Column is left alone), and ``unit`` from the ``this`` literal. The
+    executor computes ``end - start`` in the unit, matching DuckDB's
+    ``DATEDIFF(unit, a, b) = b - a``.
+    """
+    this = node.this
+    if not isinstance(this, exp.Literal):
+        raise NotImplementedError(
+            "only DATEDIFF(unit, start, end) is supported (got an unrecognized form)"
+        )
+    unit = this.name.lower()
+    start = _expr(node.expression)
+    end_node = node.args.get("unit")
+    if isinstance(end_node, exp.Var):
+        end = Col(end_node.name.lower())
+    elif end_node is not None:
+        end = _expr(end_node)
+    else:
+        raise NotImplementedError("DATEDIFF is missing its end operand")
+    return Func("datediff", (start, end, Lit(unit, "str")))
+
+
 # exp.Type -> (node) -> Func. Looked up by exact type in ``_expr``.
 _SCALAR_FUNC_BUILDERS = {
     exp.Upper: _scalar_unary("upper"),
@@ -575,6 +671,33 @@ _SCALAR_FUNC_BUILDERS = {
     exp.StrPosition: lambda n: Func("strpos", (_expr(n.this), _expr(n.args["substr"]))),
     exp.Left: lambda n: Func("left", (_expr(n.this), _expr(n.expression))),
     exp.Right: lambda n: Func("right", (_expr(n.this), _expr(n.expression))),
+    # --- date/time functions ------------------------------------------- #
+    # Date-part functions reuse the "extract" tag with a FIELD literal arg; the
+    # DAYOFWEEK/DAYOFYEAR function forms become EXTRACT(DOW/DOY FROM x).
+    exp.Year:      lambda n: Func("extract", (_expr(n.this), Lit("YEAR", "str"))),
+    exp.Month:     lambda n: Func("extract", (_expr(n.this), Lit("MONTH", "str"))),
+    exp.Day:       lambda n: Func("extract", (_expr(n.this), Lit("DAY", "str"))),
+    exp.Hour:      lambda n: Func("extract", (_expr(n.this), Lit("HOUR", "str"))),
+    exp.Minute:    lambda n: Func("extract", (_expr(n.this), Lit("MINUTE", "str"))),
+    exp.Second:    lambda n: Func("extract", (_expr(n.this), Lit("SECOND", "str"))),
+    exp.DayOfWeek: lambda n: Func("extract", (_expr(n.this), Lit("DOW", "str"))),
+    exp.DayOfYear: lambda n: Func("extract", (_expr(n.this), Lit("DOY", "str"))),
+    # EXTRACT(field FROM x): this=Var(field), expression=x.
+    exp.Extract: lambda n: Func("extract", (_expr(n.expression), Lit(n.this.name.upper(), "str"))),
+    # DATE_TRUNC(unit, x): the default dialect emits exp.DateTrunc(this=x,
+    # unit=Literal('UNIT')); duckdb-style emits exp.TimestampTrunc(this=x,
+    # unit=Var). Both have .this + args['unit']; .name lowercases either.
+    exp.DateTrunc: lambda n: Func("date_trunc", (_expr(n.this), Lit(n.args["unit"].name.lower(), "str"))),
+    exp.TimestampTrunc: lambda n: Func("date_trunc", (_expr(n.this), Lit(n.args["unit"].name.lower(), "str"))),
+    # STRFTIME(x, fmt): duckdb-style emits exp.TimeToStr(this=x, format=fmt); the
+    # default dialect emits exp.Anonymous (handled in _expr).
+    exp.TimeToStr: lambda n: Func("strftime", (_expr(n.this), _expr(n.args["format"]))),
+    exp.LastDay: lambda n: Func("last_day", (_expr(n.this),)),
+    exp.Dayname: lambda n: Func("dayname", (_expr(n.this),)),
+    exp.Monthname: lambda n: Func("monthname", (_expr(n.this),)),
+    # No-arg current-date/timestamp: scalars broadcast per row by _project.
+    exp.CurrentDate: lambda n: Func("current_date", ()),
+    exp.CurrentTimestamp: lambda n: Func("current_timestamp", ()),
 }
 
 
