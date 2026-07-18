@@ -26,6 +26,7 @@ from typing import Iterable
 from .plan import (
     Aggregate,
     And,
+    Distinct,
     Expr,
     Filter,
     Join,
@@ -101,6 +102,8 @@ def prune_projections(plan: PlanNode, schema: Schema) -> PlanNode:
             return Sort(rewrite(node.input), node.keys)
         if isinstance(node, Limit):
             return Limit(rewrite(node.input), node.n, node.offset)
+        if isinstance(node, Distinct):
+            return Distinct(rewrite(node.input))
         return node
 
     return rewrite(plan)
@@ -202,6 +205,8 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
             return Sort(insert(plan.input, per_table), plan.keys)
         if isinstance(plan, Limit):
             return Limit(insert(plan.input, per_table), plan.n, plan.offset)
+        if isinstance(plan, Distinct):
+            return Distinct(insert(plan.input, per_table))
         return plan
 
     def go(node: PlanNode) -> PlanNode:
@@ -222,6 +227,8 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
             node = Sort(go(node.input), node.keys)
         elif isinstance(node, Limit):
             node = Limit(go(node.input), node.n, node.offset)
+        elif isinstance(node, Distinct):
+            node = Distinct(go(node.input))
         elif isinstance(node, Join):
             node = Join(go(node.left), go(node.right), node.on_left,
                         node.on_right, node.how, node.on_predicate)
@@ -350,6 +357,8 @@ def select_join_sides(plan: PlanNode, stats: Stats) -> PlanNode:
             return Sort(go(node.input), node.keys)
         if isinstance(node, Limit):
             return Limit(go(node.input), node.n, node.offset)
+        if isinstance(node, Distinct):
+            return Distinct(go(node.input))
         return node
 
     return go(plan)

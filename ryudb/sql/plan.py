@@ -318,6 +318,18 @@ class Limit:
 
 
 @dataclass
+class Distinct:
+    """``SELECT DISTINCT`` (Phase F-2a): a row-preserving node that drops
+    duplicate rows from its ``input``. Like ``Sort``/``Limit`` it carries no
+    expressions (it dedups on all of ``input``'s columns) and is placed between
+    the projection and ``Sort``/``Limit`` in ``_build_select``. cuDF
+    ``drop_duplicates`` treats NaN as equal, so DISTINCT is NULL-correct and
+    matches DuckDB. ``DISTINCT ON (...)`` is a different feature (keep-first per
+    key) and is rejected at parse time, not lowered to this node."""
+    input: "PlanNode"
+
+
+@dataclass
 class SetOp:
     """UNION / INTERSECT / EXCEPT over two child relations. ``op`` is
     "union" | "intersect" | "except"; ``distinct`` is False for UNION ALL (the
@@ -398,7 +410,7 @@ class TxnControl:
     kind: str  # "begin" | "commit" | "rollback"
 
 
-PlanNode = Scan | Filter | Project | Join | Aggregate | Window | Sort | Limit | SetOp | Insert | Delete | Update | TxnControl
+PlanNode = Scan | Filter | Project | Join | Aggregate | Window | Sort | Limit | Distinct | SetOp | Insert | Delete | Update | TxnControl
 
 
 def walk(node: PlanNode):
@@ -409,7 +421,7 @@ def walk(node: PlanNode):
 
 
 def children(node: PlanNode) -> list[PlanNode]:
-    if isinstance(node, (Filter, Project, Sort)):
+    if isinstance(node, (Filter, Project, Sort, Distinct)):
         return [node.input]
     if isinstance(node, (Join,)):
         return [node.left, node.right]
@@ -473,6 +485,8 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
         return f"{pad}Sort({k})\n" + pretty(node.input, indent + 1)
     if isinstance(node, Limit):
         return f"{pad}Limit({node.n} offset={node.offset})\n" + pretty(node.input, indent + 1)
+    if isinstance(node, Distinct):
+        return f"{pad}Distinct()\n" + pretty(node.input, indent + 1)
     if isinstance(node, SetOp):
         kw = "DISTINCT" if node.distinct else "ALL"
         return (

@@ -24,6 +24,7 @@ from ..sql.plan import (
     Aggregate,
     Col,
     Delete,
+    Distinct,
     Expr,
     Filter,
     Insert,
@@ -1083,6 +1084,8 @@ class Engine:
             return self._sort(node)
         if isinstance(node, Limit):
             return self._limit(node)
+        if isinstance(node, Distinct):
+            return self._distinct(node)
         if isinstance(node, SetOp):
             return self._setop(node)
         raise NotImplementedError(f"no executor for {type(node).__name__}")
@@ -1571,6 +1574,12 @@ class Engine:
         df = self._exec(node.input)
         end = node.offset + node.n
         return df.iloc[node.offset:end]
+
+    def _distinct(self, node: Distinct) -> cudf.DataFrame:
+        # cuDF drop_duplicates treats NaN as equal, so DISTINCT is NULL-correct
+        # and matches DuckDB's row-distinct semantics.
+        df = self._exec(node.input)
+        return df.drop_duplicates().reset_index(drop=True)
 
     # ------------------------------------------------------------------ #
     # Set operators (UNION [ALL] / INTERSECT / EXCEPT)
