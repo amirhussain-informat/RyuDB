@@ -35,6 +35,7 @@ from .plan import (
     Scan,
     SetOp,
     Sort,
+    Window,
     walk,
 )
 
@@ -91,6 +92,11 @@ def prune_projections(plan: PlanNode, schema: Schema) -> PlanNode:
             return Project(rewrite(node.input), node.items)
         if isinstance(node, Aggregate):
             return Aggregate(rewrite(node.input), node.group_keys, node.aggs)
+        if isinstance(node, Window):
+            # A projection barrier: it passes input columns through, so recurse
+            # into its input's scans (which get pruned by what the window's
+            # funcs AND the nodes above reference).
+            return Window(rewrite(node.input), node.funcs)
         if isinstance(node, Sort):
             return Sort(rewrite(node.input), node.keys)
         if isinstance(node, Limit):
@@ -113,6 +119,9 @@ def _all_referenced_columns(plan: PlanNode) -> set[str]:
                 cols |= e.columns()
             for a, _ in node.aggs:
                 cols |= a.columns()
+        elif isinstance(node, Window):
+            for wf, _ in node.funcs:
+                cols |= wf.columns()
         elif isinstance(node, Sort):
             for e, _ in node.keys:
                 cols |= e.columns()
@@ -187,6 +196,8 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
             return Project(insert(plan.input, per_table), plan.items)
         if isinstance(plan, Aggregate):
             return Aggregate(insert(plan.input, per_table), plan.group_keys, plan.aggs)
+        if isinstance(plan, Window):
+            return Window(insert(plan.input, per_table), plan.funcs)
         if isinstance(plan, Sort):
             return Sort(insert(plan.input, per_table), plan.keys)
         if isinstance(plan, Limit):
@@ -201,6 +212,12 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
             node = Project(go(node.input), node.items)
         elif isinstance(node, Aggregate):
             node = Aggregate(go(node.input), node.group_keys, node.aggs)
+        elif isinstance(node, Window):
+            # A predicate barrier: a WHERE above the Window is built below it
+            # (Filter under Window) and stays there; conjuncts never push across a
+            # Window in normal shapes (changing window partition contents would
+            # be wrong), so just recurse into the input.
+            node = Window(go(node.input), node.funcs)
         elif isinstance(node, Sort):
             node = Sort(go(node.input), node.keys)
         elif isinstance(node, Limit):
@@ -327,6 +344,8 @@ def select_join_sides(plan: PlanNode, stats: Stats) -> PlanNode:
             return Project(go(node.input), node.items)
         if isinstance(node, Aggregate):
             return Aggregate(go(node.input), node.group_keys, node.aggs)
+        if isinstance(node, Window):
+            return Window(go(node.input), node.funcs)
         if isinstance(node, Sort):
             return Sort(go(node.input), node.keys)
         if isinstance(node, Limit):

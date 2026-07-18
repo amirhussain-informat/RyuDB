@@ -84,6 +84,8 @@ from .plan import (
     Star,
     TxnControl,
     Update,
+    Window,
+    WindowFunc,
 )
 from .plan import Aggregate  # noqa: E402 (kept separate for readability)
 
@@ -310,6 +312,24 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
 
     # --- projection / aggregate ------------------------------------------ #
     proj_items = list(sel.expressions)
+    # Window functions are detected and lowered BEFORE the aggregate check:
+    # sqlglot's aggregate-window funcs (SUM/LAG/RANK/.. OVER) are ``exp.AggFunc``
+    # subclasses, so ``_contains_agg`` would otherwise misroute them into the
+    # Aggregate branch (and ``ROW_NUMBER`` is not an AggFunc at all). Each
+    # ``exp.Window`` is rewritten into a ``Window`` plan node and replaced in the
+    # projection item by a bare Column ref to its output; the rewritten items then
+    # flow into the normal Project/Aggregate building.
+    if any(_contains_window(it) for it in proj_items):
+        if sel.args.get("group") or sel.args.get("having"):
+            raise NotImplementedError(
+                "window functions with GROUP BY / HAVING are not supported yet"
+            )
+        plan = _build_window(plan, proj_items, schema)
+    else:
+        # A window in GROUP BY / HAVING (not the projection) is malformed for F-1
+        # and would otherwise be silently dropped (the GROUP BY builder reads keys
+        # from the projection list). Catch it explicitly.
+        _reject_window_outside_projection(sel)
     has_agg = any(_contains_agg(it) for it in proj_items)
     group = sel.args.get("group")
     group_exprs = list(group.expressions) if group else []
@@ -432,6 +452,10 @@ def _expr(node) -> Expr:
         return Star()
     if isinstance(node, exp.Literal):
         return Lit(_literal_value(node), "str" if node.is_string else _infer_num(node))
+    if isinstance(node, exp.Neg):
+        # Unary minus (e.g. a LAG/LEAD default of -1, or -x). Lower to 0 - inner
+        # so NULL/numeric three-valued semantics match DuckDB.
+        return BinOp("-", Lit(0, "int"), _expr(node.this))
     if isinstance(node, exp.Boolean):
         return Lit(bool(node.this), "bool")
     if isinstance(node, exp.Null):
@@ -1416,6 +1440,124 @@ def _conjoin(parts: list[Expr]) -> Expr:
 
 def _contains_agg(node) -> bool:
     return node.find(exp.AggFunc) is not None
+
+
+def _contains_window(node) -> bool:
+    """True if ``node`` (a projection item) has a window function at THIS select's
+    level. By the time projection is built, scalar/EXISTS subqueries have been
+    flattened to Column refs, so ``find(exp.Window)`` cannot descend into a
+    subquery's own window -- any ``exp.Window`` found belongs to this select."""
+    return node.find(exp.Window) is not None
+
+
+def _reject_window_outside_projection(sel):
+    """Raise if a window function appears in GROUP BY / HAVING / QUALIFY (a
+    window in the projection list is supported; one elsewhere is malformed for
+    F-1 and would otherwise be silently dropped)."""
+    for key in ("group", "having", "qualify"):
+        part = sel.args.get(key)
+        if part is not None and part.find(exp.Window) is not None:
+            raise NotImplementedError(
+                "window functions in GROUP BY / HAVING / QUALIFY are not supported"
+            )
+
+
+# Window functions supported in F-1: ranking (ROW_NUMBER/RANK/DENSE_RANK) and
+# offset (LAG/LEAD) require an ORDER BY; aggregate funcs (SUM/COUNT/AVG/MIN/MAX)
+# broadcast over the whole partition (no ORDER BY). Running/cumulative aggregates
+# (an ORDER BY on an aggregate window), explicit frames (ROWS/RANGE BETWEEN),
+# QUALIFY, expression PARTITION BY / ORDER BY keys, and window + GROUP BY are
+# deferred.
+_WINDOW_RANK_FUNCS = {exp.RowNumber: "ROW_NUMBER", exp.Rank: "RANK",
+                      exp.DenseRank: "DENSE_RANK"}
+
+
+def _build_window(plan, proj_items, schema):
+    """Extract every ``exp.Window`` from the projection items, lower each to a
+    ``WindowFunc`` on a shared ``Window`` plan node, and replace the node in its
+    item with a bare Column ref (``_wfN``). An item may contain multiple windows
+    (e.g. ``LAG(w) - LEAD(w) OVER (...)``); each is extracted separately. Mutates
+    ``proj_items`` in place (the sqlglot tree) so the rewritten items flow into
+    the normal Project/Aggregate building. Returns the new plan (Window over the
+    prior plan)."""
+    funcs: list[tuple[WindowFunc, str]] = []
+    n = 0
+    for it in proj_items:
+        for win in list(it.find_all(exp.Window)):
+            n += 1
+            name = f"_wf{n}"
+            wf = _build_one_window(win, schema)
+            funcs.append((wf, name))
+            win.replace(exp.column(name))
+    return Window(plan, funcs=funcs)
+
+
+def _build_one_window(win, schema):
+    """Lower an ``exp.Window`` to a ``WindowFunc`` (or raise for deferred forms)."""
+    fn = win.this
+    part = win.args.get("partition_by") or []
+    partition_keys = []
+    for p in part:
+        e = _expr(p)
+        if not isinstance(e, Col):
+            raise NotImplementedError(
+                "PARTITION BY expressions are not supported yet (only bare columns)"
+            )
+        partition_keys.append(e)
+    order_node = win.args.get("order")
+    order_keys: list[tuple[Expr, bool]] = []
+    if order_node is not None:
+        for o in order_node.expressions:
+            if not isinstance(o, exp.Ordered):
+                raise NotImplementedError(f"unsupported ORDER BY term in window: {o}")
+            e = _expr(o.this)
+            if not isinstance(e, Col):
+                raise NotImplementedError(
+                    "ORDER BY expressions in a window are not supported yet "
+                    "(only bare columns)"
+                )
+            order_keys.append((e, not o.args.get("desc", False)))
+    if win.args.get("spec") is not None:
+        raise NotImplementedError(
+            "window frames (ROWS/RANGE BETWEEN) are not supported yet"
+        )
+
+    offset = None
+    default = None
+    if isinstance(fn, exp.Lag) or isinstance(fn, exp.Lead):
+        func = "LAG" if isinstance(fn, exp.Lag) else "LEAD"
+        arg = _expr(fn.this)
+        off = fn.args.get("offset")
+        dflt = fn.args.get("default")
+        offset = _expr(off) if off is not None else None
+        default = _expr(dflt) if dflt is not None else None
+        if not order_keys:
+            raise NotImplementedError(f"{func} requires ORDER BY in the window")
+    elif type(fn) in _WINDOW_RANK_FUNCS:
+        func = _WINDOW_RANK_FUNCS[type(fn)]
+        arg = None
+        if not order_keys:
+            raise NotImplementedError(f"{func} requires ORDER BY in the window")
+    elif isinstance(fn, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)):
+        func = AGG_FUNCS[type(fn)]
+        arg = _expr(fn.this) if fn.this is not None else Star()
+        if order_keys:
+            raise NotImplementedError(
+                "aggregate window functions with ORDER BY (running/cumulative "
+                "aggregates) are not supported yet"
+            )
+    else:
+        raise NotImplementedError(
+            f"window function {type(fn).__name__} is not supported yet"
+        )
+    return WindowFunc(
+        func=func,
+        arg=arg,
+        partition_keys=tuple(partition_keys),
+        order_keys=tuple(order_keys),
+        offset=offset,
+        default=default,
+    )
 
 
 def _is_star(node) -> bool:
