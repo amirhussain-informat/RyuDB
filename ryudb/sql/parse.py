@@ -65,6 +65,7 @@ from .plan import (
     Coalesce,
     Col,
     Delete,
+    Derived,
     Distinct,
     Expr,
     Filter,
@@ -265,25 +266,25 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
     from_ = sel.args.get("from") or sel.args.get("from_")
     if from_ is None:
         raise NotImplementedError("SELECT without FROM is not supported")
-    base_table, base_alias = _table_ref(from_.this)
-    plan: object = Scan(base_table)
-    aliases: dict[str, str] = {base_alias: base_table}
+    base_source, base_alias, base_name = _table_ref(from_.this, schema)
+    plan: object = base_source
+    aliases: dict[str, str] = {base_alias: base_name}
 
     for j in sel.args.get("joins", []) or []:
-        rtbl, ralias = _table_ref(j.this)
+        r_source, ralias, rname = _table_ref(j.this, schema)
         left_tables = {n.table for n in _walk_scans(plan)}
         how, on_left, on_right, on_predicate = _join_spec(
-            j, aliases, ralias, rtbl, schema, left_tables
+            j, aliases, ralias, rname, schema, left_tables
         )
         plan = Join(
             left=plan,
-            right=Scan(rtbl),
+            right=r_source,
             on_left=on_left,
             on_right=on_right,
             how=how,
             on_predicate=on_predicate,
         )
-        aliases[ralias] = rtbl
+        aliases[ralias] = rname
 
     # --- uncorrelated scalar / EXISTS subqueries -> cross-join broadcast -- #
     # Flatten each uncorrelated scalar subquery (a single-row aggregate, e.g.
@@ -1351,16 +1352,29 @@ def _binop_symbol(node: exp.Binary) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _table_ref(node) -> tuple[str, str]:
+def _table_ref(node, schema) -> tuple[object, str, str]:
+    """Lower a FROM/JOIN table reference into ``(source, alias, name)``.
+
+    ``source`` is a ``Scan(name)`` for a real catalog table or a
+    ``Derived(subplan, alias)`` for a FROM-subquery. ``alias`` is the FROM alias.
+    ``name`` is the routing identity used by ``_join_spec`` / ``_route_join_cols``:
+    the real table name for a base table, or the alias for a derived table
+    (``schema.get(alias)`` is empty, so equi-key routing falls back to table
+    qualifiers -- correct for a derived table whose output columns carry no
+    schema entry). Derived tables require an alias (DuckDB does too)."""
     if isinstance(node, exp.Subquery):
-        raise NotImplementedError("subqueries in FROM are not supported")
+        subplan = _build_query(node.this, schema)
+        alias = node.alias
+        if not alias:
+            raise ParseError("subquery in FROM must have an alias (e.g. FROM (...) AS t)")
+        return Derived(subplan, alias), alias, alias
     if not isinstance(node, exp.Table):
         raise ParseError(f"expected a table reference, got {type(node).__name__}")
     name = node.name
     if not name:
         raise ParseError("table reference has no name")
     alias = node.alias or name
-    return name, alias
+    return Scan(name), alias, name
 
 
 def _join_spec(j, left_aliases, ralias, rtable, schema, left_tables):
@@ -1506,8 +1520,26 @@ def _route_join_cols(lcol, rcol, rtable, schema, left_tables) -> tuple[str, str]
 
 
 def _walk_scans(plan):
-    from .plan import Scan, walk
-    return [n for n in walk(plan) if isinstance(n, Scan)]
+    # Scans in the OUTER scope only. A ``Derived`` (FROM-subquery) is an opaque
+    # relation: its inner scans belong to the subquery's own scope, not this
+    # select's table set, so do NOT descend into it (otherwise ``left_tables``
+    # in _build_select's join routing would be polluted with the subquery's
+    # inner tables and mis-route the outer join keys).
+    from .plan import Scan, Derived, children
+
+    out: list = []
+
+    def go(n):
+        if isinstance(n, Scan):
+            out.append(n)
+        elif isinstance(n, Derived):
+            return
+        else:
+            for c in children(n):
+                go(c)
+
+    go(plan)
+    return out
 
 
 def _flatten_and(node):

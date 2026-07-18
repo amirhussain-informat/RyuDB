@@ -19,7 +19,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from ryudb.catalog import Catalog, TableConstraints, TableInfo
+from ryudb.catalog import Catalog, TableInfo
 
 
 def _write_typed_parquet(path: str) -> pa.Schema:

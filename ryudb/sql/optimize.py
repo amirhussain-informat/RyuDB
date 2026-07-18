@@ -26,6 +26,7 @@ from typing import Iterable
 from .plan import (
     Aggregate,
     And,
+    Derived,
     Distinct,
     Expr,
     Filter,
@@ -104,6 +105,16 @@ def prune_projections(plan: PlanNode, schema: Schema) -> PlanNode:
             return Limit(rewrite(node.input), node.n, node.offset)
         if isinstance(node, Distinct):
             return Distinct(rewrite(node.input))
+        if isinstance(node, Derived):
+            # A projection barrier from the outer scope: outer columns do not
+            # push into the subplan's scans. But recurse so the subplan's own
+            # scans get pruned -- the inner scans' pruned set is
+            # ``referenced ∩ schema[inner_table]`` over the GLOBAL referenced set
+            # (which ``_all_referenced_columns`` collects by walking into the
+            # Derived, picking up the inner Project's real-column refs), so e.g.
+            # ``SELECT t.x FROM (SELECT a AS x FROM A) t`` keeps column ``a`` on
+            # A's scan (x is not a real column of A and is correctly excluded).
+            return Derived(rewrite(node.input), node.alias)
         return node
 
     return rewrite(plan)
@@ -155,13 +166,37 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
         return tables
 
     def subtree_tables(node: PlanNode) -> set[str]:
-        return {n.table for n in walk(node) if isinstance(n, Scan)}
+        # The real tables under ``node`` in THIS scope. A ``Derived`` (FROM-subquery)
+        # is opaque from the outer scope: its inner scans belong to the subquery's
+        # own scope, so do not descend into it (a derived table contributes one
+        # opaque relation, not its inner table set, to an enclosing join).
+        from .plan import children as _children
+
+        tables: set[str] = set()
+        stack: list[PlanNode] = [node]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, Scan):
+                tables.add(n.table)
+            elif isinstance(n, Derived):
+                continue  # boundary: inner scans are a separate scope
+            else:
+                stack.extend(_children(n))
+        return tables
 
     def insert(plan: PlanNode, per_table: dict[str, list[Expr]]) -> PlanNode:
         if isinstance(plan, Scan):
             conjuncts = per_table.get(plan.table)
             if conjuncts:
                 return Filter(plan, _conjoin(conjuncts))
+            return plan
+        if isinstance(plan, Derived):
+            # A FROM-subquery is a pushdown BARRIER: an outer conjunct must never
+            # be pushed into the subplan (it would alter the derived table's
+            # contents -- even if the subplan happens to scan a same-named real
+            # table). The subplan's own WHERE is pushed by ``go`` recursing into
+            # ``Derived.input``; ``insert`` only distributes OUTER conjuncts, so
+            # stop here and leave the subplan untouched.
             return plan
         if isinstance(plan, Join):
             left_tables = subtree_tables(plan.left)
@@ -229,6 +264,11 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
             node = Limit(go(node.input), node.n, node.offset)
         elif isinstance(node, Distinct):
             node = Distinct(go(node.input))
+        elif isinstance(node, Derived):
+            # A scope barrier for OUTER conjuncts (see ``insert``), but recurse so
+            # the subplan's own WHERE (a Filter over its inner join/scan) gets
+            # pushed within its own scope.
+            node = Derived(go(node.input), node.alias)
         elif isinstance(node, Join):
             node = Join(go(node.left), go(node.right), node.on_left,
                         node.on_right, node.how, node.on_predicate)
@@ -359,6 +399,11 @@ def select_join_sides(plan: PlanNode, stats: Stats) -> PlanNode:
             return Limit(go(node.input), node.n, node.offset)
         if isinstance(node, Distinct):
             return Distinct(go(node.input))
+        if isinstance(node, Derived):
+            # Recurse so joins inside the subplan get side-selected; the derived
+            # table itself is one opaque relation (est_rows recurses via the
+            # ``hasattr(node, "input")`` fallback for an enclosing join).
+            return Derived(go(node.input), node.alias)
         return node
 
     return go(plan)

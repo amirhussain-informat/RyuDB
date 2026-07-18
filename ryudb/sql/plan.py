@@ -330,6 +330,25 @@ class Distinct:
 
 
 @dataclass
+class Derived:
+    """A derived table / FROM-subquery (Phase F-2b): ``FROM (SELECT ...) [AS] t``.
+    A row-preserving source node whose execution returns the subplan's output
+    frame verbatim -- the subplan's top ``Project``/``Aggregate`` names its output
+    columns, and the outer query references them as ordinary flat column names
+    (the flat-column model: ``Col`` carries only a name, no table qualifier).
+    Like ``Window`` it is a *scope barrier*: outer predicates/projections do not
+    push across it (the optimizer never pushes a conjunct into the subplan), but
+    the optimizer recurses into ``input`` so the subplan is optimized -- predicate
+    pushdown, projection pruning, join-side selection -- within its own scope.
+    ``alias`` is the FROM alias and is required (anonymous derived tables are
+    rejected at parse time); it doubles as the derived table's routing identity
+    (``schema.get(alias)`` is empty, so join-key routing falls back to table
+    qualifiers)."""
+    input: "PlanNode"
+    alias: str
+
+
+@dataclass
 class SetOp:
     """UNION / INTERSECT / EXCEPT over two child relations. ``op`` is
     "union" | "intersect" | "except"; ``distinct`` is False for UNION ALL (the
@@ -410,7 +429,7 @@ class TxnControl:
     kind: str  # "begin" | "commit" | "rollback"
 
 
-PlanNode = Scan | Filter | Project | Join | Aggregate | Window | Sort | Limit | Distinct | SetOp | Insert | Delete | Update | TxnControl
+PlanNode = Scan | Filter | Project | Join | Aggregate | Window | Sort | Limit | Distinct | Derived | SetOp | Insert | Delete | Update | TxnControl
 
 
 def walk(node: PlanNode):
@@ -421,7 +440,7 @@ def walk(node: PlanNode):
 
 
 def children(node: PlanNode) -> list[PlanNode]:
-    if isinstance(node, (Filter, Project, Sort, Distinct)):
+    if isinstance(node, (Filter, Project, Sort, Distinct, Derived)):
         return [node.input]
     if isinstance(node, (Join,)):
         return [node.left, node.right]
@@ -487,6 +506,8 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
         return f"{pad}Limit({node.n} offset={node.offset})\n" + pretty(node.input, indent + 1)
     if isinstance(node, Distinct):
         return f"{pad}Distinct()\n" + pretty(node.input, indent + 1)
+    if isinstance(node, Derived):
+        return f"{pad}Derived({node.alias})\n" + pretty(node.input, indent + 1)
     if isinstance(node, SetOp):
         kw = "DISTINCT" if node.distinct else "ALL"
         return (
