@@ -936,12 +936,15 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     table (no off-path branching dims, no pure-star legs); INNER and LEFT/RIGHT
     outer joins (RIGHT arrives via the optimizer's side-swap; the fact side is
     streamed, the dim hashed, and a miss at an outer stage null-pads to a NULL
-    group slot instead of dropping the fact row); no Filter/Project/Sort under
-    the Aggregate. Q3 (multi-key group + cross-table filter), high-card group-
-    from-join (HASH), non-int join keys, dimension agg args, AVG/MIN/MAX/
-    COUNT(col) over joins, FULL/CROSS joins, outer joins whose preserved side is
-    the dimension (the fact would be null-supplying -> not streamable), and
-    global-over-join all defer.
+    group slot instead of dropping the fact row); and single-stage FULL outer
+    (a FULL join reuses the LEFT null-pad for fact misses, then the host readout
+    emits the dim-only groups -- COUNT=1, SUM=NULL -- that FULL adds over LEFT);
+    no Filter/Project/Sort under the Aggregate. Q3 (multi-key group + cross-table
+    filter), high-card group-from-join (HASH), non-int join keys, dimension agg
+    args, AVG/MIN/MAX/COUNT(col) over joins, CROSS joins, multi-stage FULL outer
+    (the dim-only semantics across a chain are subtle and rare), outer joins whose
+    preserved side is the dimension (the fact would be null-supplying -> not
+    streamable), and global-over-join all defer.
     """
     import cudf
 
@@ -968,18 +971,18 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
         return None
 
     # Only Scan and Join may appear under the Aggregate (no Filter/Project/...).
-    # Each join must be a single-pair equi-join; INNER or LEFT/RIGHT outer (FULL
-    # and CROSS defer to cuDF -- FULL needs an anti-dim pass, CROSS has no key).
-    # The how is carried per edge so the path walk can tell an INNER stage (a
-    # probe miss drops the fact row) from an outer stage (a miss null-pads).
+    # Each join must be a single-pair equi-join; INNER / LEFT / RIGHT / FULL outer
+    # (CROSS defers to cuDF -- it has no key). The how is carried per edge so the
+    # path walk can tell an INNER stage (a probe miss drops the fact row) from an
+    # outer stage (a miss null-pads).
     scans: list[Scan] = []
     edges: list[tuple[str, str, str]] = []
     for n in walk(node.input):
         if isinstance(n, Scan):
             scans.append(n)
         elif isinstance(n, Join):
-            if n.how not in ("inner", "left", "right") or len(n.on_left) != 1:
-                return None  # full/cross/non-equi -> cuDF
+            if n.how not in ("inner", "left", "right", "full") or len(n.on_left) != 1:
+                return None  # cross/non-equi -> cuDF (FULL single-stage handled below)
             edges.append((n.on_left[0], n.on_right[0], n.how))
         else:
             return None
@@ -1044,11 +1047,18 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     # streamable as fact-streamed probing -> defer to cuDF.
     path_dims: list[tuple[str, str, str]] = []
     path_left: list[int] = []
+    full_outer = False
     cur = target_dim
     while cur != fact_table:
         par, ca, cb, how, fact_is_left = parent[cur]
         if how == "inner":
             lps = 0
+        elif how == "full":
+            # FULL preserves both sides; the fact miss -> NULL group behaves as a
+            # LEFT stage (lps=1). The dim-only groups FULL adds are emitted by the
+            # host readout; single-stage only (multi-stage FULL defers below).
+            lps = 1
+            full_outer = True
         else:
             # LEFT preserves the LEFT child; RIGHT preserves the RIGHT child.
             preserved = fact_is_left if how == "left" else (not fact_is_left)
@@ -1061,6 +1071,8 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     path_dims.reverse()
     path_left.reverse()
     has_left = any(path_left)
+    if full_outer and len(path_dims) != 1:
+        return None  # multi-stage FULL-outer-agg -> cuDF (dim-only across a chain)
     if path_dims[0][2] not in schema.get(fact_table, []):
         return None
     # Every scan must lie on the path (no off-path branching dims).
@@ -1283,21 +1295,39 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
         return _empty_result({"group_keys": group_keys, "aggs": aggs})
 
     # --- assemble cuDF frame (single group key: code -> unique value) ---
-    # For a LEFT-outer plan, code 0 is the NULL group (unmatched fact rows); its
-    # group-key columns are NULL. A real dim group at code c (>=1) decodes to
-    # gkey_uniques[c-1] (the host offset the last dim's codes by +1).
+    # For an outer plan (has_left), code 0 is the NULL group (unmatched fact rows);
+    # its group-key columns are NULL. A real dim group at code c (>=1) decodes to
+    # gkey_uniques[c-1] (the host offsets the last dim's codes by +1).
     codes = np.asarray(keys_list[0], dtype=np.int64)
     if has_left:
         key_vals = [None if int(c) == 0 else gkey_uniques[int(c) - 1] for c in codes]
     else:
         key_vals = [gkey_uniques[int(c)] for c in codes]
-    data: dict = {gname: cudf.Series(key_vals)}
-    for a, (af, n_) in enumerate(aggs):
+    agg_vals: list[list] = []
+    for a, (af, _n) in enumerate(aggs):
         vals = np.asarray(aggs_list[a], dtype=np.float64)
         if af.func == "COUNT" and isinstance(af.arg, Star):
-            data[n_] = cudf.Series(vals.astype(np.int64))
-        else:
-            data[n_] = cudf.Series(vals)
+            agg_vals.append([int(x) for x in vals.astype(np.int64)])
+        else:  # SUM
+            agg_vals.append([float(x) for x in vals])
+    # FULL-outer: dim rows no fact row hit. COUNT(*)=1 (the null-padded dim-only
+    # row), SUM=NULL (no fact value). `seen` already covers code 0 (NULL group) +
+    # every matched dim; emit the rest (1..n_dim) as dim-only rows.
+    if full_outer:
+        n_dim = len(gkey_uniques)  # == n_groups - 1
+        seen = {int(c) for c in codes}
+        for g in range(1, n_dim + 1):
+            if g in seen:
+                continue
+            key_vals.append(gkey_uniques[g - 1])
+            for a, (af, _n) in enumerate(aggs):
+                if af.func == "COUNT" and isinstance(af.arg, Star):
+                    agg_vals[a].append(1)
+                else:  # SUM
+                    agg_vals[a].append(None)  # -> NaN in the float64 column
+    data: dict = {gname: cudf.Series(key_vals)}
+    for a, (af, n_) in enumerate(aggs):
+        data[n_] = cudf.Series(agg_vals[a])
     out = cudf.DataFrame(data)
     return out[[gname] + [n_ for _, n_ in aggs]]
 

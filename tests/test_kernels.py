@@ -554,3 +554,198 @@ def test_stale_kernel_guard():
     finally:
         now = time.time()
         os.utime(kernels._EXT, (now, now))
+
+
+# --- Phase 3: fused FULL-outer aggregate-over-join -------------------------- #
+#
+# FULL = LEFT (a fact miss null-pads to the NULL group) + dim-only groups (a dim
+# row no fact row hit -> COUNT=1, SUM=NULL, emitted by the host readout). This
+# 2-table fixture exercises both halves: D 40..49 are dim-only (no fact hits
+# them); f_key 50..59 are fact-only (NULL group); D 0..39 are matched. Scope is
+# single-stage (fact FULL JOIN dim GROUP BY dim.k); a multi-stage FULL chain
+# defers to cuDF. Comparison via conftest.as_sorted (NULL -> None) because _match
+# casts to float and cannot hold a NULL string group key.
+
+
+@pytest.fixture(scope="module")
+def full_dir(tmp_path_factory):
+    d = tmp_path_factory.mktemp("ryudb_full")
+    # D: d_key 0..49, label L0..L49.
+    dfr = cudf.DataFrame({
+        "d_key": np.arange(50, dtype=np.int64),
+        "label": np.array([f"L{i}" for i in range(50)], dtype=object),
+    })
+    # F: f_key in {0..39 (matched) , 50..59 (fact-only -> NULL group)}; D 40..49
+    # never appear in F -> dim-only.
+    fkeys = np.concatenate([np.arange(40), np.arange(50, 60)]).astype(np.int64)
+    ffr = cudf.DataFrame({
+        "f_key": fkeys,
+        "f_val": np.arange(fkeys.size, dtype=np.float64) + 1.0,
+    })
+    for name, fr in [("D", dfr), ("F", ffr)]:
+        (d / name).mkdir()
+        fr.to_pandas().to_parquet(d / name / "0.parquet")
+    return d
+
+
+@pytest.fixture
+def full_engine(full_dir) -> Engine:
+    cat = Catalog(str(full_dir))
+    for t in ("F", "D"):
+        cat.register(t, str(full_dir / t))
+    return Engine(cat)
+
+
+@pytest.fixture
+def full_duck(full_dir):
+    con = duckdb.connect()
+    for t in ("F", "D"):
+        con.execute(f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{full_dir}/{t}/*.parquet')")
+    return con
+
+
+FULL_AGG = """
+    SELECT label, sum(f_val) AS revenue, count(*) AS n
+      FROM F
+      FULL JOIN D ON f_key = d_key
+     GROUP BY label
+     ORDER BY label
+"""
+
+FULL_AGG_LEFT = FULL_AGG.replace("FULL JOIN", "LEFT JOIN")
+FULL_AGG_INNER = FULL_AGG.replace("FULL JOIN", "JOIN")
+
+
+def test_fused_full_outer_agg_hits_kernel(full_engine):
+    """The single-stage FULL-outer-agg is in fused scope: the gate accepts
+    how=full and returns a frame instead of None."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    agg = _agg_node(FULL_AGG, full_engine)
+    assert fused.fused_join_aggregate(agg, full_engine) is not None, (
+        "single-stage FULL-outer + SUM/COUNT should hit the C++ fused path")
+
+
+def test_fused_full_outer_agg_matches_duckdb(full_engine, full_duck):
+    """FULL-outer-agg through the fused kernel matches DuckDB, including the NULL
+    group (fact-only f_key 50..59) and the dim-only groups (D 40..49 with
+    COUNT=1, SUM=NULL)."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    assert fused.fused_join_aggregate(_agg_node(FULL_AGG, full_engine), full_engine) is not None
+    ryu = _sorted(full_engine.sql(FULL_AGG))
+    duk = _sorted(full_duck.execute(FULL_AGG).fetchdf())
+    assert ryu == duk
+    # Both halves of FULL are present: a NULL group (fact-only) and dim-only rows.
+    assert any(row[0] is None for row in ryu), "expected a NULL-group row (fact-only)"
+    # Dim-only D 40..49: COUNT(*)=1, SUM=NULL. They appear as (Lxx, None, 1).
+    dim_only = [r for r in ryu if r[0] in {f"L{i}" for i in range(40, 50)}]
+    assert dim_only, "expected dim-only rows (D 40..49 unmatched by any fact)"
+    assert all(r[1] is None and r[2] == 1 for r in dim_only), (
+        "dim-only rows must have SUM=NULL, COUNT=1")
+
+
+def test_fused_full_outer_differs_from_left(full_engine, full_duck):
+    """FULL differs from LEFT exactly by the dim-only groups (D 40..49): LEFT
+    lacks them, FULL has them. Both match DuckDB. Catches a regression that
+    forgets the host-side anti-dim emission."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    full = _sorted(full_engine.sql(FULL_AGG))
+    left = _sorted(full_engine.sql(FULL_AGG_LEFT))
+    assert full != left
+    # FULL has the dim-only labels LEFT lacks.
+    left_labels = {r[0] for r in left}
+    assert {f"L{i}" for i in range(40, 50)} <= {r[0] for r in full} - left_labels
+    assert full == _sorted(full_duck.execute(FULL_AGG).fetchdf())
+    assert left == _sorted(full_duck.execute(FULL_AGG_LEFT).fetchdf())
+
+
+@pytest.fixture(scope="module")
+def full_nomiss_dir(tmp_path_factory):
+    """All-matching FULL: every D key is hit by a fact and every fact key hits a
+    D row -- no NULL group, no dim-only rows -> FULL == INNER."""
+    d = tmp_path_factory.mktemp("ryudb_full_nomiss")
+    dfr = cudf.DataFrame({
+        "d_key": np.arange(20, dtype=np.int64),
+        "label": np.array([f"L{i}" for i in range(20)], dtype=object),
+    })
+    # f_key covers every D key (0..19); nothing on either side is unmatched.
+    ffr = cudf.DataFrame({
+        "f_key": np.arange(20000, dtype=np.int64) % 20,
+        "f_val": np.arange(20000, dtype=np.float64),
+    })
+    for name, fr in [("D", dfr), ("F", ffr)]:
+        (d / name).mkdir()
+        fr.to_pandas().to_parquet(d / name / "0.parquet")
+    return d
+
+
+@pytest.fixture
+def full_nomiss_engine(full_nomiss_dir) -> Engine:
+    cat = Catalog(str(full_nomiss_dir))
+    for t in ("F", "D"):
+        cat.register(t, str(full_nomiss_dir / t))
+    return Engine(cat)
+
+
+@pytest.fixture
+def full_nomiss_duck(full_nomiss_dir):
+    con = duckdb.connect()
+    for t in ("F", "D"):
+        con.execute(f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{full_nomiss_dir}/{t}/*.parquet')")
+    return con
+
+
+FULL_NOMISS = """
+    SELECT label, sum(f_val) AS revenue, count(*) AS n
+      FROM F
+      FULL JOIN D ON f_key = d_key
+     GROUP BY label
+     ORDER BY label
+"""
+
+
+def test_fused_full_outer_no_miss_identical_to_inner(full_nomiss_engine, full_nomiss_duck):
+    """Zero misses on either side -> no NULL group and no dim-only rows -> the
+    FULL-outer fused output equals the inner aggregate. Guards that the +1
+    payload offset and the host anti-dim pass do not perturb the matched groups
+    when nothing is appended."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    assert fused.fused_join_aggregate(_agg_node(FULL_NOMISS, full_nomiss_engine),
+                                      full_nomiss_engine) is not None
+    full = _sorted(full_nomiss_engine.sql(FULL_NOMISS))
+    inner = _sorted(full_nomiss_duck.execute(FULL_NOMISS.replace("FULL JOIN", "JOIN")).fetchdf())
+    assert full == inner
+    assert not any(row[0] is None for row in full)
+
+
+def test_fused_full_multi_stage_defers(star_engine, star_duck):
+    """A multi-stage FULL-outer chain (F FULL JOIN D1 FULL JOIN D2) defers to
+    cuDF: the dim-only semantics across a chain are out of the single-stage scope
+    and `fused_join_aggregate` returns None. The cuDF path still matches DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    sql = """
+        SELECT label, sum(f_val) AS revenue, count(*) AS n
+          FROM F
+          FULL JOIN D1 ON f_key1 = d1_key
+          FULL JOIN D2 ON d1_next = d2_key
+         GROUP BY label
+         ORDER BY label
+    """
+    agg = _agg_node(sql, star_engine)
+    assert fused.fused_join_aggregate(agg, star_engine) is None, (
+        "multi-stage FULL-outer-agg must defer to cuDF")
+    assert _sorted(star_engine.sql(sql)) == _sorted(star_duck.execute(sql).fetchdf())
+
+
+def test_fused_full_outer_fallback_matches(full_engine, full_duck, monkeypatch):
+    """With the C++ kernel marked unavailable, the FULL-outer aggregate falls
+    back to the cuDF merge+groupby path and still matches DuckDB -- correctness
+    never depends on the extension."""
+    monkeypatch.setattr(fused._kernels, "is_available", False)
+    ryu = _sorted(full_engine.sql(FULL_AGG))
+    duk = _sorted(full_duck.execute(FULL_AGG).fetchdf())
+    assert ryu == duk
