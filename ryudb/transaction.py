@@ -35,6 +35,8 @@ class Transaction:
 
     snapshot_ts: int
     _buffer: dict[str, list["cudf.DataFrame"]] = field(default_factory=dict)
+    # Buffered DELETE tombstones (PK-value frames), parallel to ``_buffer`` (step 9).
+    _tombstones: dict[str, list["cudf.DataFrame"]] = field(default_factory=dict)
 
     def buffer_append(self, table: str, frame: "cudf.DataFrame") -> None:
         """Buffer an INSERT batch for ``table`` (visible to this txn only)."""
@@ -44,10 +46,29 @@ class Transaction:
         """This txn's buffered frames for ``table`` in append order (empty if none)."""
         return list(self._buffer.get(table) or [])
 
+    def tombstone_append(self, table: str, frame: "cudf.DataFrame") -> None:
+        """Buffer a DELETE tombstone for ``table`` (visible to this txn only)."""
+        self._tombstones.setdefault(table, []).append(frame)
+
+    def tombstone_batches(self, table: str) -> list["cudf.DataFrame"]:
+        """This txn's buffered tombstone frames for ``table`` in append order."""
+        return list(self._tombstones.get(table) or [])
+
+    def has_tombstone(self, table: str) -> bool:
+        """True if this txn has buffered >=1 tombstone for ``table``."""
+        return bool(self._tombstones.get(table))
+
+    def tombstone_tables(self) -> list[str]:
+        """Tables with >=1 buffered tombstone (for commit flatten + rollback)."""
+        return [t for t, lst in self._tombstones.items() if lst]
+
     def has(self, table: str) -> bool:
-        """True if this txn has buffered >=1 frame for ``table``."""
-        return bool(self._buffer.get(table))
+        """True if this txn has buffered >=1 INSERT OR tombstone for ``table``."""
+        return bool(self._buffer.get(table)) or bool(self._tombstones.get(table))
 
     def tables(self) -> list[str]:
-        """Tables with >=1 buffered frame (for commit/rollback invalidation)."""
-        return [t for t, lst in self._buffer.items() if lst]
+        """Tables with >=1 buffered frame OR tombstone (for commit/rollback
+        invalidation)."""
+        out: set[str] = {t for t, lst in self._buffer.items() if lst}
+        out.update(t for t, lst in self._tombstones.items() if lst)
+        return list(out)

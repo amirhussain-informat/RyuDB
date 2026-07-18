@@ -51,11 +51,19 @@ if TYPE_CHECKING:
 _WAL_NAME = "ryudb.wal"
 
 # Header: u32 payload_len, u32 crc32(payload). Payload: u64 commit_ts, u32
-# n_batches, then per batch u32 name_len + name bytes + u32 arrow_len + arrow
-# bytes. All little-endian.
+# n_batches, then per batch u8 kind (0=insert, 1=tombstone -- step 9) + u32
+# name_len + name bytes + u32 arrow_len + arrow bytes. All little-endian.
 _HEADER = struct.Struct("<II")
 _COMMIT_TS = struct.Struct("<Q")
 _U32 = struct.Struct("<I")
+_U8 = struct.Struct("<B")
+
+# kind byte <-> tag string. Tombstones (DELETE PK values) take the parallel
+# ``_tombstones`` channel in ``DeltaStore``; inserts stay on ``_batches``.
+_KIND_INSERT = 0
+_KIND_TOMBSTONE = 1
+_KIND_BY_TAG = {"insert": _KIND_INSERT, "tombstone": _KIND_TOMBSTONE}
+_TAG_BY_KIND = {v: k for k, v in _KIND_BY_TAG.items()}
 
 
 def _serialize_frame(frame: "cudf.DataFrame") -> bytes:
@@ -78,12 +86,19 @@ def _deserialize_frame(arrow_bytes: bytes) -> "cudf.DataFrame":
     return cudf.DataFrame(pd.DataFrame(table.to_pandas()))
 
 
-def _build_record(commit_ts: int, batches: list[tuple[str, "cudf.DataFrame"]]) -> bytes:
-    """Serialize one commit to its full on-disk record bytes (header + payload)."""
+def _build_record(
+    commit_ts: int, batches: list[tuple[str, str, "cudf.DataFrame"]]
+) -> bytes:
+    """Serialize one commit to its full on-disk record bytes (header + payload).
+
+    ``batches`` are ``(table, kind, frame)`` triples where ``kind`` is
+    ``"insert"`` or ``"tombstone"`` (step 9 lets one commit mix INSERT and
+    DELETE batches; the per-batch kind byte preserves that split on disk)."""
     parts: list[bytes] = [_COMMIT_TS.pack(commit_ts), _U32.pack(len(batches))]
-    for table, frame in batches:
+    for table, kind, frame in batches:
         name = table.encode("utf-8")
         arrow = _serialize_frame(frame)
+        parts.append(_U8.pack(_KIND_BY_TAG[kind]))
         parts.append(_U32.pack(len(name)))
         parts.append(name)
         parts.append(_U32.pack(len(arrow)))
@@ -124,19 +139,20 @@ class WAL:
 
     # ------------------------------------------------------------------ replay
 
-    def replay(self) -> list[tuple[int, str, "cudf.DataFrame"]]:
+    def replay(self) -> list[tuple[int, str, str, "cudf.DataFrame"]]:
         """Read every valid record, in order. Stops at the first torn/short/
         CRC-mismatch record and **truncates the file to the last good byte
         offset** (cleans a crashed tail so later appends never strand behind a
         corrupt record), then seeks to EOF for appending. Returns
-        ``[(commit_ts, table, frame), ...]``. No-op (empty) when disabled."""
+        ``[(commit_ts, table, kind, frame), ...]`` where ``kind`` is
+        ``"insert"`` or ``"tombstone"`` (step 9). No-op (empty) when disabled."""
         fh = self._acquire(create=False)
         if fh is None:
             return []  # disabled, or no WAL file yet -> nothing to replay
         fh.seek(0, os.SEEK_END)
         size = fh.tell()
         fh.seek(0)
-        records: list[tuple[int, str, "cudf.DataFrame"]] = []
+        records: list[tuple[int, str, str, "cudf.DataFrame"]] = []
         offset = 0
         while offset < size:
             if offset + _HEADER.size > size:
@@ -167,7 +183,9 @@ class WAL:
 
     # ------------------------------------------------------------ write commit
 
-    def write_commit(self, commit_ts: int, batches: list[tuple[str, "cudf.DataFrame"]]) -> None:
+    def write_commit(
+        self, commit_ts: int, batches: list[tuple[str, str, "cudf.DataFrame"]]
+    ) -> None:
         """Append one durable commit record. Empty ``batches`` is a no-op (an
         empty commit bumps the in-memory counter but persists no data; the
         counter is recovered as ``max(replayed ts)``). Builds the full record in
@@ -254,15 +272,18 @@ class WAL:
                 self._fh = None
 
 
-def _parse_payload(payload: bytes) -> list[tuple[int, str, "cudf.DataFrame"]]:
-    """Split a payload into its ``(commit_ts, table, frame)`` records."""
+def _parse_payload(payload: bytes) -> list[tuple[int, str, str, "cudf.DataFrame"]]:
+    """Split a payload into its ``(commit_ts, table, kind, frame)`` records
+    (``kind`` is ``"insert"`` or ``"tombstone"``)."""
     pos = 0
     (commit_ts,) = _COMMIT_TS.unpack_from(payload, pos)
     pos += _COMMIT_TS.size
     (n_batches,) = _U32.unpack_from(payload, pos)
     pos += _U32.size
-    out: list[tuple[int, str, "cudf.DataFrame"]] = []
+    out: list[tuple[int, str, str, "cudf.DataFrame"]] = []
     for _ in range(n_batches):
+        (kind_byte,) = _U8.unpack_from(payload, pos)
+        pos += _U8.size
         (name_len,) = _U32.unpack_from(payload, pos)
         pos += _U32.size
         name = payload[pos:pos + name_len].decode("utf-8")
@@ -271,7 +292,7 @@ def _parse_payload(payload: bytes) -> list[tuple[int, str, "cudf.DataFrame"]]:
         pos += _U32.size
         arrow_bytes = payload[pos:pos + arrow_len]
         pos += arrow_len
-        out.append((commit_ts, name, _deserialize_frame(arrow_bytes)))
+        out.append((commit_ts, name, _TAG_BY_KIND[kind_byte], _deserialize_frame(arrow_bytes)))
     return out
 
 

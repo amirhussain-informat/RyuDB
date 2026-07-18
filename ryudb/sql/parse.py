@@ -26,6 +26,7 @@ from .plan import (
     And,
     BinOp,
     Col,
+    Delete,
     Expr,
     Filter,
     Insert,
@@ -77,6 +78,8 @@ def parse(sql: str, schema: dict[str, list[str]] | None = None) -> object:
         return _build_select(stmt, schema)
     if isinstance(stmt, exp.Insert):
         return _build_insert(stmt)
+    if isinstance(stmt, exp.Delete):
+        return _build_delete(stmt)
     if isinstance(stmt, exp.Transaction):
         # sqlglot lowers BEGIN[/TRANSACTION/WORK/DEFERRED] to exp.Transaction;
         # this/modes/mark are ignored (no nested txns, no SAVEPOINTs yet).
@@ -89,7 +92,7 @@ def parse(sql: str, schema: dict[str, list[str]] | None = None) -> object:
         if stmt.args.get("savepoint"):
             raise NotImplementedError("ROLLBACK TO SAVEPOINT is not supported")
         return TxnControl("rollback")
-    raise ParseError(f"only SELECT/INSERT/BEGIN/COMMIT/ROLLBACK is supported "
+    raise ParseError(f"only SELECT/INSERT/DELETE/BEGIN/COMMIT/ROLLBACK is supported "
                      f"(got {type(stmt).__name__})")
 
 
@@ -133,6 +136,30 @@ def _build_insert(stmt: exp.Insert) -> Insert:
     if not rows:
         raise ParseError("INSERT has no value rows")
     return Insert(table=table, columns=cols, rows=rows)
+
+
+def _build_delete(stmt: exp.Delete) -> Delete:
+    """Lower ``DELETE FROM t [WHERE pred]`` into a Delete node (step 9).
+
+    sqlglot puts the target table in ``stmt.this`` (an ``exp.Table``; ``.name``
+    is the table name) and the optional predicate in ``stmt.args["where"]`` (an
+    ``exp.Where`` whose ``.this`` is the predicate expression, or ``None`` when
+    no WHERE was given). Only the bare form is supported: USING/RETURNING/ORDER
+    BY/LIMIT and multi-table DELETEs raise (sqlglot ``exp.Delete`` args keys:
+    ``tables, this, using, cluster, where, returning, order, limit``).
+    """
+    for arg in ("using", "cluster", "returning", "order", "limit", "tables"):
+        if stmt.args.get(arg):
+            raise NotImplementedError(f"DELETE with {arg.upper()} is not supported yet")
+    target = stmt.this
+    if not isinstance(target, exp.Table):
+        raise ParseError("DELETE target is not a table")
+    table = target.name
+    if not table:
+        raise ParseError("DELETE target has no table name")
+    where = stmt.args.get("where")
+    predicate = _expr(where.this) if where is not None else None
+    return Delete(table=table, predicate=predicate)
 
 
 def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
