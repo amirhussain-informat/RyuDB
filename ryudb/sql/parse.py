@@ -32,12 +32,18 @@ from .plan import (
     AggFunc,
     And,
     BinOp,
+    Case,
+    Cast,
+    Coalesce,
     Col,
     Delete,
     Expr,
     Filter,
+    In,
     Insert,
+    IsNull,
     Join,
+    Like,
     Limit,
     Lit,
     Not,
@@ -343,19 +349,31 @@ def _expr(node) -> Expr:
     if isinstance(node, exp.Paren):
         return _expr(node.this)
     if isinstance(node, exp.Cast):
-        target = node.to.name.upper() if node.to else None
-        inner = node.this
-        if isinstance(inner, exp.Literal):
-            return Lit(_literal_value(inner), target)
-        # general cast of an expression: represent as BinOp-like? keep as inner
-        # with a dtype hint is not enough; unsupported for Phase 1.
-        raise NotImplementedError(f"cast of {type(inner).__name__} not supported")
+        return _cast(node)
     if isinstance(node, exp.And):
         return And(_expr(node.this), _expr(node.expression))
     if isinstance(node, exp.Or):
         return Or(_expr(node.this), _expr(node.expression))
     if isinstance(node, exp.Not):
-        return Not(_expr(node.this))
+        return _not(node)
+    # These are all exp.Binary subclasses in sqlglot, so they must be matched
+    # before the generic exp.Binary branch below.
+    if isinstance(node, exp.Is):
+        if isinstance(node.expression, exp.Null):
+            return IsNull(_expr(node.this), negated=False)
+        raise NotImplementedError("only IS NULL / IS NOT NULL is supported")
+    if isinstance(node, exp.In):
+        return _in(node, negated=False)
+    if isinstance(node, exp.Between):
+        return _between(node, negated=False)
+    if isinstance(node, (exp.Like, exp.ILike)):
+        return Like(_expr(node.this), _expr(node.expression),
+                    negated=False, case_sensitive=isinstance(node, exp.Like))
+    if isinstance(node, exp.Coalesce):
+        args = [_expr(node.this)] + [_expr(v) for v in node.expressions]
+        return Coalesce(tuple(args))
+    if isinstance(node, exp.Case):
+        return _case(node)
     if isinstance(node, exp.Binary):
         op = _binop_symbol(node)
         return BinOp(op, _expr(node.this), _expr(node.expression))
@@ -364,6 +382,92 @@ def _expr(node) -> Expr:
             arg = _expr(node.this) if node.this is not None else Star()
             return AggFunc(AGG_FUNCS[type(node)], arg)
     raise NotImplementedError(f"unsupported expression: {type(node).__name__}")
+
+
+# --------------------------------------------------------------------------- #
+# Predicate / expression helpers (IS NULL, IN, BETWEEN, LIKE, CASE, COALESCE,
+# CAST). BETWEEN lowers to AND/OR of comparisons (no plan node); the NOT
+# variants set a `negated` flag on the inner Expr so three-valued logic on a
+# NULL operand stays correct (a Not wrapper would invert NA wrongly).
+# --------------------------------------------------------------------------- #
+
+
+def _not(node) -> Expr:
+    """Lower ``NOT x``. NOT IN / NOT BETWEEN / NOT LIKE / IS NOT NULL fold the
+    negation into the inner Expr; anything else stays a ``Not`` wrapper."""
+    inner = node.this
+    if isinstance(inner, exp.In) and inner.args.get("query") is None:
+        return _in(inner, negated=True)
+    if isinstance(inner, exp.Between):
+        return _between(inner, negated=True)
+    if isinstance(inner, (exp.Like, exp.ILike)):
+        return Like(_expr(inner.this), _expr(inner.expression),
+                    negated=True, case_sensitive=isinstance(inner, exp.Like))
+    if isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null):
+        return IsNull(_expr(inner.this), negated=True)
+    return Not(_expr(inner))
+
+
+def _in(node, negated: bool) -> Expr:
+    if node.args.get("query") is not None:
+        raise NotImplementedError("IN with a subquery is not supported yet")
+    values = tuple(_expr(v) for v in node.expressions)
+    if not values:
+        raise ParseError("IN list is empty")
+    return In(_expr(node.this), values, negated=negated)
+
+
+def _between(node, negated: bool) -> Expr:
+    e = _expr(node.this)
+    lo = _expr(node.args["low"])
+    hi = _expr(node.args["high"])
+    if not negated:
+        return And(BinOp(">=", e, lo), BinOp("<=", e, hi))
+    return Or(BinOp("<", e, lo), BinOp(">", e, hi))
+
+
+def _cast(node) -> Expr:
+    target = node.to.name.upper() if node.to else None
+    inner = node.this
+    if isinstance(inner, exp.Literal):
+        # Literal cast stays a typed Lit (preserves the date-literal path).
+        return Lit(_literal_value(inner), target)
+    return Cast(_expr(inner), _sqlglot_type_tag(node.to))
+
+
+def _case(node) -> Expr:
+    operand = _expr(node.this) if node.this is not None else None
+    ifs = node.args.get("ifs") or []
+    branches: list[tuple[Expr, Expr]] = []
+    for iff in ifs:
+        cond = _expr(iff.this)
+        if operand is not None:
+            # Simple CASE: WHEN v THEN ... -> (operand = v).
+            cond = BinOp("=", operand, cond)
+        then = _expr(iff.args.get("true"))
+        branches.append((cond, then))
+    default = _expr(node.args.get("default")) if node.args.get("default") is not None else None
+    return Case(operand, tuple(branches), default)
+
+
+_SQLGLOT_TYPE_TAG = {
+    "TINYINT": "int", "SMALLINT": "int", "INT": "int", "INTEGER": "int",
+    "BIGINT": "int",
+    "FLOAT": "float", "DOUBLE": "float", "REAL": "float",
+    "DECIMAL": "float", "NUMERIC": "float",
+    "VARCHAR": "str", "CHAR": "str", "TEXT": "str", "STRING": "str",
+    "BOOLEAN": "bool", "BOOL": "bool",
+    "DATE": "date",
+    "TIMESTAMP": "timestamp", "DATETIME": "timestamp",
+}
+
+
+def _sqlglot_type_tag(dt) -> str:
+    name = dt.this.name.upper() if dt is not None and dt.this is not None else ""
+    tag = _SQLGLOT_TYPE_TAG.get(name)
+    if tag is None:
+        raise NotImplementedError(f"CAST to {name or 'unknown type'} is not supported")
+    return tag
 
 
 _BINOP = {
