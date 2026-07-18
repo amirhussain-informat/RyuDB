@@ -7,10 +7,13 @@ RangeIndex so that Series and scalar broadcasts line up in Project/Aggregate.
 
 from __future__ import annotations
 
+import os
 import re
 
 import cudf
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from ..catalog import Catalog
 from ..delta import DeltaStore
@@ -153,6 +156,31 @@ class Engine:
         for k in [k for k in self._pk_cache if k[0] == table]:
             del self._pk_cache[k]
 
+    def _drop_scan_cache_for(self, table: str) -> None:
+        """Drop this table's ``_scan_cache`` entries (used by ``checkpoint``).
+
+        The scan cache holds a **base-only** frame (``_merge_delta`` re-merges the
+        live delta on top, never writing the merged frame back). After a
+        checkpoint rewrites the base to base++delta and clears the delta, that
+        cached base-only frame is stale -- it's the OLD base without the now-
+        checkpointed rows -- so the next read would serve the wrong rows. Drop
+        just this table's entries (finalizing any in-flight Phase 5 async gather,
+        mirroring ``clear_scan_cache``) so the next scan re-reads the new base.
+        Other tables' warm frames stay resident (checkpoint is rare)."""
+        from .. import kernels as _kernels
+
+        keys = [k for k in self._scan_cache if k[0] == table]
+        if _kernels.fused_scan_finalize is not None:
+            for k in keys:
+                pid = getattr(self._scan_cache[k], "pending_id", None)
+                if pid:
+                    try:
+                        _kernels.fused_scan_finalize(int(pid))
+                    except Exception:
+                        pass
+        for k in keys:
+            self._scan_cache.pop(k, None)
+
     # ------------------------------------------------------------------ #
     # Phase 2 step 5 -- MVCC transaction layer + snapshot restore
     # ------------------------------------------------------------------ #
@@ -285,6 +313,95 @@ class Engine:
             del self._snapshots[n]
         for table in touched:
             self._invalidate_table_caches(table)
+
+    # ------------------------------------------------------------------ #
+    # Phase 2 step 7 -- delta write-back (checkpoint)
+    # ------------------------------------------------------------------ #
+
+    def checkpoint(self) -> dict[str, int]:
+        """Flush every committed delta table into a new base Parquet file, clear
+        the delta, and truncate the WAL -- the durable write-back that keeps the
+        delta + WAL from growing unbounded across a session. Returns ``{table:
+        row_count}`` for the tables compacted (empty if nothing to flush).
+
+        Full-store only (every committed table is folded in): the WAL is one
+        record per COMMIT and a commit may span tables, so a per-table checkpoint
+        could not cleanly drop just one table's records from the WAL. A full
+        checkpoint makes every WAL record obsolete, so ``wal.truncate(0)`` is
+        safe. Per-table checkpoint (with a WAL rewrite grouped by ``commit_ts``)
+        is deferred.
+
+        Type fidelity on disk: the merged frame (decimals coerced to float64,
+        dates to datetime64 by the read path) is cast back to the catalog's
+        declared Arrow schema, so the new Parquet file stores DECIMAL/DATE/BIGINT
+        as their logical types. The Phase 5 cold Parquet reader targets the
+        DuckDB physical layout (DECIMAL as INT64); pyarrow writes decimal128 as
+        FIXED_LEN_BYTE_ARRAY, so the cold reader *defers* (cleanly, via
+        ``_Defer``) on a checkpointed table and the warm cuDF path runs instead.
+        ``row_count`` staleness is fixed as a side effect (``register``
+        recomputes it from the new file's metadata).
+
+        Ordering / invariants:
+          * ``_scan(t, None)`` is the cuDF path (never the cold reader), so the
+            merged frame is always materialised regardless of cold-reader deferral.
+          * ``_commit_ts`` is NOT reset: within the session the next commit gets
+            ``checkpoint_ts+1`` (no collision with the kept ``ts == checkpoint_ts``
+            snapshot). Across a restart, snapshots are in-memory-only and dropped,
+            so a fresh low-ts batch has no old snapshot to collide with -- this is
+            the load-bearing reason snapshots stay in-memory-only.
+          * Snapshots with ``ts < checkpoint_ts`` are dropped: their state was
+            folded into base and a restore to them could not undo the now-base
+            rows. ``ts == checkpoint_ts`` is kept (restore-to-tip == base).
+        """
+        if self._txn is not None:
+            raise RuntimeError("cannot checkpoint during a transaction (COMMIT/ROLLBACK first)")
+        if self.catalog.data_dir is None:
+            raise RuntimeError("cannot checkpoint without a data dir (ephemeral engine)")
+        targets = self.delta.tables()  # tables with >=1 committed batch
+        if not targets:
+            return {}  # nothing to flush
+        checkpoint_ts = self._commit_ts  # the tip; all committed work is <= this
+        written: dict[str, int] = {}
+        for table in targets:
+            if not self.delta.has_unflushed(table):
+                continue
+            info = self.catalog.get(table)
+            merged = self._scan(table, None)  # base ++ ALL committed batches (no txn active)
+            tbl = pa.Table.from_pandas(merged.to_pandas(), preserve_index=False).cast(info.schema)
+            d = os.path.dirname(info.paths[0])
+            final = os.path.join(d, "ryudb_base.parquet")
+            tmp = final + ".tmp"
+            pq.write_table(tbl, tmp, compression="snappy")
+            old_paths = list(info.paths)
+            os.replace(tmp, final)  # atomic publish
+            # register re-derives schema + row_count from the new file and
+            # preserves any constraints previously set via :alter (PK/UNIQUE/
+            # DEFAULT/NOT NULL), then saves the catalog.
+            self.catalog.register(table, final)
+            self.delta.clear(table)
+            for p in old_paths:
+                # Skip the file we just published (final may equal an old path on
+                # a re-checkpoint) and any already-gone path.
+                if p != final and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            # The cached base-only frame is the OLD base (without the now-
+            # checkpointed rows); code/pk facts are stale (data changed).
+            self._drop_scan_cache_for(table)
+            self._invalidate_table_caches(table)
+            written[table] = self.catalog.get(table).row_count
+        # Every committed batch is now in base -> the whole WAL is obsolete.
+        # No-op when the WAL is disabled (ephemeral engine, already rejected
+        # above, but harmless).
+        self._wal.truncate(0)
+        # Drop snapshots whose state was folded into base (ts < checkpoint_ts):
+        # a restore to them could not undo the now-base rows. Keep
+        # ts == checkpoint_ts (restore-to-tip == base, still valid).
+        for name in [n for n, ts in self._snapshots.items() if ts < checkpoint_ts]:
+            del self._snapshots[name]
+        return written
 
     def is_unique_key(self, table: str, col: str, series) -> bool:
         """Return cached (table, col) uniqueness -- a dimension join key must be

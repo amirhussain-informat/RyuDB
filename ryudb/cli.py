@@ -18,6 +18,8 @@ REPL dot-commands:
                      :alter NAME default COL VALUE
   :snapshot NAME capture the current committed state as a named snapshot
   :restore NAME  restore the whole DB to a named snapshot (discards later commits)
+  :checkpoint    flush committed delta into base Parquet (preserve DECIMAL/DATE),
+                 clear the delta, and truncate the WAL
   :explain SQL   print the optimized logical plan without running
   :help          show help
   :quit          exit
@@ -199,6 +201,17 @@ def _dot_command(cmd: str, engine: Engine, catalog: Catalog) -> bool:
                 print(f"restored to snapshot {arg.strip()}")
             except Exception as exc:  # noqa: BLE001
                 print(f"error: {exc}")
+    elif name == "checkpoint":
+        try:
+            written = engine.checkpoint()
+            if not written:
+                print("nothing to checkpoint (no committed delta)")
+            else:
+                total = sum(written.values())
+                detail = ", ".join(f"{t}={n}" for t, n in written.items())
+                print(f"checkpointed {len(written)} table(s), {total} row(s): {detail}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"error: {exc}")
     elif name == "explain":
         if not arg:
             print("usage: :explain <sql>")
