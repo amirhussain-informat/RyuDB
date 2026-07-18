@@ -240,6 +240,15 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
             pushable: dict[str, list[Expr]] = {}
             remaining: list[Expr] = []
             for c in conjuncts:
+                # A conjunct referencing a non-base column -- e.g. a cross-join
+                # broadcast column (``_sq1``) produced by a flattened scalar /
+                # EXISTS subquery -- depends on a column produced *above* the
+                # join, so it cannot be pushed below any scan (``tables_of``
+                # ignores unknown columns, which would otherwise let the
+                # conjunct be mis-routed to a scan that lacks the column).
+                if any(col not in col_to_tables for col in c.columns()):
+                    remaining.append(c)
+                    continue
                 ts = tables_of(c) & join_tables
                 if len(ts) == 1:
                     t = next(iter(ts))
