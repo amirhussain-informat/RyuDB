@@ -91,6 +91,89 @@ class AggFunc(Expr):
         return self.arg.columns() if not isinstance(self.arg, Star) else set()
 
 
+@dataclass(frozen=True)
+class IsNull(Expr):
+    """``expr IS [NOT] NULL`` -- ``negated`` for IS NOT NULL."""
+    expr: Expr
+    negated: bool = False
+
+    def columns(self) -> set[str]:
+        return self.expr.columns()
+
+
+@dataclass(frozen=True)
+class In(Expr):
+    """``expr [NOT] IN (v1, v2, ...)`` -- list form only (subquery IN defers)."""
+    expr: Expr
+    values: tuple[Expr, ...]
+    negated: bool = False
+
+    def columns(self) -> set[str]:
+        cols = self.expr.columns()
+        for v in self.values:
+            cols |= v.columns()
+        return cols
+
+
+@dataclass(frozen=True)
+class Like(Expr):
+    """``expr [NOT] LIKE pattern`` (or ``ILIKE`` when ``case_sensitive`` is False)."""
+    expr: Expr
+    pattern: Expr
+    negated: bool = False
+    case_sensitive: bool = True
+
+    def columns(self) -> set[str]:
+        return self.expr.columns() | self.pattern.columns()
+
+
+@dataclass(frozen=True)
+class Case(Expr):
+    """``CASE [operand] WHEN cond THEN val ... [ELSE default]``.
+
+    ``operand`` is non-None for a simple CASE (each branch condition is
+    ``operand = when_value``); None for a searched CASE (each branch condition is
+    a predicate). ``branches`` is ``[(cond, value), ...]``; ``default`` is the
+    ELSE expression or ``None`` (-> NULL)."""
+    operand: Expr | None
+    branches: tuple[tuple[Expr, Expr], ...]
+    default: Expr | None = None
+
+    def columns(self) -> set[str]:
+        cols: set[str] = set()
+        if self.operand is not None:
+            cols |= self.operand.columns()
+        for cond, val in self.branches:
+            cols |= cond.columns() | val.columns()
+        if self.default is not None:
+            cols |= self.default.columns()
+        return cols
+
+
+@dataclass(frozen=True)
+class Coalesce(Expr):
+    """``COALESCE(a, b, ...)`` -- first non-NULL argument per row."""
+    args: tuple[Expr, ...]
+
+    def columns(self) -> set[str]:
+        cols: set[str] = set()
+        for a in self.args:
+            cols |= a.columns()
+        return cols
+
+
+@dataclass(frozen=True)
+class Cast(Expr):
+    """``CAST(expr AS type)`` for a non-literal ``expr`` (literal casts stay
+    ``Lit`` with a dtype). ``dtype`` is a RyuDB type tag: int/float/str/bool/
+    date/timestamp."""
+    expr: Expr
+    dtype: str
+
+    def columns(self) -> set[str]:
+        return self.expr.columns()
+
+
 # --------------------------------------------------------------------------- #
 # Plan nodes
 # --------------------------------------------------------------------------- #
@@ -321,4 +404,22 @@ def _estr(e: Expr) -> str:
         return f"(NOT {_estr(e.expr)})"
     if isinstance(e, AggFunc):
         return f"{e.func}({_estr(e.arg)})"
+    if isinstance(e, IsNull):
+        return f"{_estr(e.expr)} IS {'NOT ' if e.negated else ''}NULL"
+    if isinstance(e, In):
+        vals = ", ".join(_estr(v) for v in e.values)
+        return f"{_estr(e.expr)} {'NOT ' if e.negated else ''}IN ({vals})"
+    if isinstance(e, Like):
+        op = "NOT ILIKE" if (e.negated and not e.case_sensitive) else (
+            "NOT LIKE" if e.negated else ("ILIKE" if not e.case_sensitive else "LIKE"))
+        return f"{_estr(e.expr)} {op} {_estr(e.pattern)}"
+    if isinstance(e, Case):
+        whens = " ".join(f"WHEN {_estr(c)} THEN {_estr(v)}" for c, v in e.branches)
+        dflt = f" ELSE {_estr(e.default)}" if e.default is not None else ""
+        op = f"{_estr(e.operand)} " if e.operand is not None else ""
+        return f"CASE {op}{whens}{dflt} END"
+    if isinstance(e, Coalesce):
+        return f"COALESCE({', '.join(_estr(a) for a in e.args)})"
+    if isinstance(e, Cast):
+        return f"CAST({_estr(e.expr)} AS {e.dtype})"
     return repr(e)

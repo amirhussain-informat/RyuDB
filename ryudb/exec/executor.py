@@ -1062,7 +1062,9 @@ class Engine:
             df = self._exec(node.input)
             mask = eval_expr(node.predicate, df)
             if isinstance(mask, cudf.Series):
-                return df[mask]
+                # SQL three-valued logic: an NA predicate (e.g. NULL IN / NULL
+                # LIKE) drops the row. Aligns with the join-residual path.
+                return df[mask.fillna(False)]
             return df if mask else df.iloc[0:0]
         if isinstance(node, Join):
             left = self._exec(node.left)
