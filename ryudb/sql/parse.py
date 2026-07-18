@@ -65,6 +65,7 @@ from .plan import (
     Coalesce,
     Col,
     Delete,
+    Distinct,
     Expr,
     Filter,
     Func,
@@ -254,14 +255,11 @@ def _build_update(stmt: exp.Update) -> Update:
 
 
 def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
-    if sel.args.get("distinct"):
-        raise NotImplementedError("DISTINCT is not supported yet")
-    if sel.args.get("having"):
-        raise NotImplementedError("HAVING is not supported yet")
     if sel.args.get("qualify") or sel.args.get("windows"):
         raise NotImplementedError("window functions are not supported yet")
     if sel.args.get("connect") or sel.args.get("start"):
         raise NotImplementedError("recursive/hierarchical queries are not supported")
+    having = sel.args.get("having")
 
     # --- FROM + JOINs -> base relation ----------------------------------- #
     from_ = sel.args.get("from") or sel.args.get("from_")
@@ -334,7 +332,7 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
     group = sel.args.get("group")
     group_exprs = list(group.expressions) if group else []
 
-    if group_exprs or has_agg:
+    if group_exprs or has_agg or having is not None:
         if any(_is_star(it) for it in proj_items):
             raise NotImplementedError("SELECT * with GROUP BY/aggregates is not supported")
         # Build group keys and aggregates from the projection list so that
@@ -349,7 +347,30 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
                 aggs.append((e, alias))
             else:
                 group_keys.append((e, alias))
-        plan = Aggregate(plan, group_keys=group_keys, aggs=aggs)
+        if having is not None and not group_exprs and group_keys:
+            # HAVING with no explicit GROUP BY and a non-aggregate SELECT column
+            # is invalid SQL (the column must be grouped or aggregated); DuckDB
+            # rejects it too. Don't implicitly group by the stray columns.
+            raise NotImplementedError(
+                "HAVING without GROUP BY requires a pure-aggregate SELECT list "
+                "(add a GROUP BY for non-aggregate columns)"
+            )
+        if having is not None:
+            pred, extra_aggs = _having_predicate(having, proj_items, group_keys, aggs)
+            user_aggs = list(aggs)
+            plan = Aggregate(plan, group_keys=group_keys, aggs=aggs + extra_aggs)
+            plan = Filter(plan, pred)
+            if extra_aggs:
+                # The HAVING-only aggregates (_hvN) were added to compute the
+                # predicate but must not leak into the output; re-project only the
+                # user's columns (group keys + selected aggregates).
+                items = (
+                    [(Col(a), a) for _, a in group_keys]
+                    + [(Col(a), a) for _, a in user_aggs]
+                )
+                plan = Project(plan, items=items)
+        else:
+            plan = Aggregate(plan, group_keys=group_keys, aggs=aggs)
     else:
         if len(proj_items) == 1 and _is_star(proj_items[0]):
             plan = _maybe_project_star(plan)  # no-op pass-through
@@ -360,7 +381,73 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
                 items.append((e, alias))
             plan = Project(plan, items=items)
 
+    if sel.args.get("distinct"):
+        d = sel.args["distinct"]
+        if d.args.get("on") is not None:
+            raise NotImplementedError("DISTINCT ON is not supported")
+        plan = Distinct(plan)
+
     return _build_tail(sel, plan)
+
+
+def _having_predicate(having, proj_items, group_keys, aggs):
+    """Lower a HAVING clause to a predicate ``Expr`` over the ``Aggregate``'s
+    output frame, returning ``(predicate, extra_aggs)``.
+
+    The executor's ``Aggregate`` emits one column per group key and per selected
+    aggregate, named by their output aliases (the same aliases ``_proj_item`` /
+    ``_output_name`` produce). HAVING is evaluated by a ``Filter`` over that
+    frame, so every column HAVING references must be one of those aliases (or a
+    synthetic aggregate added below).
+
+    Each ``exp.AggFunc`` in the HAVING expression is rewritten to a bare ``Col``
+    of its matching SELECT-list aggregate's output alias (matched by the
+    sqlglot ``.sql()`` of the aggregate node, which is deterministic for the
+    default dialect -- an unaliased SELECT aggregate and a bare HAVING aggregate
+    of the same shape render identically and so match automatically). A HAVING
+    aggregate that is NOT in the SELECT list is added as a synthetic aggregate
+    ``_hvN`` (computed during grouping, then pruned from the output by a wrapping
+    ``Project``) and the HAVING reference rewrites to ``Col("_hvN")``.
+
+    Every remaining ``Col`` in the lowered predicate must name a group-key alias
+    or an aggregate alias; a reference to any other column is rejected (it is
+    neither grouped nor aggregated -- standard SQL requires one or the other).
+    Subqueries in HAVING are deferred.
+    """
+    if having.find(exp.Subquery) is not None or having.find(exp.Select) is not None:
+        raise NotImplementedError("subqueries in HAVING are not supported")
+    # Map each SELECT-list aggregate's sqlglot .sql() -> its output alias.
+    agg_map: dict[str, str] = {}
+    for it in proj_items:
+        if isinstance(it, exp.Alias):
+            inner = it.this
+            alias = it.alias
+        else:
+            inner = it
+            alias = _output_name(it)
+        if isinstance(inner, exp.AggFunc):
+            agg_map.setdefault(inner.sql(), alias)
+
+    extra_aggs: list[tuple[AggFunc, str]] = []
+    n_hv = 0
+    for a in list(having.this.find_all(exp.AggFunc)):
+        key = a.sql()
+        if key in agg_map:
+            a.replace(exp.column(agg_map[key]))
+        else:
+            n_hv += 1
+            name = f"_hv{n_hv}"
+            extra_aggs.append((_expr(a), name))
+            a.replace(exp.column(name))
+
+    pred = _expr(having.this)
+    allowed = {a for _, a in group_keys} | {a for _, a in aggs} | {a for _, a in extra_aggs}
+    for c in pred.columns():
+        if c not in allowed:
+            raise NotImplementedError(
+                f"HAVING references a non-aggregated, non-grouped column {c!r}"
+            )
+    return pred, extra_aggs
 
 
 # --------------------------------------------------------------------------- #
