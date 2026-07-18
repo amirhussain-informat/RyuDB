@@ -32,6 +32,7 @@ from ..sql.plan import (
 )
 from ..storage import scan
 from ..transaction import Transaction
+from ..wal import WAL, wal_path
 from .fused import (
     _PendingFrame,
     _arrow_match_dtype,
@@ -86,6 +87,17 @@ class Engine:
         self._commit_ts: int = 0          # monotonic; bumped on each commit
         self._txn: Transaction | None = None
         self._snapshots: dict[str, int] = {}  # name -> commit_ts captured
+        # Phase 2 step 6 -- WAL + recovery. Each commit is appended to
+        # <data_dir>/ryudb.wal and fsync'd BEFORE the in-memory delta is mutated,
+        # so commit_ts doubles as the WAL LSN. On startup we replay the WAL to
+        # reconstruct the delta and reset _commit_ts to the highest replayed LSN.
+        # Disabled (no-op) when there is no data dir, mirroring Catalog gating.
+        self._wal: WAL = WAL(wal_path(catalog.data_dir))
+        max_ts = 0
+        for cts, table, frame in self._wal.replay():
+            self.delta.append(table, frame, cts)
+            max_ts = max(max_ts, cts)
+        self._commit_ts = max_ts
 
     def clear_scan_cache(self) -> None:
         """Clear the GPU-resident frame cache (forces a re-read on next scan).
@@ -181,13 +193,36 @@ class Engine:
         # Flush the txn's buffered batches to the shared delta under one new ts ->
         # atomic commit (all-or-nothing). Buffer append order is preserved, so the
         # post-commit visible series (base ++ batches_at(snapshot) ++ buffer) is
-        # byte-identical to the in-txn read-your-writes series.
-        ts = self._next_commit_ts()
-        for table in txn.tables():
-            for frame in txn.buffer_batches(table):
-                self.delta.append(table, frame, ts)
-            self._invalidate_table_caches(table)
+        # byte-identical to the in-txn read-your-writes series. Step 6 routes the
+        # flush through _write_commit so the whole commit is one durable WAL
+        # record (atomic on the disk side too), written+fsync'd before the
+        # in-memory delta mutates.
+        batches = [(t, f) for t in txn.tables() for f in txn.buffer_batches(t)]
+        self._write_commit(batches)
         self._txn = None
+
+    def _write_commit(self, batches: list[tuple[str, cudf.DataFrame]]) -> int:
+        """The single durable-commit seam used by both the autocommit INSERT path
+        and the explicit txn COMMIT path.
+
+        Allocates one new commit_ts, writes+fsyncs a single WAL record holding
+        every batch in ``batches`` (one record per commit => commit atomicity is
+        either a fully CRC-valid durable record or a discarded torn tail), and
+        ONLY THEN appends the batches to the in-memory delta in the given order.
+        A crash after the fsync but before the in-memory append is recovered by
+        WAL replay; a crash during the write leaves a torn tail the next replay
+        discards -- so a commit is all-or-nothing on both sides of a restart. The
+        in-memory append order is identical to today's, preserving the MVCC
+        byte-identical invariant. Empty ``batches`` bumps the counter but writes
+        no WAL record (the counter is recovered as max replayed ts). Returns ts.
+        """
+        ts = self._next_commit_ts()
+        self._wal.write_commit(ts, batches)  # durable BEFORE in-memory mutation
+        for table, frame in batches:
+            self.delta.append(table, frame, ts)
+        for table in dict.fromkeys(t for t, _ in batches):
+            self._invalidate_table_caches(table)
+        return ts
 
     def _rollback(self) -> None:
         txn = self._txn
@@ -237,6 +272,12 @@ class Engine:
             )
         touched = self.delta.rewind(target)
         self._commit_ts = target
+        # Phase 2 step 6: durably drop the discarded tail from the WAL too, so a
+        # crash right after a restore doesn't replay the discarded batches back
+        # in. commit_ts is monotonic so the discarded records are a tail suffix
+        # -> physical truncate to the first record past `target` (mirrors the
+        # delta rewind). No-op when the WAL is disabled.
+        self._wal.truncate(target)
         # Drop snapshots that now point at discarded state (ts > target). This is
         # the dangling-snapshot fix: without it, restore("b") after restore("a")
         # (where b's ts > a) would silently return state rolled back past b.
@@ -422,12 +463,15 @@ class Engine:
         # maintained-fact caches must be dropped -- including on buffer-append,
         # or a warm in-txn read would leave stale codes read OOB on the next
         # in-txn read after the buffer grows.
+        # Phase 2 step 6: the autocommit path routes through _write_commit so the
+        # batch is also written+fsync'd to the WAL before the in-memory delta
+        # mutates (durable). The buffered (txn) path never touches the WAL -- an
+        # uncommitted txn is implicitly rolled back on process exit.
         if self._txn is not None:
             self._txn.buffer_append(node.table, frame)
+            self._invalidate_table_caches(node.table)
         else:
-            ts = self._next_commit_ts()
-            self.delta.append(node.table, frame, ts)
-        self._invalidate_table_caches(node.table)
+            self._write_commit([(node.table, frame)])
         return len(frame)
 
     def sql(self, sql: str) -> "cudf.DataFrame | int | None":
