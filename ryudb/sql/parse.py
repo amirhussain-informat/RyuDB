@@ -25,8 +25,12 @@ clear message.
 
 Uncorrelated ``x IN (SELECT ...)`` / ``x NOT IN (SELECT ...)`` in WHERE lower to
 semi/anti joins (see ``_apply_where_subqueries``): the subquery becomes the
-Join's right child, a normal subtree the optimizer recurses into. EXISTS, scalar
-subqueries, correlated subqueries, and IN under OR are deferred.
+Join's right child, a normal subtree the optimizer recurses into. IN under OR is
+deferred. Uncorrelated scalar subqueries (single-row aggregates such as
+``SELECT COUNT(*)/MAX(...) FROM ...``) and ``EXISTS (SELECT ...)`` -- anywhere a
+boolean/value is legal in WHERE or projection -- are flattened into cross-joins
+of a 1-row relation onto the outer plan (see ``_flatten_outer_subqueries``);
+NOT EXISTS falls out via ``Not``. Correlated subqueries are deferred (E-3).
 
 Set operators (UNION [ALL] / INTERSECT / EXCEPT) compose two SELECTs into a
 ``SetOp`` node (see ``_build_query`` / ``_build_setop``); DISTINCT set ops use
@@ -273,6 +277,19 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None):
             on_predicate=on_predicate,
         )
         aliases[ralias] = rtbl
+
+    # --- uncorrelated scalar / EXISTS subqueries -> cross-join broadcast -- #
+    # Flatten each uncorrelated scalar subquery (a single-row aggregate, e.g.
+    # ``SELECT COUNT(*)/MAX(...) FROM ...``) and each ``EXISTS (SELECT ...)`` that
+    # appear in THIS select's WHERE or projection into a cross-join of a 1-row
+    # relation onto ``plan``, replacing the subquery node with a bare Column
+    # reference to the broadcast column. Done before the WHERE block so the
+    # replaced Columns flow into the residual Filter / IN-subquery handling
+    # normally. Correlated subqueries are rejected here (outer aliases are in
+    # scope); IN/NOT IN subqueries are left untouched (handled below). See
+    # ``_flatten_outer_subqueries``. Non-aggregate and GROUP BY scalar subqueries
+    # are deferred (no 1-row guarantee).
+    plan = _flatten_outer_subqueries(plan, sel, schema, aliases)
 
     # --- WHERE ----------------------------------------------------------- #
     where = sel.args.get("where")
@@ -656,6 +673,121 @@ def _subquery_output_col(subplan) -> str:
     raise NotImplementedError(
         "IN-subquery must project a single named column (SELECT * is ambiguous)"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Uncorrelated scalar / EXISTS subqueries -> cross-join broadcast (Phase E-2).
+# A scalar subquery (a single-row aggregate such as ``SELECT COUNT(*)/MAX(...)
+# FROM ...``) or an ``EXISTS (SELECT ...)`` that appears in THIS select's WHERE or
+# projection is flattened into a cross-join of a 1-row relation onto the running
+# ``plan``; the subquery sqlglot node is replaced in place by a bare Column
+# reference to the broadcast column. Keeping it relational (a Join.right subtree
+# the optimizer recurses into) -- not an Expr-embedded subplan -- leaves
+# ``eval_expr`` engine-free, consistent with the IN/NOT IN lowering (E-1).
+#
+# EXISTS becomes ``(SELECT COUNT(*) FROM (subquery) LIMIT 1) > 0``: a 1-row
+# aggregate whose value is 1 iff the subquery has any row, 0 otherwise. Replacing
+# the ``exp.Exists`` node with ``exp.GT(col, 0)`` (rather than a dedicated node)
+# means EXISTS works wherever a boolean is legal -- under AND/OR/NOT, in a
+# comparison, in projection -- not only as a top-level WHERE conjunct (unlike IN,
+# which is restricted to AND-conjuncts). NOT EXISTS falls out for free: the
+# wrapping ``exp.Not`` becomes ``Not(GT(col, 0))``, and since the count is a
+# non-NULL int ``Not`` inverts it correctly.
+#
+# Scalar subqueries are restricted to *single-row aggregates* (the only shape with
+# a guaranteed 1 row, so the cross-join broadcasts exactly one value per outer
+# row). Non-aggregate scalars (``SELECT k FROM b`` -- 0+ rows) and GROUP BY
+# scalars (``SELECT k FROM b GROUP BY k`` -- N rows) are deferred. Correlated
+# subqueries are rejected (outer-scope column binding is E-3).
+# --------------------------------------------------------------------------- #
+
+
+def _flatten_outer_subqueries(plan, sel, schema, outer_aliases):
+    """Flatten uncorrelated scalar / EXISTS subqueries of THIS select into
+    cross-joins on ``plan``, replacing each subquery node with a Column ref.
+
+    Only subqueries that belong to ``sel`` itself are collected -- ones nested
+    inside an inner SELECT (a subquery's own body, or an IN-subquery's body) are
+    NOT descended into; they are handled recursively by that inner select's own
+    ``_build_select`` (or by ``_apply_where_subqueries`` for IN). IN/NOT IN
+    subquery nodes (``exp.In`` with a ``query``) are left untouched here."""
+    acc: list[tuple[str, exp.Expression]] = []
+    where = sel.args.get("where")
+    if where is not None:
+        _collect_outer_subqueries(where.this, acc)
+    for it in sel.expressions:
+        _collect_outer_subqueries(it, acc)
+
+    n = 0
+    for kind, node in acc:
+        n += 1
+        name = f"_sq{n}"
+        if kind == "exists":
+            inner = node.this  # the exp.Select under exp.Exists
+            _reject_correlated(inner, outer_aliases)
+            subplan = _build_query(inner, schema)
+            # COUNT(*) of <=1 row > 0: 1 iff the subquery has any row, else 0.
+            # COUNT must be uppercase (the executor's _scalar_global_agg special-
+            # cases ``func == "COUNT"`` with a Star arg); ``AGG_FUNCS`` (used by
+            # _build_select) already yields the uppercase tag.
+            count_plan = Aggregate(
+                Limit(subplan, 1, 0), [], [(AggFunc("COUNT", Star()), name)]
+            )
+            plan = Join(plan, count_plan, [], [], "cross", None)
+            node.replace(exp.GT(this=exp.column(name), expression=exp.Literal.number(0)))
+        else:  # scalar
+            inner = node.this if isinstance(node, exp.Subquery) else node
+            _reject_correlated(inner, outer_aliases)
+            subplan = _build_query(inner, schema)
+            _require_global_aggregate(subplan)
+            existing = _subquery_output_col(subplan)
+            # Rename the aggregate's single output column to the broadcast name
+            # via a 1-item Project so the cross-joined column is referenced cleanly.
+            renamed = Project(subplan, [(Col(existing), name)])
+            plan = Join(plan, renamed, [], [], "cross", None)
+            node.replace(exp.column(name))
+    return plan
+
+
+def _collect_outer_subqueries(node, acc):
+    """Collect scalar (``exp.Subquery``) and ``exp.Exists`` subqueries that belong
+    to the outer select, WITHOUT descending into any inner select's body (those
+    are owned by the inner query and handled recursively). IN-subquery nodes
+    (``exp.In`` carrying a ``query``) are skipped: their subquery is owned by
+    ``_apply_where_subqueries``."""
+    if isinstance(node, exp.Exists):
+        acc.append(("exists", node))
+        return  # do not descend into .this (the inner SELECT)
+    if isinstance(node, exp.Subquery):
+        parent = node.parent
+        if isinstance(parent, exp.In) and parent.args.get("query") is node:
+            return  # IN-subquery: owned by _apply_where_subqueries
+        acc.append(("scalar", node))
+        return  # do not descend into .this (the inner SELECT)
+    if isinstance(node, exp.Select):
+        return  # an inner select reached without an owning Subquery/Exists wrapper
+    for child in node.args.values():
+        if isinstance(child, exp.Expression):
+            _collect_outer_subqueries(child, acc)
+        elif isinstance(child, list):
+            for c in child:
+                if isinstance(c, exp.Expression):
+                    _collect_outer_subqueries(c, acc)
+
+
+def _require_global_aggregate(subplan):
+    """A scalar subquery must be a single-row aggregate (a global aggregate with
+    no GROUP BY keys) so the cross-join broadcasts exactly one value per outer
+    row. Non-aggregate and GROUP BY scalar subqueries are deferred."""
+    core = subplan
+    while isinstance(core, (Sort, Limit)):
+        core = core.input
+    if not isinstance(core, Aggregate) or core.group_keys:
+        raise NotImplementedError(
+            "scalar subquery must be a single-row aggregate (e.g. "
+            "SELECT COUNT(*)/MAX(...) FROM ...); non-aggregate and GROUP BY "
+            "scalar subqueries are not supported yet"
+        )
 
 
 def _between(node, negated: bool) -> Expr:

@@ -1,0 +1,36 @@
+sql: EXISTS + uncorrelated scalar subqueries (Phase E-2)
+
+Flatten uncorrelated scalar subqueries (single-row aggregates such as
+SELECT COUNT(*)/MAX(...) FROM ...) and EXISTS (SELECT ...) into cross-joins
+of a 1-row relation onto the outer plan, replacing the subquery node with a
+bare Column reference to the broadcast column. Keeps eval_expr engine-free
+and consistent with the E-1 IN/NOT IN lowering (the subquery is a normal
+Join.right subtree the optimizer recurses into).
+
+EXISTS becomes (SELECT COUNT(*) FROM (subq) LIMIT 1) > 0: 1 iff the subquery
+has any row, else 0. Replacing exp.Exists with col > 0 (not a dedicated node)
+means EXISTS works under AND/OR/NOT and in projection, not just as a top-level
+WHERE conjunct (unlike IN). NOT EXISTS falls out via Not (the count is a
+non-NULL int, so Not inverts it correctly).
+
+Scalar subqueries are restricted to single-row aggregates (the only shape
+with a guaranteed 1 row); non-aggregate and GROUP BY scalars are deferred.
+Correlated scalar/EXISTS subqueries are rejected (deferred to E-3).
+
+parse.py: _flatten_outer_subqueries runs in _build_select before the WHERE
+block, collecting scalar/EXISTS subqueries from WHERE.this and sel.expressions
+without descending into inner selects (owned by their own _build_select) or
+IN-subqueries (owned by _apply_where_subqueries). Each is cross-joined onto
+the running plan; the subquery node is replaced in place (exp.column / exp.GT)
+so the replaced Columns flow into the residual Filter / projection normally.
+_require_global_aggregate enforces the 1-row guarantee.
+
+optimize.py: push_predicates must not push a conjunct that references a
+non-base column (a cross-join broadcast column like _sq1) below a scan -- it
+depends on a column produced above the join. Without this guard the
+semi-join-wrapping-cross-join shape (scalar + IN in the same WHERE) mis-routes
+the residual conjunct into a scan that lacks the broadcast column.
+
+382 tests pass (364 + 18 new E-2 cases); ruff clean; bench 6/6 check=OK.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
