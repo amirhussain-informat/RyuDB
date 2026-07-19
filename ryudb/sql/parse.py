@@ -271,8 +271,6 @@ def _build_update(stmt: exp.Update) -> Update:
 
 
 def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None, ctes=None):
-    if sel.args.get("windows"):
-        raise NotImplementedError("named window definitions (WINDOW ...) are not supported yet")
     if sel.args.get("connect") or sel.args.get("start"):
         raise NotImplementedError("recursive/hierarchical queries are not supported")
     having = sel.args.get("having")
@@ -353,6 +351,10 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None, c
 
     # --- projection / aggregate ------------------------------------------ #
     proj_items = list(sel.expressions)
+    # Inline any named window definitions (``WINDOW w AS (...)``) into their
+    # ``OVER w`` references before window detection, so each reference becomes a
+    # plain inline ``exp.Window`` for ``_build_window`` (zero executor change).
+    _resolve_named_windows(sel, proj_items, qualify)
     # Window functions are detected and lowered BEFORE the aggregate check:
     # sqlglot's aggregate-window funcs (SUM/LAG/RANK/.. OVER) are ``exp.AggFunc``
     # subclasses, so ``_contains_agg`` would otherwise misroute them into the
@@ -1890,14 +1892,71 @@ def _reject_window_outside_projection(sel):
             )
 
 
+def _resolve_named_windows(sel, proj_items, qualify):
+    """Inline named window definitions (``WINDOW w AS (...)``) into every
+    ``OVER w`` reference in the projection and QUALIFY, so each reference
+    becomes a plain inline ``exp.Window`` that ``_build_window`` /
+    ``_build_one_window`` lower directly (zero executor change -- this is pure
+    parse-time rewriting, like QUALIFY's lowering). A pure reference ``OVER w``
+    parses to an ``exp.Window`` whose ``alias`` arg holds the referenced name
+    (an ``exp.Identifier``) with no ``partition_by`` / ``order`` / ``spec``;
+    copy those from the matching def and drop the ``alias``. Chaining defs
+    (``WINDOW w2 AS (w1 ...)``), partial overrides (``OVER (w ORDER BY ...)``),
+    duplicate defs, and unknown references are rejected (deferred / malformed).
+    Unused defs (never referenced) are allowed and silently ignored."""
+    defs = sel.args.get("windows") or []
+    named: dict[str, exp.Window] = {}
+    for d in defs:
+        if not isinstance(d.this, exp.Identifier):
+            raise NotImplementedError("malformed named window definition")
+        if d.args.get("alias") is not None:
+            raise NotImplementedError(
+                "named window definitions that reference another window are not supported"
+            )
+        name = d.this.name
+        if name in named:
+            raise NotImplementedError(f"duplicate named window definition {name!r}")
+        named[name] = d
+
+    def _resolve(win):
+        ref = win.args.get("alias")
+        if not isinstance(ref, exp.Identifier):
+            return  # an inline window (no named reference) -- nothing to inline
+        if (
+            win.args.get("partition_by") is not None
+            or win.args.get("order") is not None
+            or win.args.get("spec") is not None
+        ):
+            raise NotImplementedError(
+                "OVER (w ...) partial window override is not supported"
+            )
+        name = ref.name
+        if name not in named:
+            raise NotImplementedError(f"unknown named window {name!r}")
+        d = named[name]
+        win.set("partition_by", d.args.get("partition_by"))
+        win.set("order", d.args.get("order"))
+        win.set("spec", d.args.get("spec"))
+        win.set("alias", None)
+
+    for it in proj_items:
+        for win in list(it.find_all(exp.Window)):
+            _resolve(win)
+    if qualify is not None:
+        for win in list(qualify.find_all(exp.Window)):
+            _resolve(win)
+
+
 # Window functions: ranking (ROW_NUMBER/RANK/DENSE_RANK) and offset (LAG/LEAD)
 # require an ORDER BY; aggregate funcs (SUM/COUNT/AVG/MIN/MAX) broadcast over the
 # whole partition when there is no ORDER BY, and compute a running/cumulative
 # aggregate (with the SQL default frame RANGE UNBOUNDED PRECEDING TO CURRENT ROW,
 # or an explicit ROWS/RANGE frame) when an ORDER BY is present. QUALIFY
-# (window-function filtering) is supported (G-4). Deferred: expression PARTITION
-# BY / ORDER BY keys, window + GROUP BY, RANGE value offsets, EXCLUDE, and
-# MIN/MAX with a FOLLOWING bound.
+# (window-function filtering) is supported (G-4). Named window definitions
+# (WINDOW w AS (...); OVER w) are inlined at parse time (G-5). Deferred:
+# expression PARTITION BY / ORDER BY keys, window + GROUP BY, RANGE value
+# offsets, EXCLUDE, MIN/MAX with a FOLLOWING bound, named-window chaining
+# (WINDOW w2 AS (w1 ...)), and partial overrides (OVER (w ORDER BY ...)).
 _WINDOW_RANK_FUNCS = {exp.RowNumber: "ROW_NUMBER", exp.Rank: "RANK",
                       exp.DenseRank: "DENSE_RANK"}
 

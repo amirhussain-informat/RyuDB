@@ -35,9 +35,13 @@ BY``/``ORDER BY`` keys (only bare columns), rank functions without an ORDER BY,
 window functions mixed with ``GROUP BY``/``HAVING``, ``RANGE`` frames with
 value offsets (``RANGE BETWEEN N PRECEDING``), ``EXCLUDE``, a frame on an
 aggregate with no ORDER BY, and ``MIN``/``MAX`` with a non-cumulative frame
-(trailing ``ROWS N PRECEDING AND CURRENT ROW`` or any FOLLOWING bound).
+(trailing ``ROWS N PRECEDING AND CURRENT ROW`` or any FOLLOWING bound), named
+window chaining (``WINDOW w2 AS (w1 ...)``) and partial overrides
+(``OVER (w ORDER BY ...)``).
 ``QUALIFY`` (window-function filtering) is supported (Phase G-4) -- see the
-QUALIFY section below.
+QUALIFY section below. Named window definitions (``WINDOW w AS (...)``;
+``OVER w``) are supported (Phase G-5) -- inlined at parse time, see the
+Named-window section below.
 
 A window function in arithmetic (``w - LAG(w) OVER (...)``) and a plain
 projection alongside a window output are supported (the ``Window`` node passes
@@ -935,6 +939,164 @@ def test_qualify_subquery_rejected(sengine):
     _rej(sengine, "SELECT k, w FROM a QUALIFY k IN (SELECT k FROM a)")
 
 
-def test_qualify_named_window_def_rejected(sengine):
-    # Named window definitions (WINDOW w AS (...)) are still unsupported.
-    _rej(sengine, "SELECT k, ROW_NUMBER() OVER w AS rn FROM a WINDOW w AS (PARTITION BY k ORDER BY w)")
+def test_qualify_with_named_window(sengine, sduck):
+    # QUALIFY + a named window def: the QUALIFY inline window references the
+    # named def, which is inlined at parse time before _build_qualify_predicate.
+    sql = ("SELECT k, w, v FROM c WINDOW w AS (PARTITION BY k ORDER BY w) "
+           "QUALIFY ROW_NUMBER() OVER w = 1")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+# --------------------------------------------------------------------------- #
+# Named window definitions (Phase G-5) -- WINDOW w AS (...) inlined into OVER w
+# --------------------------------------------------------------------------- #
+#
+# A named window definition (``WINDOW w AS (PARTITION BY .. ORDER BY ..)``) is
+# inlined at parse time into every ``OVER w`` reference (in the projection and
+# in QUALIFY), so each reference becomes a plain inline ``exp.Window`` that the
+# existing ``_build_window`` / ``_build_one_window`` lower directly -- zero
+# executor/optimizer change (pure parse-time rewriting, like QUALIFY). A pure
+# reference ``OVER w`` parses to an ``exp.Window`` whose ``alias`` arg holds the
+# referenced name (an ``exp.Identifier``) with no ``partition_by`` / ``order`` /
+# ``spec``; the parser copies those from the matching def and drops the
+# ``alias``. Chaining defs, partial overrides, duplicate defs, and unknown
+# references are rejected.
+
+
+def test_named_window_row_number(sengine, sduck):
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER w AS rn FROM c "
+           "WINDOW w AS (PARTITION BY k ORDER BY w)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_named_window_two_funcs_same_def(sengine, sduck):
+    # Two different functions referencing the same named window.
+    sql = ("SELECT k, w, ROW_NUMBER() OVER w AS rn, RANK() OVER w AS rk FROM c "
+           "WINDOW w AS (PARTITION BY k ORDER BY w)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_named_window_desc_order(sengine, sduck):
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER w AS rn FROM c "
+           "WINDOW w AS (PARTITION BY k ORDER BY w DESC)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_named_window_lag(sengine, sduck):
+    sql = ("SELECT k, w, v, LAG(v) OVER w AS lv FROM c "
+           "WINDOW w AS (PARTITION BY k ORDER BY w)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_named_window_broadcast_aggregate(sengine, sduck):
+    # A named window with no ORDER BY -> whole-partition broadcast.
+    sql = ("SELECT k, v, SUM(v) OVER w AS s FROM c "
+           "WINDOW w AS (PARTITION BY k)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_named_window_running_aggregate_default_frame(sengine, sduck):
+    # A named window with an ORDER BY and no explicit frame -> the parser
+    # synthesizes the default RANGE UNBOUNDED PRECEDING TO CURRENT ROW frame
+    # (peer-group cumulative), exactly as an inline window would.
+    sql = ("SELECT k, w, v, SUM(v) OVER w AS s FROM c "
+           "WINDOW w AS (PARTITION BY k ORDER BY w)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_named_window_explicit_rows_frame(sengine, sduck):
+    # An explicit ROWS frame in the named def is inlined into the reference.
+    sql = ("SELECT k, w, v, SUM(v) OVER w AS s FROM c "
+           "WINDOW w AS (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_named_window_no_partition(sengine, sduck):
+    # A named window with no PARTITION BY (single partition).
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER w AS rn FROM c "
+           "WINDOW w AS (ORDER BY w)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_named_window_two_defs(sengine, sduck):
+    # Two named windows, each referenced.
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER w1 AS rn, SUM(v) OVER w2 AS s "
+           "FROM c WINDOW w1 AS (PARTITION BY k ORDER BY w), "
+           "w2 AS (PARTITION BY k)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_named_window_in_arithmetic(sengine, sduck):
+    # A named-window reference inside an arithmetic expression.
+    sql = ("SELECT k, w, v - LAG(v) OVER w AS diff FROM c "
+           "WINDOW w AS (PARTITION BY k ORDER BY w)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_named_window_with_order_by(sengine, sduck):
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER w AS rn FROM c "
+           "WINDOW w AS (PARTITION BY k ORDER BY w) ORDER BY k DESC, w DESC")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_named_window_typed_decimal_date(typed_engine):
+    import duckdb
+
+    d = typed_engine.catalog.data_dir
+    con = duckdb.connect()
+    con.execute(f"CREATE VIEW lineitem AS SELECT * FROM read_parquet('{d}/lineitem/*.parquet')")
+    sql = ("SELECT l_orderkey, l_quantity, l_shipdate, "
+           "ROW_NUMBER() OVER w AS rn FROM lineitem "
+           "WINDOW w AS (PARTITION BY l_discount ORDER BY l_orderkey) "
+           "QUALIFY rn = 1 ORDER BY l_orderkey")
+    assert _ryu(typed_engine, sql) == _duck(con, sql)
+
+
+def test_named_window_inlines_to_one_window_node():
+    # After inlining, the plan has a single Window node with one func whose
+    # OVER is the full inline spec (the named ref is gone).
+    plan = parse("SELECT k, w, ROW_NUMBER() OVER w AS rn FROM a "
+                 "WINDOW w AS (PARTITION BY k ORDER BY w)")
+    win = _window_of(plan)
+    assert len(win.funcs) == 1
+    wf, name = win.funcs[0]
+    assert name == "_wf1"
+    assert wf.func == "ROW_NUMBER"
+    assert [c.name for c in wf.partition_keys] == ["k"]
+    assert [c.name for (c, _asc) in wf.order_keys] == ["w"]
+
+
+def test_named_window_two_refs_two_funcs():
+    # Two references to the same named window -> two WindowFuncs on the Window
+    # node (the executor computes both; output matches DuckDB which also
+    # assigns both the same per-row values).
+    plan = parse("SELECT k, ROW_NUMBER() OVER w AS r1, RANK() OVER w AS r2 FROM a "
+                 "WINDOW w AS (PARTITION BY k ORDER BY w)")
+    win = _window_of(plan)
+    funcs = {name: wf.func for wf, name in win.funcs}
+    assert funcs == {"_wf1": "ROW_NUMBER", "_wf2": "RANK"}
+
+
+# --- Named window rejections --- #
+
+
+def test_named_window_chaining_rejected(sengine):
+    # WINDOW w2 AS (w1 ...) -- a def that references another def.
+    _rej(sengine, "SELECT ROW_NUMBER() OVER w2 AS rn FROM a "
+                  "WINDOW w1 AS (PARTITION BY k), w2 AS (w1 ORDER BY w)")
+
+
+def test_named_window_partial_override_rejected(sengine):
+    # OVER (w ORDER BY ...) -- a reference with its own inline additions.
+    _rej(sengine, "SELECT ROW_NUMBER() OVER (w ORDER BY w) AS rn FROM a "
+                  "WINDOW w AS (PARTITION BY k)")
+
+
+def test_named_window_unknown_ref_rejected(sengine):
+    _rej(sengine, "SELECT ROW_NUMBER() OVER missing AS rn FROM a")
+
+
+def test_named_window_duplicate_def_rejected(sengine):
+    _rej(sengine, "SELECT ROW_NUMBER() OVER w AS rn FROM a "
+                  "WINDOW w AS (PARTITION BY k), w AS (PARTITION BY k ORDER BY w)")
