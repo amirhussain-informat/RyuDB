@@ -20,12 +20,22 @@ expression. Three families are supported:
   partition, matching DuckDB). ``COUNT(*)`` is the partition row count;
   ``COUNT(expr)`` is the non-NULL count; an empty partition is 0 (COALESCE) not
   NULL.
+* **Running/cumulative aggregates** (``SUM`` / ``COUNT`` / ``AVG`` / ``MIN`` /
+  ``MAX``) WITH an ORDER BY -- the SQL default frame (``RANGE BETWEEN UNBOUNDED
+  PRECEDING AND CURRENT ROW``, peer-group cumulative: rows with equal order
+  keys share the cumulative value, matching DuckDB) or an explicit ``ROWS`` /
+  ``RANGE`` frame. ``ROWS`` frames use per-partition prefix sums (``SUM`` /
+  ``COUNT`` / ``AVG``, O(n), any bounds incl. FOLLOWING) or ``cummin`` /
+  ``cummax`` (``MIN`` / ``MAX``, cumulative only). NULLs in the agg arg are
+  skipped (SQL): an all-null or empty window yields NULL for ``SUM`` / ``AVG``,
+  0 for ``COUNT``; ``MIN`` / ``MAX`` skip nulls via ffill of the cumulative.
 
-Deferred (raise ``NotImplementedError``): running/cumulative aggregates (an
-ORDER BY on an aggregate window), explicit frames (``ROWS``/``RANGE
-BETWEEN``), ``QUALIFY``, expression ``PARTITION BY``/``ORDER BY`` keys (only
-bare columns), rank functions without an ORDER BY, and window functions mixed
-with ``GROUP BY``/``HAVING``.
+Deferred (raise ``NotImplementedError``): ``QUALIFY``, expression ``PARTITION
+BY``/``ORDER BY`` keys (only bare columns), rank functions without an ORDER BY,
+window functions mixed with ``GROUP BY``/``HAVING``, ``RANGE`` frames with
+value offsets (``RANGE BETWEEN N PRECEDING``), ``EXCLUDE``, a frame on an
+aggregate with no ORDER BY, and ``MIN``/``MAX`` with a non-cumulative frame
+(trailing ``ROWS N PRECEDING AND CURRENT ROW`` or any FOLLOWING bound).
 
 A window function in arithmetic (``w - LAG(w) OVER (...)``) and a plain
 projection alongside a window output are supported (the ``Window`` node passes
@@ -381,14 +391,231 @@ def _rej(engine: Engine, sql: str):
         engine.sql(sql)
 
 
-def test_running_aggregate_rejected(sengine):
-    # ORDER BY on an aggregate window -> running/cumulative aggregate (deferred).
-    _rej(sengine, "SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w) AS s FROM a")
+# --------------------------------------------------------------------------- #
+# Running/cumulative aggregates + frames (Phase G-3)
+# --------------------------------------------------------------------------- #
 
 
-def test_explicit_frame_rejected(sengine):
-    _rej(sengine,
-         "SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM a")
+def test_running_sum_default_frame(sengine, sduck):
+    # The SQL default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW) is
+    # peer-group cumulative: the tied w=10 rows share the cumulative sum.
+    sql = "SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w) AS s FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_running_count_star(sengine, sduck):
+    sql = "SELECT k, w, COUNT(*) OVER (PARTITION BY k ORDER BY w) AS c FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_running_count_expr(sengine, sduck):
+    # COUNT(w) running ignores the NULL w.
+    sql = "SELECT k, w, COUNT(w) OVER (PARTITION BY k ORDER BY w) AS c FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_running_avg(sengine, sduck):
+    sql = "SELECT k, w, AVG(w) OVER (PARTITION BY k ORDER BY w) AS av FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_running_min_max(sengine, sduck):
+    sql = ("SELECT k, w, MIN(w) OVER (PARTITION BY k ORDER BY w) AS mn, "
+           "MAX(w) OVER (PARTITION BY k ORDER BY w) AS mx FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_default_range_differs_from_rows_on_ties(sengine, sduck):
+    # The default (RANGE, peer) and an explicit ROWS cumulative diverge on the
+    # tied w=10 rows -- and BOTH match DuckDB. This is the load-bearing proof
+    # that peer-group semantics are implemented, not positional cumsum.
+    sql_range = "SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w) AS s FROM a"
+    sql_rows = ("SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w "
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM a")
+    assert _ryu(sengine, sql_range) == _duck(sduck, sql_range)
+    assert _ryu(sengine, sql_rows) == _duck(sduck, sql_rows)
+    # And they actually differ (so the test is meaningful).
+    assert _ryu(sengine, sql_range) != _ryu(sengine, sql_rows)
+
+
+def test_rows_cumulative(sengine, sduck):
+    sql = ("SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_rows_trailing_one(sengine, sduck):
+    sql = ("SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_rows_trailing_two_avg(sengine, sduck):
+    sql = ("SELECT k, w, AVG(w) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS av FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_rows_centered(sengine, sduck):
+    # A FOLLOWING bound: SUM/COUNT/AVG via prefix sums.
+    sql = ("SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_rows_current_to_following(sengine, sduck):
+    sql = ("SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS s FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_rows_current_to_unbounded_following(sengine, sduck):
+    # "Remaining" sum: every row sees the sum from itself to the partition end.
+    sql = ("SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS s FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_rows_unbounded_to_unbounded(sengine, sduck):
+    # Whole-partition frame via an explicit ROWS frame = the broadcast value.
+    sql = ("SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_rows_count_star_centered(sengine, sduck):
+    sql = ("SELECT k, w, COUNT(*) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_range_default_explicit(sengine, sduck):
+    # Explicit RANGE UNBOUNDED PRECEDING TO CURRENT ROW == the default frame.
+    sql = ("SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w "
+           "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_range_unbounded_to_unbounded(sengine, sduck):
+    sql = ("SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w "
+           "RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_min_max_cumulative_with_following(sengine, sduck):
+    # MIN/MAX with start UNBOUNDED PRECEDING and a FOLLOWING end is cumulative
+    # (cummin/cummax at hi) -- supported.
+    sql = ("SELECT k, w, MAX(w) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) AS mx FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_min_max_whole_partition_frame(sengine, sduck):
+    sql = ("SELECT k, w, MIN(w) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS mn FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_running_no_partition(sengine, sduck):
+    # Single partition (no PARTITION BY) running aggregate.
+    sql = "SELECT k, w, SUM(w) OVER (ORDER BY w) AS s FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_running_multikey_order(sengine, sduck):
+    # Peer = equal on ALL order keys.
+    sql = "SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY k, w) AS s FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_running_in_arithmetic(sengine, sduck):
+    sql = "SELECT k, w, w - SUM(w) OVER (PARTITION BY k ORDER BY w) AS d FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_running_with_where(sengine, sduck):
+    sql = ("SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w) AS s "
+           "FROM a WHERE w > 10")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_running_mixed_with_broadcast(sengine, sduck):
+    # A running aggregate alongside a whole-partition broadcast in one query.
+    sql = ("SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w) AS run_s, "
+           "SUM(w) OVER (PARTITION BY k) AS all_s FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_running_join_then_window(sengine, sduck):
+    sql = ("SELECT a.k, a.w, b.v, "
+           "SUM(b.v) OVER (PARTITION BY a.k ORDER BY b.v) AS s "
+           "FROM a JOIN b ON a.k = b.k")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+# --------------------------------------------------------------------------- #
+# Parse shape -- the frame on the WindowFunc
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_default_frame_synthesized():
+    from ryudb.sql.plan import Frame, FrameBound
+
+    plan = parse("SELECT SUM(w) OVER (PARTITION BY k ORDER BY w) AS s FROM a")
+    wf, _ = _window_of(plan).funcs[0]
+    assert wf.frame == Frame(
+        "RANGE", FrameBound("UNBOUNDED_PRECEDING"), FrameBound("CURRENT_ROW")
+    )
+
+
+def test_parse_explicit_rows_frame():
+    from ryudb.sql.plan import Frame, FrameBound
+
+    plan = parse(
+        "SELECT SUM(w) OVER (PARTITION BY k ORDER BY w "
+        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM a")
+    wf, _ = _window_of(plan).funcs[0]
+    assert wf.frame == Frame(
+        "ROWS", FrameBound("PRECEDING", 1), FrameBound("CURRENT_ROW")
+    )
+
+
+def test_parse_explicit_rows_centered_frame():
+    from ryudb.sql.plan import Frame, FrameBound
+
+    plan = parse(
+        "SELECT SUM(w) OVER (PARTITION BY k ORDER BY w "
+        "ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING) AS s FROM a")
+    wf, _ = _window_of(plan).funcs[0]
+    assert wf.frame == Frame(
+        "ROWS", FrameBound("PRECEDING", 1), FrameBound("FOLLOWING", 2)
+    )
+
+
+def test_parse_broadcast_frame_none():
+    plan = parse("SELECT SUM(w) OVER (PARTITION BY k) AS s FROM a")
+    wf, _ = _window_of(plan).funcs[0]
+    assert wf.frame is None
+
+
+def test_parse_ranking_ignores_frame():
+    # A frame on ROW_NUMBER is ignored (DuckDB does too); frame stays None.
+    plan = parse(
+        "SELECT ROW_NUMBER() OVER (PARTITION BY k ORDER BY w "
+        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS rn FROM a")
+    wf, _ = _window_of(plan).funcs[0]
+    assert wf.func == "ROW_NUMBER"
+    assert wf.frame is None
+
+
+# --------------------------------------------------------------------------- #
+# Deferred forms -- raise NotImplementedError
+# --------------------------------------------------------------------------- #
+
+
+def _rej(engine: Engine, sql: str):
+    with pytest.raises(NotImplementedError):
+        engine.sql(sql)
 
 
 def test_rank_without_order_rejected(sengine):
@@ -411,3 +638,59 @@ def test_unsupported_window_func_rejected(sengine):
     # NTILE / PERCENT_RANK / CUME_DIST / FIRST_VALUE / LAST_VALUE / NTH_VALUE are
     # not in the F-1 whitelist.
     _rej(sengine, "SELECT k, NTILE(2) OVER (PARTITION BY k ORDER BY w) AS nt FROM a")
+
+
+def test_range_value_offset_rejected(sengine):
+    # RANGE with a value offset needs value-based (not positional) scanning.
+    _rej(sengine,
+         "SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w "
+         "RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM a")
+
+
+def test_min_max_trailing_rejected(sengine):
+    # MIN/MAX with a non-cumulative frame (trailing ROWS) is deferred.
+    _rej(sengine,
+         "SELECT k, w, MIN(w) OVER (PARTITION BY k ORDER BY w "
+         "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS mn FROM a")
+
+
+def test_min_max_following_rejected(sengine):
+    # MIN/MAX with a FOLLOWING bound and a non-UNBOUNDED start is deferred.
+    _rej(sengine,
+         "SELECT k, w, MIN(w) OVER (PARTITION BY k ORDER BY w "
+         "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS mn FROM a")
+
+
+def test_frame_without_order_rejected(sengine):
+    # A frame on an aggregate with no ORDER BY is ambiguous (deferred).
+    _rej(sengine,
+         "SELECT k, w, SUM(w) OVER (PARTITION BY k "
+         "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM a")
+
+
+def test_window_exclude_rejected(sengine):
+    _rej(sengine,
+         "SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w "
+         "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) AS s FROM a")
+
+
+# --------------------------------------------------------------------------- #
+# CLI smoke -- a running total + moving average
+# --------------------------------------------------------------------------- #
+
+
+def test_cli_running_output(sengine, capsys):
+    from ryudb import cli
+
+    cli._run_statement(
+        sengine,
+        "SELECT k, w, "
+        "sum(w) OVER (PARTITION BY k ORDER BY w) AS run_s, "
+        "avg(w) OVER (PARTITION BY k ORDER BY w "
+        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS ma "
+        "FROM a ORDER BY k, w",
+        quiet=False,
+    )
+    out = capsys.readouterr().out
+    assert "run_s" in out
+    assert "ma" in out
