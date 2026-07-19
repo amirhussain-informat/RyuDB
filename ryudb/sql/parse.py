@@ -1062,20 +1062,22 @@ def _apply_where_subqueries(plan, where_node, schema, outer_aliases, ctes=None):
         if sub is None:
             residual.append(_expr(c))
             continue
-        how, outer_key, inner_select = sub
+        how, outer_keys, inner_select = sub
         subplan = _build_query(inner_select, schema, ctes)
-        on_right = _subquery_output_col(subplan)
-        plan = Join(plan, subplan, [outer_key], [on_right], how, None)
+        on_right = _subquery_output_cols(subplan)
+        plan = Join(plan, subplan, outer_keys, on_right, how, None)
     return plan, (_conjoin_exprs(residual) if residual else None)
 
 
 def _where_subquery_conjunct(c, outer_aliases):
     """If conjunct ``c`` folds to a semi/anti join, return
-    ``(how, outer_key, inner_select)``; else None (it stays in the residual).
+    ``(how, outer_keys, inner_select)``; else None (it stays in the residual).
 
-    ``outer_key`` is the outer-side join key column name; ``inner_select`` is the
-    sqlglot select for the Join's right side (already decorrelated for EXISTS:
-    correlation stripped from its WHERE, projection set to the inner key)."""
+    ``outer_keys`` is the list of outer-side join-key column names (one per
+    equi-correlation -- a composite correlation yields a multi-key semi/anti
+    join); ``inner_select`` is the sqlglot select for the Join's right side
+    (already decorrelated for EXISTS: correlation stripped from its WHERE,
+    projection set to the inner equi-keys)."""
     # Correlated EXISTS / NOT EXISTS.
     if isinstance(c, exp.Exists):
         return _exists_conjunct(c, negated=False, outer_aliases=outer_aliases)
@@ -1089,28 +1091,35 @@ def _where_subquery_conjunct(c, outer_aliases):
         if _classify_correlation(subq_select, outer_aliases) is not None:
             raise NotImplementedError("correlated IN subqueries are not supported yet")
         on_left = _in_subquery_key(left_node)  # raises if not a bare column
-        return how, on_left[0], subq_select
+        return how, [on_left[0]], subq_select
     return None
 
 
 def _exists_conjunct(exists_node, negated, outer_aliases):
     """Decorrelate a correlated ``EXISTS``/``NOT EXISTS`` to a semi/anti join.
-    Returns ``(how, outer_key, inner_select)`` or None (uncorrelated -> residual)."""
+    Returns ``(how, outer_keys, inner_select)`` where ``outer_keys`` is the list
+    of outer-side join-key column names (one per equi-correlation -- a composite
+    correlation yields a multi-key semi/anti join), or None (uncorrelated ->
+    residual)."""
     inner = exists_node.this
     corr = _classify_correlation(inner, outer_aliases)
     if corr is None:
         return None  # uncorrelated (already handled by _flatten_outer_subqueries)
-    outer_key, inner_key, inner_table, local_conjuncts = corr
+    equi_pairs, local_conjuncts = corr
     _set_local_where(inner, local_conjuncts)
-    # The SELECT list is irrelevant to EXISTS -- project the inner key so the
-    # right side exposes it as the join key column. Keep the qualifier so a
-    # subquery whose own join renamed the key (``b__k``) still resolves it.
+    # The SELECT list is irrelevant to EXISTS -- project the inner equi-keys so
+    # the right side exposes them as the join-key columns. Keep each key's
+    # qualifier so a subquery whose own join renamed a colliding key (``b__k``)
+    # still resolves it. The projection order matches ``equi_pairs`` so the
+    # outer keys and inner output columns pair up by position.
     inner.set(
         "expressions",
-        [exp.column(inner_key) if not inner_table
-         else exp.column(inner_key, table=inner_table)],
+        [
+            exp.column(ik) if not it else exp.column(ik, table=it)
+            for _ok, ik, it in equi_pairs
+        ],
     )
-    return ("anti" if negated else "semi"), outer_key, inner
+    return ("anti" if negated else "semi"), [ok for ok, _ik, _it in equi_pairs], inner
 
 
 def _in_subquery_conjunct(c):
@@ -1148,14 +1157,18 @@ def _conjoin_exprs(parts: list[Expr]) -> Expr:
 def _classify_correlation(subq_select, outer_aliases):
     """Classify a subquery's correlation with the outer scope.
 
-    Returns ``(outer_key, inner_key, local_conjuncts)`` for a subquery whose only
-    outer reference is a single equi-correlation ``inner.col = outer.col`` conjunct
-    in its WHERE (both sides bare columns, one referencing an outer alias, the
-    other local); ``local_conjuncts`` are the remaining (non-correlated) WHERE
-    conjuncts. Returns ``None`` for an uncorrelated subquery. Raises
-    ``NotImplementedError`` for the deferred forms: more than one equi-correlation,
-    a non-equi outer reference in the WHERE, or any outer reference outside the
-    WHERE (SELECT list / aggregate args / GROUP BY / HAVING / ORDER BY).
+    Returns ``(equi_pairs, local_conjuncts)`` where ``equi_pairs`` is a list of
+    ``(outer_key, inner_key, inner_table)`` -- one per equi-correlation
+    ``inner.col = outer.col`` conjunct in the subquery's WHERE (both sides bare
+    columns, one referencing an outer alias, the other local) -- and
+    ``local_conjuncts`` are the remaining (non-correlated) WHERE conjuncts
+    (applied to the inner subquery's own WHERE). Returns ``None`` for an
+    uncorrelated subquery (no equi-correlation). Raises ``NotImplementedError``
+    for the deferred forms: a non-equi outer reference in the WHERE (e.g.
+    ``b.v <> a.v`` -- a join residual, not yet lowered), or any outer reference
+    outside the WHERE (SELECT list / aggregate args / GROUP BY / HAVING / ORDER
+    BY). Multiple equi-correlations (a composite correlation key) ARE supported
+    -- they lower to a multi-key semi/anti (EXISTS) or left (scalar) join.
 
     Bare (unqualified) columns are assumed local (the flat-column model); a bare
     column that actually belongs outside raises a KeyError at execution rather
@@ -1164,7 +1177,7 @@ def _classify_correlation(subq_select, outer_aliases):
     outer = set(outer_aliases)
     where = subq_select.args.get("where")
 
-    equi: tuple[str, str] | None = None
+    equi_pairs: list[tuple[str, str, str]] = []
     local_conjuncts: list = []
     if where is not None:
         for conj in _split_and_exp(where.this):
@@ -1172,16 +1185,11 @@ def _classify_correlation(subq_select, outer_aliases):
                 pair = _equi_correlation_pair(conj, outer, local)
                 if pair is None:
                     raise NotImplementedError(
-                        "correlated subqueries are only supported with a single "
-                        "equality correlation (inner.col = outer.col); non-equi "
-                        "correlations are not supported yet"
+                        "correlated subqueries with a non-equi correlation "
+                        "(e.g. b.v <> a.v) are not supported yet; only equality "
+                        "correlations (inner.col = outer.col) are lowered to joins"
                     )
-                if equi is not None:
-                    raise NotImplementedError(
-                        "correlated subqueries with multiple correlation "
-                        "predicates are not supported yet"
-                    )
-                equi = pair
+                equi_pairs.append(pair)
             else:
                 local_conjuncts.append(conj)
 
@@ -1194,9 +1202,9 @@ def _classify_correlation(subq_select, outer_aliases):
                 "arguments, or HAVING are not supported yet)"
             )
 
-    if equi is None:
+    if not equi_pairs:
         return None  # uncorrelated
-    return (*equi, local_conjuncts)
+    return equi_pairs, local_conjuncts
 
 
 def _references_outer(node, outer, local) -> bool:
@@ -1223,11 +1231,11 @@ def _equi_correlation_pair(conj, outer, local):
     lhs_outer = _col_table_is_outer(lhs, outer, local)
     rhs_outer = _col_table_is_outer(rhs, outer, local)
     if lhs_outer and not rhs_outer:
-        # lhs is outer, rhs is the subquery's (inner) column.
-        return rhs.name, lhs.name, rhs.table
+        # lhs is the outer column, rhs is the subquery's (inner) column.
+        return lhs.name, rhs.name, rhs.table
     if rhs_outer and not lhs_outer:
-        # rhs is outer, lhs is the subquery's (inner) column.
-        return lhs.name, rhs.name, lhs.table
+        # rhs is the outer column, lhs is the subquery's (inner) column.
+        return rhs.name, lhs.name, lhs.table
     return None  # both outer or both inner -> not a single correlation pair
 
 
@@ -1289,29 +1297,41 @@ def _table_alias_name(node) -> str:
     return getattr(node, "alias", "") or getattr(node, "name", "") or ""
 
 
+def _subquery_output_cols(subplan) -> list[str]:
+    """The output column names of a subquery plan, in projection order.
+
+    Peeks through Sort/Limit (ORDER BY/LIMIT in an IN/EXISTS-subquery are
+    meaningless; DuckDB ignores them). Requires an explicit projection
+    (``SELECT *`` is ambiguous and rejected). For a single-column IN-subquery
+    the list has one entry; for a composite-correlation EXISTS-subquery it has
+    one entry per equi-key (paired by position with the outer keys)."""
+    node = subplan
+    while isinstance(node, (Sort, Limit)):
+        node = node.input
+    if isinstance(node, Project):
+        return [name for _e, name in node.items]
+    if isinstance(node, Aggregate):
+        return (
+            [name for _e, name in node.group_keys]
+            + [name for _a, name in node.aggs]
+        )
+    if isinstance(node, SetOp):
+        return _subquery_output_cols(node.left)
+    raise NotImplementedError(
+        "subquery must project named columns (SELECT * is ambiguous)"
+    )
+
+
 def _subquery_output_col(subplan) -> str:
     """The single output column name of a one-column subquery plan.
 
     Peeks through Sort/Limit (ORDER BY/LIMIT in an IN-subquery are meaningless;
     DuckDB ignores them). Requires exactly one output column and an explicit
     projection (``SELECT *`` is ambiguous and rejected)."""
-    node = subplan
-    while isinstance(node, (Sort, Limit)):
-        node = node.input
-    if isinstance(node, Project):
-        if len(node.items) != 1:
-            raise NotImplementedError("IN-subquery must project exactly one column")
-        return node.items[0][1]
-    if isinstance(node, Aggregate):
-        n = len(node.group_keys) + len(node.aggs)
-        if n != 1:
-            raise NotImplementedError("IN-subquery must project exactly one column")
-        return (node.aggs[0][1] if node.aggs else node.group_keys[0][1])
-    if isinstance(node, SetOp):
-        return _subquery_output_col(node.left)
-    raise NotImplementedError(
-        "IN-subquery must project a single named column (SELECT * is ambiguous)"
-    )
+    cols = _subquery_output_cols(subplan)
+    if len(cols) != 1:
+        raise NotImplementedError("IN-subquery must project exactly one column")
+    return cols[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -1420,7 +1440,13 @@ def _decorrelate_scalar(plan, inner_select, corr, name, schema, ctes=None):
     but cuDF ``merge`` would match NULL==NULL, so the NULL-key group is removed and
     a NULL outer key finds no match -> null-pad (MAX/MIN/SUM -> NULL; COUNT -> the
     COALESCE default 0)."""
-    outer_key, inner_key, inner_table, local_conjuncts = corr
+    equi_pairs, local_conjuncts = corr
+    if len(equi_pairs) != 1:
+        raise NotImplementedError(
+            "correlated scalar subqueries with multiple equi-correlations "
+            "(composite correlation keys) are not supported yet"
+        )
+    outer_key, inner_key, inner_table = equi_pairs[0]
     _set_local_where(inner_select, local_conjuncts)
     subplan = _build_query(inner_select, schema, ctes)
     _require_global_aggregate(subplan)
