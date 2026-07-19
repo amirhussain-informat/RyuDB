@@ -358,8 +358,20 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None, c
     has_agg = any(_contains_agg(it) for it in proj_items)
     group = sel.args.get("group")
     group_exprs = list(group.expressions) if group else []
+    # GROUP BY ROLLUP / CUBE / GROUPING SETS (and the GROUPING() marker) are
+    # desugared at parse time into a UNION ALL of per-grouping-set Aggregate
+    # branches (see _build_grouping_extension). They must be routed BEFORE the
+    # single-aggregate branch: a pure ``GROUP BY ROLLUP(a,b)`` has empty
+    # ``group.expressions`` (the cols live in ``rollup``), so ``group_exprs``
+    # alone would miss it and a ROLLUP without a SELECT aggregate would fall
+    # through to the plain-Project branch and silently drop the subtotals.
+    _group_ext = group is not None and any(
+        group.args.get(k) for k in ("rollup", "cube", "grouping_sets")
+    )
 
-    if group_exprs or has_agg or having is not None:
+    if _group_ext:
+        plan = _build_grouping_extension(plan, group, proj_items, having)
+    elif group_exprs or has_agg or having is not None:
         if any(_is_star(it) for it in proj_items):
             raise NotImplementedError("SELECT * with GROUP BY/aggregates is not supported")
         # Build group keys and aggregates from the projection list so that
@@ -553,6 +565,214 @@ def _build_tail(stmt, plan):
         plan = Limit(plan, n=n, offset=off)
 
     return plan
+
+
+# --------------------------------------------------------------------------- #
+# GROUP BY ROLLUP / CUBE / GROUPING SETS + GROUPING()
+# --------------------------------------------------------------------------- #
+#
+# A grouping extension is desugared at parse time into a UNION ALL of one
+# Aggregate branch per grouping set. Each branch groups by the columns present
+# in that set; the omitted grouping columns are projected as NULL and every
+# GROUPING(...) call is replaced by a per-branch constant integer (the
+# "not-grouped" bitmap, leftmost argument = most-significant bit). UNION ALL
+# (not UNION) is load-bearing: when real data NULLs collide with subtotal
+# NULLs the duplicate rows are NOT deduped (they are distinguished by GROUPING,
+# verified against DuckDB). No executor / optimizer / storage change -- each
+# branch is a vanilla Aggregate -> Project and SetOp(union, distinct=False) is
+# cuDF concat. The existing _aggregate groups with dropna=False so NULL group
+# keys are kept, matching DuckDB.
+
+
+def _grouping_cols_of(item) -> list[str]:
+    """Flatten one GROUP BY / ROLLUP / CUBE / GROUPING SETS item to its column
+    names. A ``Column`` -> [name]; a ``Paren`` recurses; a ``Tuple`` flattens
+    every contained expression. A composite item (``ROLLUP(a, (b, c))``) yields
+    the unit's columns together -- they are grouped/absent as one."""
+    if isinstance(item, exp.Column):
+        return [item.name]
+    if isinstance(item, exp.Paren):
+        return _grouping_cols_of(item.this)
+    if isinstance(item, exp.Tuple):
+        cols: list[str] = []
+        for e in item.expressions:
+            cols.extend(_grouping_cols_of(e))
+        return cols
+    # Only bare columns (and tuples/parens of them) are supported in a grouping
+    # extension -- the desugar matches dimensions by column name (the Phase-1
+    # invariant that every GROUP BY column appears in the SELECT list). An
+    # arbitrary expression (e.g. ``l_orderkey % 10``) has no single column
+    # name to match; reject it explicitly rather than silently mis-desugaring.
+    raise NotImplementedError(
+        "only bare columns are supported in ROLLUP / CUBE / GROUPING SETS "
+        f"(got {type(item).__name__})"
+    )
+
+
+def _grouping_extension_sets(group) -> tuple[list[str], list[frozenset[str]]]:
+    """Enumerate the grouping sets of a ``GROUP BY ROLLUP/CUBE/GROUPING SETS``
+    clause.
+
+    Returns ``(dim_cols, sets)``: ``dim_cols`` is the ordered, deduped universe
+    of grouping column names (always-on plain ``GROUP BY`` cols first, then the
+    extension items in order); ``sets`` is one ``frozenset[str]`` of *present*
+    column names per grouping set. Plain ``GROUP BY`` columns (``group.
+    expressions``) are always-on -- present in every grouping set.
+
+    Semantics (verified against DuckDB 1.5.4):
+    - ``ROLLUP(a, b)`` -> {a,b}, {a}, {}  (prefixes: drop last item, then last
+      two, ... down to the grand total).
+    - ``CUBE(a, b)``    -> every subset of the items (2**n sets).
+    - ``GROUPING SETS ((a,b),(a),())`` -> the listed sets verbatim.
+    """
+    always_on: list[str] = []
+    for ge in group.expressions:
+        for c in _grouping_cols_of(ge):
+            if c not in always_on:
+                always_on.append(c)
+
+    def with_always(item_cols: list[str]) -> frozenset[str]:
+        seen: list[str] = list(always_on)
+        for c in item_cols:
+            if c not in seen:
+                seen.append(c)
+        return frozenset(seen)
+
+    rollup = group.args.get("rollup")
+    cube = group.args.get("cube")
+    grouping_sets = group.args.get("grouping_sets")
+
+    sets: list[frozenset[str]] = []
+    ext_item_cols: list[list[str]] = []  # for dim_cols universe
+
+    if rollup:
+        items = [_grouping_cols_of(e) for e in rollup[0].expressions]
+        ext_item_cols = items
+        # Prefixes: items[:k] for k = n, n-1, ..., 0  (all present -> grand total).
+        for k in range(len(items), -1, -1):
+            flat: list[str] = []
+            for it in items[:k]:
+                flat.extend(it)
+            sets.append(with_always(flat))
+    elif cube:
+        items = [_grouping_cols_of(e) for e in cube[0].expressions]
+        ext_item_cols = items
+        n = len(items)
+        for mask in range(1 << n):
+            flat: list[str] = []
+            for i in range(n):
+                if mask & (1 << i):
+                    flat.extend(items[i])
+            sets.append(with_always(flat))
+    else:  # grouping_sets
+        entries = grouping_sets[0].expressions
+        ext_item_cols = [_grouping_cols_of(e) for e in entries]
+        for e in entries:
+            sets.append(with_always(_grouping_cols_of(e)))
+
+    # dim_cols universe (always_on first, then extension cols in order).
+    dim_cols: list[str] = list(always_on)
+    for item_cols in ext_item_cols:
+        for c in item_cols:
+            if c not in dim_cols:
+                dim_cols.append(c)
+
+    return dim_cols, sets
+
+
+def _build_grouping_extension(plan, group, proj_items, having):
+    """Desugar ``GROUP BY ROLLUP/CUBE/GROUPING SETS`` (+ ``GROUPING()``) into a
+    ``UNION ALL`` of per-grouping-set ``Aggregate`` branches, each wrapped in a
+    ``Project`` that NULLs the omitted grouping columns and substitutes a
+    constant int for each ``GROUPING(...)`` call. Returns the ``SetOp`` root;
+    the caller applies DISTINCT / ORDER BY / LIMIT via the normal tail."""
+    if having is not None:
+        raise NotImplementedError(
+            "HAVING with ROLLUP / CUBE / GROUPING SETS is not supported yet"
+        )
+    if any(_is_star(it) for it in proj_items):
+        raise NotImplementedError("SELECT * with GROUP BY/aggregates is not supported")
+
+    # Split the projection into dims, GROUPING() markers, and real aggregates.
+    # GROUPING() is an exp.AggFunc subclass (so _contains_agg routes the query
+    # here) but is NOT a real aggregate -- it is a per-branch constant -- so it
+    # must be consumed here and never reach _expr (which has no Grouping case).
+    dim_keys: list[tuple[Expr, str, str]] = []   # (Expr, out_alias, col_name)
+    groupings: list[tuple[list[str], str]] = []  # (col_names, out_name)
+    aggs: list[tuple[AggFunc, str]] = []
+    for it in proj_items:
+        gnode = it.this if isinstance(it, exp.Alias) else it
+        if isinstance(gnode, exp.Grouping):
+            cols = [c.name for c in gnode.expressions]
+            name = it.alias if isinstance(it, exp.Alias) else f"grouping_{'_'.join(cols)}"
+            groupings.append((cols, name))
+            continue
+        e, alias = _proj_item(it)
+        if isinstance(e, AggFunc):
+            aggs.append((e, alias))
+        else:
+            # Phase-1 invariant: every GROUP BY column appears in the SELECT
+            # list, so a grouping dim is a bare Col whose name is the grouped
+            # column. e.name is that column name.
+            dim_keys.append((e, alias, e.name if isinstance(e, Col) else alias))
+
+    dim_cols, sets = _grouping_extension_sets(group)
+
+    dim_key_names = {cn for _, _, cn in dim_keys}
+    for s in sets:
+        for c in s:
+            if c not in dim_key_names:
+                raise NotImplementedError(
+                    f"grouping column {c!r} must appear in the SELECT list "
+                    f"(Phase-1 invariant for ROLLUP/CUBE/GROUPING SETS)"
+                )
+    for cols, _name in groupings:
+        for c in cols:
+            if c not in dim_cols:
+                raise NotImplementedError(
+                    f"GROUPING({c!r}) names a non-grouping column"
+                )
+
+    def grouping_value(present: frozenset[str], cols: list[str]) -> int:
+        # Bitmap: leftmost argument is the most-significant bit. Bit i (from
+        # the left) is 1 iff cols[i] is NOT grouped in this branch.
+        v = 0
+        for i, c in enumerate(cols):
+            if c not in present:
+                v |= 1 << (len(cols) - 1 - i)
+        return v
+
+    def branch_proj_items(present: frozenset[str]):
+        items = []
+        gi = 0
+        for it in proj_items:
+            gnode = it.this if isinstance(it, exp.Alias) else it
+            if isinstance(gnode, exp.Grouping):
+                cols, name = groupings[gi]
+                gi += 1
+                items.append((Lit(grouping_value(present, cols), "int"), name))
+            else:
+                e, alias = _proj_item(it)
+                if isinstance(e, AggFunc):
+                    items.append((Col(alias), alias))
+                else:
+                    cn = e.name if isinstance(e, Col) else alias
+                    if cn in present:
+                        items.append((Col(alias), alias))
+                    else:
+                        items.append((Lit(None, "null"), alias))
+        return items
+
+    branches = []
+    for present in sets:
+        gk = [(e, alias) for (e, alias, cn) in dim_keys if cn in present]
+        agg = Aggregate(plan, group_keys=gk, aggs=aggs)
+        branches.append(Project(agg, items=branch_proj_items(present)))
+
+    acc = branches[0]
+    for b in branches[1:]:
+        acc = SetOp(acc, b, "union", distinct=False)
+    return acc
 
 
 # --------------------------------------------------------------------------- #

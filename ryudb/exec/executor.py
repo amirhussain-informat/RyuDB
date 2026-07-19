@@ -1352,6 +1352,11 @@ class Engine:
             else:
                 col = eval_expr(af.arg, df)
                 row[n] = [_scalar_agg(af.func, col)]
+        if not aggs:
+            # No aggregates (a bare global "GROUP BY ()" / no-agg ROLLUP grand
+            # total): emit the single grand-total row. An empty dict would make
+            # cudf.DataFrame({}) a 0-row frame, dropping the row entirely.
+            return cudf.DataFrame({"_g_": [0]})
         return cudf.DataFrame(row)
 
     def _keys_nonnull(self, df: cudf.DataFrame, group_keys) -> bool:
@@ -1397,6 +1402,14 @@ class Engine:
         # Fused single-pass aggregation: one groupby.agg({col: [funcs]}) call
         # instead of one kernel launch per aggregate. COUNT(*) folds in via a
         # constant non-null column counted per group.
+        if not aggs:
+            # No aggregates: a bare ``GROUP BY`` (or a no-agg ROLLUP/CUBE/GROUPING
+            # SETS branch) with only grouping columns == SELECT DISTINCT of the
+            # group keys. groupby().size() yields the distinct key combinations
+            # (NULL keys kept via dropna=False on the normal path).
+            return (
+                work.groupby(by_names, dropna=dropna).size().reset_index()[by_names]
+            )
         work["__cnt"] = 1
         spec: dict[str, list[str]] = {}
         out_map: list[tuple[str, str, str]] = []
