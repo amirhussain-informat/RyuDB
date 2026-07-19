@@ -595,19 +595,35 @@ def _build_setop(node, schema: dict[str, list[str]] | None = None, ctes=None):
 
 def _build_tail(stmt, plan):
     """Apply ORDER BY then LIMIT/OFFSET from ``stmt.args`` (shared by SELECT and
-    set-op nodes). ORDER BY only supports column references that name an output
-    column; the executor's Sort resolves them against the produced frame. No-op
-    when neither clause is present."""
+    set-op nodes). ORDER BY supports:
+
+      * a column reference (qualified or bare) naming an output/source column, or
+      * an arbitrary scalar expression over source columns (``k + v``, ``-v``,
+        ``v * 2``, ``abs(v)``); the executor's Sort materializes such keys via
+        ``eval_expr`` against the pre-projection frame.
+
+    An aggregate or window function in ORDER BY is rejected -- order by the
+    function's output alias instead (``ORDER BY cnt``, not ``ORDER BY
+    count(*)``); that form is already supported as a plain column reference.
+    No-op when neither clause is present."""
     order = stmt.args.get("order")
     if order is not None:
         keys = []
         for o in order.expressions:
             if not isinstance(o, exp.Ordered):
                 raise NotImplementedError(f"unsupported ORDER BY term: {o}")
-            e = _expr(o.this)
-            if not isinstance(e, Col):
-                raise NotImplementedError("ORDER BY only supports column references")
-            keys.append((Col(e.name, table=e.table), not o.args.get("desc", False)))
+            term = o.this
+            if _contains_agg(term) or _contains_window(term):
+                raise NotImplementedError(
+                    "ORDER BY with an aggregate or window function is not "
+                    "supported; order by the function's output alias instead "
+                    "(e.g. ORDER BY cnt, not ORDER BY count(*))"
+                )
+            e = _expr(term)
+            if isinstance(e, Col):
+                keys.append((Col(e.name, table=e.table), not o.args.get("desc", False)))
+            else:
+                keys.append((e, not o.args.get("desc", False)))
         plan = Sort(plan, keys=keys)
 
     limit = stmt.args.get("limit")
