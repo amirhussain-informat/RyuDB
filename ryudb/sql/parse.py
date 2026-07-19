@@ -106,6 +106,13 @@ AGG_FUNCS = {
     exp.StddevSamp: "STDDEV_SAMP",
     exp.Variance: "VARIANCE",
     exp.Median: "MEDIAN",
+    # Logical aggregates: ``bool_and`` / ``logical_and`` = AND of a boolean arg
+    # (all true -> true); ``bool_or`` / ``logical_or`` = OR (any true -> true).
+    # Lowered to cuDF ``min`` / ``max`` on the boolean arg series (NULL-skipping,
+    # matching DuckDB -- a NULL predicate is unknown, not false; an all-NULL or
+    # empty group is NULL). See ``_AGG_METHOD``.
+    exp.LogicalAnd: "BOOL_AND",
+    exp.LogicalOr: "BOOL_OR",
 }
 
 
@@ -990,6 +997,8 @@ def _expr(node) -> Expr:
                 exp.StddevSamp,
                 exp.Variance,
                 exp.Median,
+                exp.LogicalAnd,
+                exp.LogicalOr,
             ),
         ):
             inner = node.this
