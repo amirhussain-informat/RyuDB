@@ -2301,7 +2301,19 @@ def _build_one_window(win, schema):
         if not order_keys:
             raise NotImplementedError(f"{func} requires ORDER BY in the window")
         # Ranking funcs ignore any explicit frame (DuckDB does too); frame stays None.
-    elif isinstance(fn, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)):
+    elif isinstance(fn, (
+        exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max,
+        # Statistical / logical / population aggregates as window functions
+        # (PRs #45/#46/#47 added the grouped/global form; this widens the
+        # window builder's accept-list beyond the 5 basic aggs). ``AGG_FUNCS``
+        # already maps every class below, and ``_build_frame`` admits all frame
+        # shapes for them (the MIN/MAX-trailing rejection is scoped to MIN/MAX).
+        # Execution: broadcast (no ORDER BY) is table-driven via ``_AGG_METHOD``
+        # + a pop ddof=0 branch; running (ORDER BY) is a per-row gather-and-reduce.
+        exp.Stddev, exp.StddevSamp, exp.Variance, exp.Median,
+        exp.StddevPop, exp.VariancePop,
+        exp.LogicalAnd, exp.LogicalOr,
+    )):
         func = AGG_FUNCS[type(fn)]
         arg = _expr(fn.this) if fn.this is not None else Star()
         if order_keys:

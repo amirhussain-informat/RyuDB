@@ -728,6 +728,161 @@ def test_cli_running_output(sengine, capsys):
 
 
 # --------------------------------------------------------------------------- #
+# Statistical / logical / population aggregates as window functions
+# (stddev / stddev_samp / variance / median / stddev_pop / var_pop /
+#  bool_and / bool_or) -- broadcast (no ORDER BY) + running (ORDER BY + any
+# frame shape). Running uses a per-row gather-and-reduce (O(n x window);
+# TPC-H has no stat aggs, so the bench is unaffected). DuckDB is the oracle.
+# --------------------------------------------------------------------------- #
+
+# arg = w for stat funcs; w > 10 (a predicate) for bool_and/bool_or so the
+# NULL-w -> NULL-predicate -> skipped edge is exercised. _A has a NULL-k
+# partition (single non-null w=20 + a NULL w), ties on w, and a NULL w in k=1
+# -- so NULL-skip, peer-group RANGE vs ROWS, n<2 (sample -> NULL) and n=1
+# (pop -> 0.0) all get covered across the frame shapes.
+
+_STAT_FUNCS = ["stddev", "stddev_samp", "variance", "median",
+               "stddev_pop", "var_pop"]
+_BOOL_FUNCS = ["bool_and", "bool_or"]
+
+# (label, OVER-clause body) -- broadcast through every running frame shape.
+_FRAME_SHAPES = [
+    ("broadcast",       "PARTITION BY k"),
+    ("range_default",   "PARTITION BY k ORDER BY w"),
+    ("rows_cumulative", "PARTITION BY k ORDER BY w "
+                        "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"),
+    ("trailing_one",    "PARTITION BY k ORDER BY w "
+                        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW"),
+    ("centered",        "PARTITION BY k ORDER BY w "
+                        "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING"),
+    ("following_one",   "PARTITION BY k ORDER BY w "
+                        "ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING"),
+    ("unbounded",       "PARTITION BY k ORDER BY w "
+                        "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"),
+]
+
+
+@pytest.mark.parametrize("func", _STAT_FUNCS)
+@pytest.mark.parametrize("label,over", _FRAME_SHAPES)
+def test_window_stat_all_frames(sengine, sduck, func, label, over):
+    sql = f"SELECT k, w, {func}(w) OVER ({over}) AS x FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+@pytest.mark.parametrize("func", _BOOL_FUNCS)
+@pytest.mark.parametrize("label,over", _FRAME_SHAPES)
+def test_window_bool_all_frames(sengine, sduck, func, label, over):
+    sql = f"SELECT k, w, {func}(w > 10) OVER ({over}) AS x FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_window_stddev_pop_n1_is_zero_not_null(sengine, sduck):
+    # The NULL-k partition has exactly one non-null w (20): population std/var
+    # -> 0.0 (divides by n, not n-1); the sample form -> NULL. This is the
+    # load-bearing pop-vs-sample distinction -- pin it explicitly, not just via
+    # the DuckDB-equality matrix.
+    df = sengine.sql(
+        "SELECT stddev_pop(w) OVER (PARTITION BY k) AS pop_sd, "
+        "var_pop(w) OVER (PARTITION BY k) AS pop_var, "
+        "stddev(w) OVER (PARTITION BY k) AS samp_sd "
+        "FROM a WHERE k IS NULL ORDER BY w"
+    ).to_pandas()
+    assert df["pop_sd"].tolist() == [0.0, 0.0]
+    assert df["pop_var"].tolist() == [0.0, 0.0]
+    assert all(v is None or v != v for v in df["samp_sd"].tolist())
+
+
+def test_window_stat_empty_window_is_null(sengine, sduck):
+    # 1 PRECEDING AND 1 PRECEDING at the first row of each partition -> empty
+    # window -> NULL (DuckDB returns NULL for an empty stat window).
+    sql = ("SELECT k, w, stddev(w) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) AS x FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_window_stat_all_null_window_is_null(sengine, sduck):
+    # A 1-row window over the NULL w -> the only value is NULL -> skipped ->
+    # empty -> NULL for every stat agg.
+    sql = ("SELECT k, w, stddev(w) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS x FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_window_bool_null_predicate_skipped(sengine, sduck):
+    # bool_and/bool_or skip a NULL predicate (w>10 with NULL w -> unknown, not
+    # false). k=1 sorted by w: 10(F),10(F),30(T),NULL(NA) -- cumulative bool_and
+    # at the NULL row = AND(F,F,T) = F (NA skipped); bool_or = T.
+    sql_and = ("SELECT k, w, bool_and(w > 10) OVER (PARTITION BY k ORDER BY w) AS x "
+               "FROM a")
+    sql_or = ("SELECT k, w, bool_or(w > 10) OVER (PARTITION BY k ORDER BY w) AS x "
+              "FROM a")
+    assert _ryu(sengine, sql_and) == _duck(sduck, sql_and)
+    assert _ryu(sengine, sql_or) == _duck(sduck, sql_or)
+
+
+def test_window_bool_all_null_window_is_null(sengine, sduck):
+    # A 1-row window over the NULL w -> the only predicate is NA -> skipped ->
+    # empty -> NULL for bool_and/bool_or.
+    sql = ("SELECT k, w, bool_and(w > 10) OVER (PARTITION BY k ORDER BY w "
+           "ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS x FROM a")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_window_var_samp_alias(sengine, sduck):
+    # var_samp parses to exp.Variance (same as variance) -- the window form too.
+    sql = "SELECT k, w, var_samp(w) OVER (PARTITION BY k ORDER BY w) AS x FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_window_logical_and_alias(sengine):
+    # logical_and/logical_or are sqlglot aliases for bool_and/bool_or; DuckDB
+    # lacks those spellings, so compare RyuDB-against-RyuDB (alias == canonical).
+    a = sengine.sql("SELECT bool_and(w > 10) OVER (PARTITION BY k) AS x FROM a") \
+        .to_pandas()
+    b = sengine.sql("SELECT logical_and(w > 10) OVER (PARTITION BY k) AS x FROM a") \
+        .to_pandas()
+    assert a["x"].tolist() == b["x"].tolist()
+
+
+def test_window_stddev_no_partition(sengine, sduck):
+    sql = "SELECT k, w, stddev(w) OVER (ORDER BY w) AS x FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_window_stddev_multikey_order(sengine, sduck):
+    sql = "SELECT k, w, stddev(w) OVER (PARTITION BY k ORDER BY k, w) AS x FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_window_stddev_join_then_window(sengine, sduck):
+    # Window over a join output: a JOIN b multiplies rows before the window
+    # frames them (mirrors test_running_join_then_window with stddev).
+    sql = ("SELECT a.k, a.w, b.v, "
+           "stddev(b.v) OVER (PARTITION BY a.k ORDER BY b.v) AS s "
+           "FROM a JOIN b ON a.k = b.k")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_cli_stat_window_output(sengine, capsys):
+    from ryudb import cli
+
+    cli._run_statement(
+        sengine,
+        "SELECT k, w, "
+        "stddev(w) OVER (PARTITION BY k ORDER BY w) AS run_sd, "
+        "var_pop(w) OVER (PARTITION BY k ORDER BY w "
+        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS mv, "
+        "bool_and(w > 10) OVER (PARTITION BY k) AS ba "
+        "FROM a ORDER BY k, w",
+        quiet=False,
+    )
+    out = capsys.readouterr().out
+    assert "run_sd" in out
+    assert "mv" in out
+    assert "ba" in out
+
+
+# --------------------------------------------------------------------------- #
 # QUALIFY -- filter on window-function results (Phase G-4)
 #
 # QUALIFY lowers to a Filter directly above the Window node (below the outer

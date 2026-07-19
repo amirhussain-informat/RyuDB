@@ -131,19 +131,24 @@ class WindowFunc(Expr):
 
     Each window function carries its OWN OVER clause (partition + order can
     differ per function). ``func`` is one of ROW_NUMBER / RANK / DENSE_RANK /
-    LAG / LEAD / SUM / COUNT / AVG / MIN / MAX. ``arg`` is the function argument
+    LAG / LEAD / SUM / COUNT / AVG / MIN / MAX, plus the statistical / logical /
+    population aggregates STDDEV / STDDEV_SAMP / VARIANCE / MEDIAN / STDDEV_POP /
+    VAR_POP / BOOL_AND / BOOL_OR. ``arg`` is the function argument
     (``Star()`` for COUNT(*), ``None`` for the no-argument rank funcs
     ROW_NUMBER / RANK / DENSE_RANK). ``offset`` / ``default`` are LAG/LEAD's
     optional integer offset (default 1) and default value (default NULL).
     ``partition_keys`` / ``order_keys`` are the OVER clause's PARTITION BY and
     ORDER BY (``order_keys`` is ``((Expr, ascending), ...)``); either may be
     empty. ``frame`` is the window frame (ROWS/RANGE BETWEEN ...); it is set for
-    aggregate funcs (SUM/COUNT/AVG/MIN/MAX) when an ORDER BY is present -- the
-    SQL default (RANGE UNBOUNDED PRECEDING TO CURRENT ROW, peer-group cumulative)
-    is synthesized when no explicit frame is given -- and ``None`` for the
-    whole-partition broadcast (aggregate, no ORDER BY) and for ranking/offset
-    funcs (which ignore frames). ``columns()`` does not include the frame: its
-    bound offsets are literal ints, not per-row expressions.
+    aggregate funcs (SUM/COUNT/AVG/MIN/MAX and the statistical/logical/population
+    aggregates) when an ORDER BY is present -- the SQL default (RANGE UNBOUNDED
+    PRECEDING TO CURRENT ROW, peer-group cumulative) is synthesized when no
+    explicit frame is given -- and ``None`` for the whole-partition broadcast
+    (aggregate, no ORDER BY) and for ranking/offset funcs (which ignore frames).
+    ``columns()`` does not include the frame: its bound offsets are literal ints,
+    not per-row expressions. WindowFunc does not carry FILTER / DISTINCT (only
+    the non-window ``AggFunc`` does); window-form FILTER / DISTINCT aggs are not
+    supported.
     """
     func: str
     arg: Expr | None
