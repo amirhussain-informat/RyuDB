@@ -114,6 +114,25 @@ QUERIES: dict[str, str] = {
          ORDER BY revenue DESC
          LIMIT 10
     """,
+    # Cross-table WHERE folded into the fused join path: a fact predicate
+    # (l_quantity < 24 -> the kernel's pass_pred) plus two dim predicates
+    # (o_orderdate < date '...' on orders, c_mktsegment = 'BUILDING' on customer ->
+    # pre-HT-build dim frame filters). Previously deferred to cuDF by the "no
+    # Filter under the Aggregate" restriction on the join path; now hits the
+    # fused C++ probe kernel (DENSE, ~25 n_name groups).
+    "Q_join_where_filter": """
+        SELECT n_name, sum(l_extendedprice) AS revenue, count(*) AS n
+          FROM lineitem
+          JOIN orders   ON l_orderkey = o_orderkey
+          JOIN customer ON o_custkey = c_custkey
+          JOIN nation   ON c_nationkey = n_nationkey
+         WHERE c_mktsegment = 'BUILDING'
+           AND o_orderdate < date '1995-03-15'
+           AND l_quantity < 24
+         GROUP BY n_name
+         ORDER BY revenue DESC
+         LIMIT 10
+    """,
 }
 
 # Q6 uses BETWEEN, which RyuDB doesn't parse yet -> expand it for the GPU run.
