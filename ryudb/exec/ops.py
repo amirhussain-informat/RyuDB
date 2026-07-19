@@ -217,6 +217,40 @@ def _as_series(v, df: cudf.DataFrame) -> "cudf.Series | pd.Series":
     return cudf.Series([v] * len(df), index=df.index)
 
 
+def _isnull_scalar(v):
+    return v is None or (isinstance(v, float) and pd.isna(v))
+
+
+# numpy ufunc for each 1-arg math tag. cuDF Series support these elementwise on
+# GPU; NULL inputs propagate to NaN (normalized to None by conftest.as_sorted).
+# Domain violations (SQRT of a negative, LN of <=0, ASIN/ACOS outside [-1,1])
+# yield NaN/inf here -- DuckDB instead RAISES. That divergence is documented; the
+# functions are correct for in-domain inputs and NULL propagation.
+_MATH_UNARY = {
+    "sqrt": np.sqrt, "cbrt": np.cbrt, "exp": np.exp, "ln": np.log,
+    "log10": np.log10, "sin": np.sin, "cos": np.cos, "tan": np.tan,
+    "asin": np.arcsin, "acos": np.arccos, "atan": np.arctan,
+    "degrees": np.degrees, "radians": np.radians,
+}
+
+
+def _math_unary(np_fn, v):
+    if isinstance(v, cudf.Series):
+        return np_fn(v)
+    if _isnull_scalar(v):
+        return None
+    return float(np_fn(v))
+
+
+def _math_binary(np_fn, a, b, df: cudf.DataFrame):
+    """Apply a 2-arg numpy ufunc with series/scalar alignment + NULL propagation."""
+    if not isinstance(a, cudf.Series) and not isinstance(b, cudf.Series):
+        if _isnull_scalar(a) or _isnull_scalar(b):
+            return None
+        return float(np_fn(a, b))
+    return np_fn(_as_series(a, df), _as_series(b, df))
+
+
 def _isnull(e: IsNull, df: cudf.DataFrame):
     v = eval_expr(e.expr, df)
     if isinstance(v, cudf.Series):
@@ -553,6 +587,41 @@ def _func(e: Func, df: cudf.DataFrame):
             return None
         sign = -1.0 if v < 0 else 1.0
         return math.floor(abs(v) * f + 0.5) / f * sign
+
+    # --- numeric math functions --------------------------------------- #
+    if name == "pi":
+        return math.pi
+    if name in _MATH_UNARY:
+        return _math_unary(_MATH_UNARY[name], eval_expr(args[0], df))
+    if name == "power":
+        return _math_binary(np.power, eval_expr(args[0], df), eval_expr(args[1], df), df)
+    if name == "atan2":
+        return _math_binary(np.arctan2, eval_expr(args[0], df), eval_expr(args[1], df), df)
+    if name == "log":
+        # 2-arg LOG(base, value) = ln(value) / ln(base) (covers LOG10/LOG2 which
+        # parse with a literal base, and LOG(b, x)).
+        base = eval_expr(args[0], df)
+        value = eval_expr(args[1], df)
+        if not isinstance(base, cudf.Series) and not isinstance(value, cudf.Series):
+            if _isnull_scalar(base) or _isnull_scalar(value):
+                return None
+            return float(np.log(value) / np.log(base))
+        return np.log(_as_series(value, df)) / np.log(_as_series(base, df))
+    if name == "trunc":
+        v = eval_expr(args[0], df)
+        if len(args) > 1:
+            n = int(eval_expr(args[1], df))
+            f = 10 ** n
+            if isinstance(v, cudf.Series):
+                return np.trunc(v * f) / f
+            if _isnull_scalar(v):
+                return None
+            return float(np.trunc(v * f) / f)
+        if isinstance(v, cudf.Series):
+            return np.trunc(v)
+        if _isnull_scalar(v):
+            return None
+        return float(np.trunc(v))
 
     # --- date/time functions ------------------------------------------- #
     if name == "extract":
