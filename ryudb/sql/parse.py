@@ -79,6 +79,8 @@ from .plan import (
     Like,
     Limit,
     Lit,
+    Merge,
+    MergeArm,
     Not,
     Or,
     Project,
@@ -150,6 +152,8 @@ def parse(sql: str, schema: dict[str, list[str]] | None = None) -> object:
         return _build_delete(stmt)
     if isinstance(stmt, exp.Update):
         return _build_update(stmt)
+    if isinstance(stmt, exp.Merge):
+        return _build_merge(stmt, schema)
     if isinstance(stmt, exp.Transaction):
         # sqlglot lowers BEGIN[/TRANSACTION/WORK/DEFERRED] to exp.Transaction;
         # this/modes/mark are ignored (no nested txns, no SAVEPOINTs yet).
@@ -286,6 +290,227 @@ def _build_update(stmt: exp.Update) -> Update:
     where = stmt.args.get("where")
     predicate = _expr(where.this) if where is not None else None
     return Update(table=table, assignments=assignments, predicate=predicate)
+
+
+def _merge_on_keys(on, talias: str, salias: str) -> tuple[list[str], list[str], Expr | None]:
+    """Split a MERGE ``ON`` predicate into ``(on_target, on_source, on_residual)``.
+
+    Each ``AND`` conjunct that is an equi-predicate ``tcol = scol`` (two
+    ``exp.Column``s) contributes one key pair, routed to target vs source by the
+    column's table qualifier (``talias`` / ``salias``). Any non-equi conjunct is
+    lowered with ``_expr`` and conjoined into ``on_residual`` (applied inside the
+    match by the executor, like a Join's residual). At least one equi-key is
+    required (the common UPSERT case is equi; mirrors ``_join_keys``'s equi-only
+    rule). An unqualified or same-side equi-predicate is rejected (ambiguous which
+    side a column belongs to without a table qualifier).
+    """
+    on_target: list[str] = []
+    on_source: list[str] = []
+    leftover: list[Expr] = []
+    for conj in _flatten_and(on):
+        if (
+            isinstance(conj, exp.EQ)
+            and isinstance(conj.this, exp.Column)
+            and isinstance(conj.expression, exp.Column)
+        ):
+            lcol, rcol = conj.this, conj.expression
+            lside = lcol.table
+            rside = rcol.table
+            if lside == talias and rside == salias:
+                on_target.append(lcol.name)
+                on_source.append(rcol.name)
+            elif lside == salias and rside == talias:
+                on_target.append(rcol.name)
+                on_source.append(lcol.name)
+            else:
+                raise NotImplementedError(
+                    "MERGE ON equi-predicate columns must be qualified by the "
+                    f"target ({talias}) and source ({salias}) aliases "
+                    f"(got {lcol.sql()} = {rcol.sql()})"
+                )
+        else:
+            leftover.append(_expr(conj))
+    if not on_target:
+        raise NotImplementedError(
+            "MERGE ON must be a conjunction of equi-predicates (tcol = scol [AND ...])"
+        )
+    residual = _conjoin(leftover) if leftover else None
+    return on_target, on_source, residual
+
+
+def _build_merge(stmt: exp.Merge, schema) -> Merge:
+    """Lower ``MERGE INTO target [AS talias] USING source [AS salias] ON ...
+    WHEN MATCHED ... / WHEN NOT MATCHED ...`` into a Merge node.
+
+    v1 scope: at most one ``WHEN MATCHED`` arm (``UPDATE`` / ``DELETE``) and one
+    ``WHEN NOT MATCHED [BY TARGET]`` arm (``INSERT``) -- the dominant UPSERT
+    shape. Multi-arm ordered WHEN ladders, ``WHEN NOT MATCHED BY SOURCE``,
+    ``RETURNING``, the ``USING (cols)`` form, and ``WITH`` are rejected. ``ON``
+    must be equi-conjunctive (see ``_merge_on_keys``). The USING source is lowered
+    via ``_table_ref`` (a ``Scan`` for a base table, a ``Derived`` subplan for a
+    subquery); the executor materializes it and joins target x source on the equi
+    keys + residual. The target/source aliases default to the table names so
+    qualified refs (``t.k``, ``s.k``) resolve via the executor's
+    ``{alias}__{col}`` rename. ``exp.When``'s ``then`` is a partial
+    ``exp.Update`` (SET list) / ``exp.Var("DELETE")`` / ``exp.Insert`` (column
+    list + VALUES) per sqlglot's MERGE grammar.
+    """
+    for arg in ("returning", "using_cond", "with_"):
+        if stmt.args.get(arg) is not None:
+            raise NotImplementedError(f"MERGE with {arg.upper()} is not supported yet")
+    target = stmt.this
+    if not isinstance(target, exp.Table):
+        raise ParseError("MERGE target is not a table")
+    table = target.name
+    if not table:
+        raise ParseError("MERGE target has no table name")
+    talias = target.alias or table
+
+    using = stmt.args.get("using")
+    if using is None:
+        raise ParseError("MERGE requires a USING clause")
+    source, salias, _name = _table_ref(using, schema)
+    if not salias:
+        raise ParseError("MERGE USING source has no alias")
+
+    on = stmt.args.get("on")
+    if on is None:
+        raise ParseError("MERGE requires an ON clause")
+    on_target, on_source, on_residual = _merge_on_keys(on, talias, salias)
+
+    whens = stmt.args.get("whens")
+    if whens is None or not whens.expressions:
+        raise ParseError("MERGE requires at least one WHEN clause")
+    when_list = list(whens.expressions)
+    if len(when_list) > 2:
+        raise NotImplementedError(
+            "MERGE with more than two WHEN clauses is not supported yet"
+        )
+
+    matched_arm: MergeArm | None = None
+    not_matched_arm: MergeArm | None = None
+    for w in when_list:
+        if not isinstance(w, exp.When):
+            raise ParseError(f"MERGE WHEN clause is not a When (got {type(w).__name__})")
+        matched = bool(w.args.get("matched"))
+        # WHEN NOT MATCHED BY SOURCE acts on target rows with no source match -- a
+        # different arm kind; defer it.
+        if not matched and w.args.get("source"):
+            raise NotImplementedError("WHEN NOT MATCHED BY SOURCE is not supported yet")
+        condition = _expr(w.args["condition"]) if w.args.get("condition") else None
+        then = w.args.get("then")
+        if then is None:
+            raise ParseError("MERGE WHEN clause has no THEN action")
+        arm = _build_merge_arm(then, matched, condition, table, schema)
+        # WHEN MATCHED acts on an existing target row (UPDATE/DELETE); WHEN NOT
+        # MATCHED [BY TARGET] acts on an unmatched source row (INSERT). Reject the
+        # nonsensical crosses (the grammar permits them, the semantics do not).
+        if matched and arm.action == "INSERT":
+            raise ParseError("WHEN MATCHED THEN INSERT is not valid (use WHEN NOT MATCHED)")
+        if not matched and arm.action in ("UPDATE", "DELETE"):
+            raise ParseError(
+                f"WHEN NOT MATCHED THEN {arm.action} is not valid (use WHEN MATCHED)"
+            )
+        if matched:
+            if matched_arm is not None:
+                raise NotImplementedError(
+                    "MERGE with multiple WHEN MATCHED arms is not supported yet"
+                )
+            matched_arm = arm
+        else:
+            if not_matched_arm is not None:
+                raise NotImplementedError(
+                    "MERGE with multiple WHEN NOT MATCHED arms is not supported yet"
+                )
+            not_matched_arm = arm
+
+    return Merge(
+        table=table,
+        target_alias=talias,
+        source=source,
+        source_alias=salias,
+        on_target=on_target,
+        on_source=on_source,
+        on_residual=on_residual,
+        matched_arm=matched_arm,
+        not_matched_arm=not_matched_arm,
+    )
+
+
+def _build_merge_arm(then, matched: bool, condition: Expr | None, table: str, schema) -> MergeArm:
+    """Lower a WHEN clause's ``then`` action into a ``MergeArm``.
+
+    ``then`` is a partial ``exp.Update`` (SET list, no target) for UPDATE, an
+    ``exp.Var(this="DELETE")`` for DELETE, or a partial ``exp.Insert`` (column list
+    + VALUES) for INSERT. The INSERT column list lives in ``then.this`` (an
+    ``exp.Tuple``; ``exp.Star`` / ``exp.var("ROW")`` mean full schema) and the
+    value row in ``then.expression`` (an ``exp.Values`` with exactly one row whose
+    cells reference the source). The UPDATE SET list lives in ``then.expressions``
+    (a list of bare ``exp.EQ``), mirroring ``_build_update``.
+    """
+    if isinstance(then, exp.Update):
+        sets = then.expressions or []
+        assignments: list[tuple[str, Expr]] = []
+        for eq in sets:
+            if not isinstance(eq, exp.EQ) or not isinstance(eq.this, exp.Column):
+                raise ParseError(
+                    f"MERGE UPDATE SET must be `col = expr` (got {type(eq).__name__})"
+                )
+            assignments.append((eq.this.name, _expr(eq.expression)))
+        if not assignments:
+            raise ParseError("MERGE WHEN MATCHED UPDATE has no SET assignments")
+        cols = [c for c, _ in assignments]
+        if len(set(cols)) != len(cols):
+            raise ParseError(f"MERGE UPDATE SET has duplicate columns: {cols}")
+        return MergeArm(matched=matched, condition=condition, action="UPDATE", assignments=assignments)
+    if isinstance(then, exp.Var) and then.name.upper() == "DELETE":
+        return MergeArm(matched=matched, condition=condition, action="DELETE")
+    if isinstance(then, exp.Insert):
+        insert_columns: list[str] | None = None
+        this = then.this
+        if isinstance(this, exp.Tuple):
+            insert_columns = []
+            for c in this.expressions:
+                name = c.name if hasattr(c, "name") and c.name else c.alias_or_name
+                if not name:
+                    raise ParseError("MERGE INSERT column list is malformed")
+                insert_columns.append(name)
+            if len(set(insert_columns)) != len(insert_columns):
+                raise ParseError(f"MERGE INSERT column list has duplicates: {insert_columns}")
+        elif isinstance(this, exp.Star):
+            insert_columns = None  # INSERT * -> full schema (executor validates)
+        # exp.var("ROW") (INSERT ROW) and a bare VALUES with no column list both
+        # mean full-schema positional insert.
+        body = then.expression
+        # sqlglot encodes the MERGE INSERT value row as a bare exp.Tuple (one row)
+        # in ``then.expression``; a multi-row VALUES would be an exp.Values whose
+        # .expressions are Tuples (rejected -- MERGE INSERT fires per unmatched
+        # source row, so exactly one value row referencing the source is allowed).
+        if isinstance(body, exp.Tuple):
+            row = body
+        elif isinstance(body, exp.Values) and body.expressions:
+            if len(body.expressions) > 1:
+                raise ParseError("MERGE INSERT VALUES must have exactly one row")
+            row = body.expressions[0]
+            if not isinstance(row, exp.Tuple):
+                raise ParseError("MERGE INSERT VALUES row is not a tuple")
+        else:
+            raise ParseError("MERGE WHEN NOT MATCHED INSERT requires a VALUES row")
+        insert_values = [_expr(cell) for cell in row.expressions]
+        if insert_columns is not None and len(insert_values) != len(insert_columns):
+            raise ParseError(
+                f"MERGE INSERT has {len(insert_values)} values for {len(insert_columns)} columns"
+            )
+        if not insert_values:
+            raise ParseError("MERGE INSERT VALUES row is empty")
+        return MergeArm(
+            matched=matched,
+            condition=condition,
+            action="INSERT",
+            insert_columns=insert_columns,
+            insert_values=insert_values,
+        )
+    raise ParseError(f"MERGE THEN action must be UPDATE/DELETE/INSERT (got {type(then).__name__})")
 
 
 def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None, ctes=None):

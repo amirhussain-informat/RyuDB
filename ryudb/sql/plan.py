@@ -476,6 +476,65 @@ class Update:
 
 
 @dataclass
+class MergeArm:
+    """One ``WHEN`` clause of a ``MERGE`` (v1: at most one matched + one not-matched).
+
+    ``matched`` is ``True`` for ``WHEN MATCHED`` (acts on target rows that have a
+    source match -> ``UPDATE`` / ``DELETE``) and ``False`` for ``WHEN NOT MATCHED
+    [BY TARGET]`` (acts on source rows with no target match -> ``INSERT``).
+    ``condition`` is the optional ``AND <cond>`` on the WHEN clause. ``action`` is
+    one of ``"UPDATE"`` / ``"DELETE"`` / ``"INSERT"``; the arm carries only the
+    fields relevant to its action (``assignments`` for UPDATE, ``insert_columns`` +
+    ``insert_values`` for INSERT). ``MergeArm`` is payload on ``Merge`` -- it is NOT
+    a ``PlanNode`` and is not in the union.
+    """
+
+    matched: bool
+    condition: Expr | None
+    action: str  # "UPDATE" | "DELETE" | "INSERT"
+    assignments: list[tuple[str, Expr]] = field(default_factory=list)  # UPDATE SET list
+    insert_columns: list[str] | None = None  # INSERT target cols (None = full schema)
+    insert_values: list[Expr] = field(default_factory=list)  # INSERT value exprs (parallel)
+
+
+@dataclass
+class Merge:
+    """Write node: ``MERGE INTO target [AS talias] USING source [AS salias] ON ...
+    WHEN MATCHED ... / WHEN NOT MATCHED ...`` (UPSERT).
+
+    A write leaf whose single relational child is ``source`` (the ``USING`` relation
+    -- a ``Scan`` for a base table or a subplan for a subquery), mirroring
+    ``Insert`` with a ``source``. ``target_alias`` / ``source_alias`` are the
+    correlation names (defaulting to the table name) used to qualify columns in the
+    ``ON`` predicate, the WHEN ``AND`` conditions, the UPDATE ``SET`` expressions,
+    and the INSERT ``VALUES`` -- the executor renames each side's columns to
+    ``{alias}__{col}`` so ``eval_expr`` resolves ``Col(c, table=alias)`` to that
+    column. ``on_target`` / ``on_source`` are the equi-join key column lists split
+    out of the ``ON`` predicate (parallel); ``on_residual`` is the non-equi ``AND``
+    remnant applied inside the match. ``matched_arm`` / ``not_matched_arm`` are the
+    two WHEN clauses (either may be ``None``; v1 supports at most one of each). The
+    executor joins target x source on the equi keys + residual, splits matched vs
+    not-matched, and flushes all arms' tombstones + inserts atomically under ONE
+    ``commit_ts`` via the implicit-txn + ``_write_commit`` seam (a WHEN MATCHED
+    UPDATE is ``_update``'s tombstone-old + insert-new pattern per row; a WHEN NOT
+    MATCHED INSERT is ``_insert``'s typed-batch path on the unmatched source rows).
+    Requires a declared PRIMARY KEY when a matched UPDATE/DELETE arm is present
+    (row identity is by PK value). Autocommit only (explicit-txn MERGE raises
+    ``NotImplementedError`` in v1, matching ``Update``).
+    """
+
+    table: str
+    target_alias: str | None
+    source: "PlanNode | None"  # the USING relation (Scan or subplan) -- the single child
+    source_alias: str | None
+    on_target: list[str]  # equi-key cols from the target side of ON
+    on_source: list[str]  # equi-key cols from the source side of ON (parallel)
+    on_residual: Expr | None  # non-equi AND terms of ON (applied inside the match)
+    matched_arm: MergeArm | None  # WHEN MATCHED [AND cond] THEN UPDATE|DELETE
+    not_matched_arm: MergeArm | None  # WHEN NOT MATCHED [BY TARGET] [AND cond] THEN INSERT
+
+
+@dataclass
 class TxnControl:
     """Transaction-control leaf (Phase 2 step 5): BEGIN / COMMIT / ROLLBACK.
 
@@ -487,7 +546,7 @@ class TxnControl:
     kind: str  # "begin" | "commit" | "rollback"
 
 
-PlanNode = Scan | Filter | Project | Join | Aggregate | Window | Sort | Limit | Distinct | Derived | SetOp | Insert | Delete | Update | TxnControl
+PlanNode = Scan | Filter | Project | Join | Aggregate | Window | Sort | Limit | Distinct | Derived | SetOp | Insert | Delete | Update | Merge | TxnControl
 
 
 def walk(node: PlanNode):
@@ -509,6 +568,11 @@ def children(node: PlanNode) -> list[PlanNode]:
     if isinstance(node, Insert):
         # INSERT ... SELECT: the subplan is the single child. INSERT ... VALUES
         # (rows set, source None) is a leaf.
+        return [node.source] if node.source is not None else []
+    if isinstance(node, Merge):
+        # MERGE ... USING <rel>: the USING relation is the single child (a Scan
+        # for a base table, a subplan for a subquery). NULL only when the source
+        # could not be lowered -- unreachable for a well-formed MERGE.
         return [node.source] if node.source is not None else []
     return []
 
@@ -533,6 +597,20 @@ def exprs_in(node: PlanNode) -> list[Expr]:
         return [e for _, e in node.assignments] + (
             [node.predicate] if node.predicate is not None else []
         )
+    if isinstance(node, Merge):
+        # Surface the ON residual + each arm's condition / SET / VALUES exprs. The
+        # optimizer bypasses write nodes, so this is for completeness/analysis.
+        out: list[Expr] = []
+        if node.on_residual is not None:
+            out.append(node.on_residual)
+        for arm in (node.matched_arm, node.not_matched_arm):
+            if arm is None:
+                continue
+            if arm.condition is not None:
+                out.append(arm.condition)
+            out.extend(e for _, e in arm.assignments)
+            out.extend(arm.insert_values)
+        return out
     # Insert's payload (VALUES Lits / SELECT subplan) is not a relational
     # expression to surface here; the optimizer does not rewrite a write node.
     return []
@@ -589,6 +667,26 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
         sets = ", ".join(f"{c}={_estr(e)}" for c, e in node.assignments)
         pred = "" if node.predicate is None else f" WHERE {_estr(node.predicate)}"
         return f"{pad}Update({node.table} SET {sets}{pred})"
+    if isinstance(node, Merge):
+        on = " AND ".join(f"{lk}={rk}" for lk, rk in zip(node.on_target, node.on_source))
+        on_res = "" if node.on_residual is None else f" [{_estr(node.on_residual)}]"
+        arms = []
+        for arm in (node.matched_arm, node.not_matched_arm):
+            if arm is None:
+                continue
+            kind = "MATCHED" if arm.matched else "NOT MATCHED"
+            cond = "" if arm.condition is None else f" AND {_estr(arm.condition)}"
+            if arm.action == "UPDATE":
+                body = "UPDATE SET " + ", ".join(f"{c}={_estr(e)}" for c, e in arm.assignments)
+            elif arm.action == "DELETE":
+                body = "DELETE"
+            else:
+                cols = ",".join(arm.insert_columns) if arm.insert_columns else "*"
+                vals = ",".join(_estr(e) for e in arm.insert_values)
+                body = f"INSERT({cols}) VALUES({vals})"
+            arms.append(f"WHEN {kind}{cond} THEN {body}")
+        src = pretty(node.source, indent + 1) if node.source is not None else "<no source>"
+        return f"{pad}Merge({node.table} on {on}{on_res} {' | '.join(arms)})\n" + src
     if isinstance(node, TxnControl):
         return f"{pad}TxnControl({node.kind})"
     return f"{pad}<{type(node).__name__}>"

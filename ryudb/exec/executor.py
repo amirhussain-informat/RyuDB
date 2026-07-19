@@ -31,6 +31,7 @@ from ..sql.plan import (
     Insert,
     Join,
     Limit,
+    Merge,
     PlanNode,
     Project,
     Scan,
@@ -1139,6 +1140,274 @@ class Engine:
             raise
         return len(targets)
 
+    def _merge(self, node: Merge) -> int:
+        """Apply ``MERGE INTO target [AS t] USING source [AS s] ON ...
+        WHEN MATCHED ... / WHEN NOT MATCHED ...`` (UPSERT).
+
+        v1 scope: at most one ``WHEN MATCHED`` arm (UPDATE/DELETE) and one ``WHEN
+        NOT MATCHED [BY TARGET]`` arm (INSERT); autocommit only (an explicit-txn
+        MERGE raises ``NotImplementedError``, matching ``_update``); ON is
+        equi-conjunctive (the parser split it into ``on_target``/``on_source`` equi
+        keys + an ``on_residual``). A matched UPDATE/DELETE arm requires a declared
+        PRIMARY KEY (row identity is by PK value, mirroring ``_update``/``_delete``).
+
+        Match determination is against the pre-MERGE visible target (the snapshot
+        scanned once up front, per SQL: a source row matches iff ON holds against
+        that snapshot). Target x source is an inner equi-merge on the ON keys, then
+        ``on_residual`` filters the pairs. Matched pairs drive the MATCHED arm
+        (UPDATE = tombstone old PK + reinsert post-SET rows; DELETE = tombstone old
+        PKs). Source rows with no match drive the NOT MATCHED arm (INSERT = a typed
+        batch built from the source row, the ``_insert`` per-column path). A target
+        row matched by >1 source row is a cardinality violation (matches DuckDB).
+
+        Atomicity: the whole MERGE runs inside an *implicit* transaction and flushes
+        every tombstone + insert via one ``_write_commit`` under ONE ``commit_ts``
+        -- a WHEN MATCHED UPDATE is exactly ``_update``'s tombstone-old +
+        insert-new pattern (the ``exclude_same_ts=True`` tombstone lets each
+        reinserted row survive its own tombstone via ``_merge_delta``'s
+        ``_tomb_upd <= ins_ts`` rule). ``_enforce_unique`` runs on the combined new
+        frame after the tombstones are buffered, so its read-your-writes scan sees
+        the old matched rows gone and the new rows not-yet-buffered -- no false
+        self-collision when SET keeps the PK. On any failure the implicit txn is
+        discarded (no half-applied state). Returns the total affected row count
+        (matched updated/deleted + not-matched inserted), matching DuckDB.
+
+        Limitation: a WHEN MATCHED DELETE arm whose deleted PK is re-inserted by the
+        WHEN NOT MATCHED arm in the same statement is not supported (the DELETE
+        tombstone at ``+inf`` would remove the same-``ts`` insert). This does not
+        arise in normal UPSERT / DELETE-MERGE usage.
+        """
+        info = self.catalog.get(node.table)
+        if info is None:
+            raise RuntimeError(f"unknown table: {node.table}")
+        all_cols = list(info.columns)
+        types = info.types
+        not_null = info.constraints.not_null
+        defaults = info.constraints.defaults
+        pk = info.constraints.primary_key
+        talias = node.target_alias
+        salias = node.source_alias
+
+        matched_arm = node.matched_arm
+        not_matched_arm = node.not_matched_arm
+        needs_pk = matched_arm is not None and matched_arm.action in ("UPDATE", "DELETE")
+        if needs_pk and pk is None:
+            raise RuntimeError(
+                f"MERGE requires a declared PRIMARY KEY on {node.table} "
+                f"for a WHEN MATCHED {matched_arm.action} arm"
+            )
+        if self._txn is not None:
+            raise NotImplementedError(
+                "MERGE inside an explicit transaction is not supported in v1 "
+                "(needs per-row MVCC versioning); use autocommit MERGE"
+            )
+
+        # Visible target snapshot (the pre-MERGE state) + materialized source.
+        tgt = self._scan(node.table, None)
+        src = self._exec(node.source)
+        src_cols = list(src.columns)  # the source's output names (pre-rename)
+
+        def _bare(frame, alias, cols):
+            """Return a copy of ``frame`` with bare-name copies of each
+            ``{alias}__{c}`` column (for ``c`` in ``cols`` present on that side),
+            so an UNQUALIFIED ``Col(c)`` resolves to that side via eval_expr's
+            bare-name fallback (ops.py:51-52). Qualified ``{alias}__c`` refs are
+            unaffected. SQL semantics: an unqualified column in a WHEN MATCHED arm
+            refers to the TARGET; in a WHEN NOT MATCHED arm it refers to the
+            SOURCE (the target row does not exist)."""
+            g = frame.copy()
+            for c in cols:
+                col = f"{alias}__{c}"
+                if col in g.columns and c not in g.columns:
+                    g[c] = frame[col]
+            return g
+
+        # Qualified rename: every target col -> {talias}__c, every source col ->
+        # {salias}__c, so eval_expr resolves Col(c, table=talias/salias) to that
+        # column unambiguously (ops.py:47-52). No cross-side collisions -> cuDF
+        # merge suffixes never fire. Bare-name aliases are layered on per arm
+        # above for unqualified refs (see ``_bare``).
+        T = tgt.rename(columns={c: f"{talias}__{c}" for c in tgt.columns})
+        S = src.rename(columns={c: f"{salias}__{c}" for c in src.columns})
+
+        on_t = [f"{talias}__{c}" for c in node.on_target]
+        on_s = [f"{salias}__{c}" for c in node.on_source]
+        matched = T.merge(
+            S, left_on=on_t, right_on=on_s, how="inner", suffixes=("_x", "_y")
+        )
+        if node.on_residual is not None:
+            mask = eval_expr(node.on_residual, matched)
+            if isinstance(mask, cudf.Series):
+                matched = matched[mask.fillna(False)]
+            elif not mask:
+                matched = matched.iloc[0:0]
+
+        # Cardinality: a target row matched by >1 source row is an error (only
+        # relevant when a MATCHED arm fires). PK cols identify the target row.
+        if matched_arm is not None and len(matched) > 0:
+            pk_tcols = [f"{talias}__{c}" for c in pk]
+            if matched.duplicated(subset=pk_tcols).any():
+                raise RuntimeError(
+                    f"MERGE cardinality violation: a {node.table} row matched more "
+                    f"than one source row on ON"
+                )
+
+        tombstone_upd: "cudf.DataFrame | None" = None
+        tombstone_del: "cudf.DataFrame | None" = None
+        new_upd: "cudf.DataFrame | None" = None
+        new_ins: "cudf.DataFrame | None" = None
+        matched_n = 0
+        not_matched_n = 0
+
+        # ---- MATCHED arm (UPDATE / DELETE) ----
+        if matched_arm is not None and len(matched) > 0:
+            m = matched
+            if matched_arm.condition is not None:
+                # Unqualified cols in a WHEN MATCHED condition resolve to the TARGET.
+                m_eval = _bare(m, talias, all_cols)
+                mask = eval_expr(matched_arm.condition, m_eval)
+                if isinstance(mask, cudf.Series):
+                    m = m[mask.fillna(False)]
+                elif not mask:
+                    m = m.iloc[0:0]
+            matched_n = len(m)
+            if matched_n > 0:
+                m = m.reset_index(drop=True)
+                pk_tcols = [f"{talias}__{c}" for c in pk]
+                if matched_arm.action == "UPDATE":
+                    # Build the post-SET frame in full target schema (actual col
+                    # names): start from the matched target rows, override each SET
+                    # col with the evaluated expr (refs {talias}__* / {salias}__*,
+                    # and bare names -> target for unqualified refs).
+                    m_eval = _bare(m, talias, all_cols)
+                    new_upd = cudf.DataFrame(index=cudf.Series(range(matched_n)))
+                    for c in all_cols:
+                        new_upd[c] = m[f"{talias}__{c}"].reset_index(drop=True)
+                    for col, expr in matched_arm.assignments:
+                        if col not in all_cols:
+                            raise ParseError(
+                                f"unknown column in MERGE UPDATE {node.table}: {col}"
+                            )
+                        val = eval_expr(expr, m_eval)
+                        if isinstance(val, cudf.Series):
+                            arr = val.to_pandas().tolist()
+                        else:
+                            arr = [val] * matched_n
+                        new_upd[col] = self._typed_series(types[col], arr)
+                    for c in not_null:
+                        if new_upd[c].isna().any():
+                            raise RuntimeError(f"NOT NULL violation: {node.table}.{c}")
+                    tombstone_upd = m[pk_tcols].rename(
+                        columns={f"{talias}__{c}": c for c in pk}
+                    )
+                else:  # DELETE
+                    tombstone_del = m[pk_tcols].rename(
+                        columns={f"{talias}__{c}": c for c in pk}
+                    )
+
+        # ---- NOT MATCHED arm (INSERT) ----
+        if not_matched_arm is not None and len(S) > 0:
+            # Unmatched source rows = S minus the source rows that appeared in any
+            # matched pair (NULL-safe: dropna on the matched source keys -- a NULL
+            # source key never matches). Mirror _semi_anti_join's tag+anti pattern.
+            on_scols = [f"{salias}__{c}" for c in node.on_source]
+            S2 = S.reset_index(drop=True)
+            S2["__sid"] = cudf.Series(range(len(S2)), dtype="int64")
+            if len(matched) > 0:
+                matched_src = matched[on_scols].dropna(subset=on_scols).drop_duplicates()
+                hit = S2.merge(matched_src, left_on=on_scols, right_on=on_scols, how="inner")
+                matched_ids = hit["__sid"].drop_duplicates()
+            else:
+                matched_ids = cudf.Series([], dtype="int64")
+            ids = cudf.Series(range(len(S2)), dtype="int64")
+            not_matched = S2[~ids.isin(matched_ids)]
+            # Apply the arm's AND condition (references source cols only; an
+            # unqualified col resolves to the SOURCE via the bare-name aliases).
+            if not_matched_arm.condition is not None and len(not_matched) > 0:
+                nm_eval = _bare(not_matched, salias, src_cols)
+                mask = eval_expr(not_matched_arm.condition, nm_eval)
+                if isinstance(mask, cudf.Series):
+                    not_matched = not_matched[mask.fillna(False)]
+                elif not mask:
+                    not_matched = not_matched.iloc[0:0]
+            not_matched_n = len(not_matched)
+            if not_matched_n > 0:
+                # Validate the INSERT column list / value arity (full-schema case
+                # needs the catalog column count, available here).
+                insert_columns = not_matched_arm.insert_columns
+                if insert_columns is None:
+                    insert_columns = list(all_cols)
+                unknown = [c for c in insert_columns if c not in all_cols]
+                if unknown:
+                    raise ParseError(f"unknown columns in {node.table}: {unknown}")
+                if len(set(insert_columns)) != len(insert_columns):
+                    raise ParseError(
+                        f"MERGE INSERT column list has duplicates: {insert_columns}"
+                    )
+                if len(not_matched_arm.insert_values) != len(insert_columns):
+                    raise ParseError(
+                        f"MERGE INSERT has {len(not_matched_arm.insert_values)} values "
+                        f"for {len(insert_columns)} columns"
+                    )
+                provided_idx = {c: i for i, c in enumerate(insert_columns)}
+                # Build a full-schema typed frame (DEFAULT/NULL fill, NOT NULL
+                # enforce) -- the same per-column path _insert uses.
+                data: dict[str, list] = {c: [] for c in all_cols}
+                vals = not_matched_arm.insert_values
+                for i in range(not_matched_n):
+                    row_frame = _bare(not_matched.iloc[[i]], salias, src_cols)
+                    for c in all_cols:
+                        if c in provided_idx:
+                            v = eval_expr(vals[provided_idx[c]], row_frame)
+                            v = v.to_pandas().tolist()[0] if isinstance(v, cudf.Series) else v
+                        elif c in defaults:
+                            v = defaults[c]
+                        else:
+                            v = None
+                        if v is None and c in not_null:
+                            raise RuntimeError(
+                                f"NOT NULL violation: {node.table}.{c} (row {len(data[c])})"
+                            )
+                        data[c].append(v)
+                pdf = {}
+                for c in all_cols:
+                    arr = data[c]
+                    dt = _arrow_match_dtype(types[c])
+                    if "datetime" in str(dt):
+                        pdf[c] = pd.to_datetime(arr, errors="coerce")
+                    elif str(dt).startswith("int"):
+                        pdf[c] = pd.array(arr, dtype="Int64")
+                    else:
+                        pdf[c] = pd.array(arr, dtype=dt)
+                new_ins = cudf.DataFrame(pd.DataFrame(pdf))
+
+        # ---- Atomic flush under ONE commit_ts (mirror _update) ----
+        if (
+            tombstone_upd is None
+            and tombstone_del is None
+            and new_upd is None
+            and new_ins is None
+        ):
+            return 0  # nothing matched / inserted -> no WAL record
+        new_parts = [f for f in (new_upd, new_ins) if f is not None and len(f) > 0]
+        combined_new = cudf.concat(new_parts, axis=0) if new_parts else None
+        self._txn = Transaction(snapshot_ts=self._commit_ts)
+        try:
+            if tombstone_upd is not None:
+                self._txn.tombstone_append(node.table, tombstone_upd, exclude_same_ts=True)
+            if tombstone_del is not None:
+                self._txn.tombstone_append(node.table, tombstone_del, exclude_same_ts=False)
+            if combined_new is not None:
+                self._enforce_unique(node.table, combined_new)
+                self._txn.buffer_append(node.table, combined_new)
+            self._invalidate_table_caches(node.table)
+            self._commit()
+        except BaseException:
+            self._txn = None
+            self._invalidate_table_caches(node.table)
+            raise
+        return matched_n + not_matched_n
+
     def sql(self, sql: str) -> "cudf.DataFrame | int | None":
         # Non-standard snapshot/restore bypass sqlglot entirely (no AST node).
         # Cheap prefix guard so the regex never runs on a SELECT/INSERT/BEGIN.
@@ -1156,20 +1425,28 @@ class Engine:
         # INSERT ... SELECT carries a relational subplan that DOES need
         # optimizing (predicate pushdown, projection pruning, ...); the Insert
         # shell itself is not a relational node, so optimize the child in place
-        # before the leaf-bypass below. INSERT ... VALUES has no source.
+        # before the leaf-bypass below. INSERT ... VALUES has no source. A MERGE's
+        # USING source is the same: a relational subplan (Scan or subquery) that
+        # benefits from optimizing, while the Merge shell is not relational.
         if isinstance(plan, Insert) and plan.source is not None:
             plan.source = optimize(
                 plan.source,
                 self.catalog.schema_dict(),
                 self.catalog.stats_dict(),
             )
-        # INSERT, DELETE, UPDATE, and TxnControl are non-relational leaves with no
+        if isinstance(plan, Merge) and plan.source is not None:
+            plan.source = optimize(
+                plan.source,
+                self.catalog.schema_dict(),
+                self.catalog.stats_dict(),
+            )
+        # INSERT, DELETE, UPDATE, MERGE, and TxnControl are non-relational leaves with no
         # predicate / projection / join to optimize; bypass the optimizer (the
         # rules are pass-through-safe today, but a future Select-shaped rule
-        # could choke on an Insert/Delete/Update/TxnControl root). A DELETE's or
-        # UPDATE's WHERE is a row-selector evaluated in _delete/_update, not a
-        # relational Filter.
-        if not isinstance(plan, (Insert, Delete, Update, TxnControl)):
+        # could choke on an Insert/Delete/Update/Merge/TxnControl root). A DELETE's,
+        # UPDATE's, or MERGE's predicates are row-selectors evaluated in
+        # _delete/_update/_merge, not relational Filters.
+        if not isinstance(plan, (Insert, Delete, Update, Merge, TxnControl)):
             plan = optimize(
                 plan,
                 self.catalog.schema_dict(),
@@ -1190,12 +1467,17 @@ class Engine:
                 return f"RestoreToSnapshot({m.group(1)})"
         plan = parse(sql, self.catalog.schema_dict())
         # INSERT ... SELECT: optimize the subplan so EXPLAIN shows the optimized
-        # plan (predicate pushdown etc.), mirroring sql().
+        # plan (predicate pushdown etc.), mirroring sql(). A MERGE's USING source
+        # is optimized the same way.
         if isinstance(plan, Insert) and plan.source is not None:
             plan.source = optimize(
                 plan.source, self.catalog.schema_dict(), self.catalog.stats_dict()
             )
-        if not isinstance(plan, (Insert, Delete, Update, TxnControl)):
+        if isinstance(plan, Merge) and plan.source is not None:
+            plan.source = optimize(
+                plan.source, self.catalog.schema_dict(), self.catalog.stats_dict()
+            )
+        if not isinstance(plan, (Insert, Delete, Update, Merge, TxnControl)):
             plan = optimize(plan, self.catalog.schema_dict(), self.catalog.stats_dict())
         return pretty(plan)
 
@@ -1217,6 +1499,8 @@ class Engine:
             return self._delete(node)
         if isinstance(node, Update):
             return self._update(node)
+        if isinstance(node, Merge):
+            return self._merge(node)
         if isinstance(node, TxnControl):
             self._txn_control(node)
             return None
