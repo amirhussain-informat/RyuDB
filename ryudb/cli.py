@@ -108,7 +108,12 @@ def _run_statement(engine: Engine, stmt: str, quiet: bool) -> int:
     # delta); SELECT returns a cuDF frame to print.
     if isinstance(result, int):
         kw = stmt.lstrip().split(None, 1)[0].upper() if stmt.strip() else ""
-        verb = "deleted" if kw == "DELETE" else "updated" if kw == "UPDATE" else "inserted"
+        verb = (
+            "deleted" if kw == "DELETE"
+            else "updated" if kw == "UPDATE"
+            else "merged" if kw == "MERGE"
+            else "inserted"
+        )
         print(f"{verb} {result} rows")
         return 0
     _print_frame(result)
