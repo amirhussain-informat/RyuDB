@@ -69,6 +69,8 @@ from .plan import (
     Distinct,
     Expr,
     Filter,
+    Frame,
+    FrameBound,
     Func,
     In,
     Insert,
@@ -1868,12 +1870,13 @@ def _reject_window_outside_projection(sel):
             )
 
 
-# Window functions supported in F-1: ranking (ROW_NUMBER/RANK/DENSE_RANK) and
-# offset (LAG/LEAD) require an ORDER BY; aggregate funcs (SUM/COUNT/AVG/MIN/MAX)
-# broadcast over the whole partition (no ORDER BY). Running/cumulative aggregates
-# (an ORDER BY on an aggregate window), explicit frames (ROWS/RANGE BETWEEN),
-# QUALIFY, expression PARTITION BY / ORDER BY keys, and window + GROUP BY are
-# deferred.
+# Window functions: ranking (ROW_NUMBER/RANK/DENSE_RANK) and offset (LAG/LEAD)
+# require an ORDER BY; aggregate funcs (SUM/COUNT/AVG/MIN/MAX) broadcast over the
+# whole partition when there is no ORDER BY, and compute a running/cumulative
+# aggregate (with the SQL default frame RANGE UNBOUNDED PRECEDING TO CURRENT ROW,
+# or an explicit ROWS/RANGE frame) when an ORDER BY is present. Deferred:
+# QUALIFY, expression PARTITION BY / ORDER BY keys, window + GROUP BY, RANGE
+# value offsets, EXCLUDE, and MIN/MAX with a FOLLOWING bound.
 _WINDOW_RANK_FUNCS = {exp.RowNumber: "ROW_NUMBER", exp.Rank: "RANK",
                       exp.DenseRank: "DENSE_RANK"}
 
@@ -1923,11 +1926,8 @@ def _build_one_window(win, schema):
                     "(only bare columns)"
                 )
             order_keys.append((e, not o.args.get("desc", False)))
-    if win.args.get("spec") is not None:
-        raise NotImplementedError(
-            "window frames (ROWS/RANGE BETWEEN) are not supported yet"
-        )
-
+    spec = win.args.get("spec")
+    frame = None
     offset = None
     default = None
     if isinstance(fn, exp.Lag) or isinstance(fn, exp.Lead):
@@ -1939,19 +1939,26 @@ def _build_one_window(win, schema):
         default = _expr(dflt) if dflt is not None else None
         if not order_keys:
             raise NotImplementedError(f"{func} requires ORDER BY in the window")
+        # LAG/LEAD ignore any explicit frame (DuckDB does too); frame stays None.
     elif type(fn) in _WINDOW_RANK_FUNCS:
         func = _WINDOW_RANK_FUNCS[type(fn)]
         arg = None
         if not order_keys:
             raise NotImplementedError(f"{func} requires ORDER BY in the window")
+        # Ranking funcs ignore any explicit frame (DuckDB does too); frame stays None.
     elif isinstance(fn, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)):
         func = AGG_FUNCS[type(fn)]
         arg = _expr(fn.this) if fn.this is not None else Star()
         if order_keys:
+            # Running/cumulative aggregate: resolve the frame, synthesizing the
+            # SQL default (RANGE UNBOUNDED PRECEDING TO CURRENT ROW) when none is
+            # explicit. Peer-group cumulative matches DuckDB's default frame.
+            frame = _build_frame(spec, func)
+        elif spec is not None:
             raise NotImplementedError(
-                "aggregate window functions with ORDER BY (running/cumulative "
-                "aggregates) are not supported yet"
+                "window frames without ORDER BY are not supported yet"
             )
+        # else: whole-partition broadcast, frame stays None.
     else:
         raise NotImplementedError(
             f"window function {type(fn).__name__} is not supported yet"
@@ -1963,7 +1970,63 @@ def _build_one_window(win, schema):
         order_keys=tuple(order_keys),
         offset=offset,
         default=default,
+        frame=frame,
     )
+
+
+def _build_frame(spec, func):
+    """Resolve an ``exp.WindowSpec`` to a :class:`Frame`, synthesizing the SQL
+    default (``RANGE UNBOUNDED PRECEDING TO CURRENT ROW``) when ``spec`` is
+    None. Raises for the deferred forms (EXCLUDE, GROUPS, RANGE value offsets,
+    MIN/MAX with a FOLLOWING bound)."""
+    if spec is None:
+        return Frame(
+            "RANGE", FrameBound("UNBOUNDED_PRECEDING"), FrameBound("CURRENT_ROW")
+        )
+    if spec.args.get("exclude") is not None:
+        raise NotImplementedError("window EXCLUDE is not supported yet")
+    mode = (spec.args.get("kind") or "RANGE").upper()
+    if mode not in ("ROWS", "RANGE"):
+        raise NotImplementedError(f"window frame mode {mode} is not supported yet")
+    start = _frame_bound(spec.args.get("start"), spec.args.get("start_side"))
+    end = _frame_bound(spec.args.get("end"), spec.args.get("end_side"))
+    if start is None:
+        raise NotImplementedError("window frame requires a start bound")
+    if end is None:
+        end = FrameBound("CURRENT_ROW")  # shorthand `ROWS N PRECEDING`
+    if mode == "RANGE":
+        for b in (start, end):
+            if b.kind in ("PRECEDING", "FOLLOWING"):
+                raise NotImplementedError(
+                    "RANGE frames with value offsets are not supported yet"
+                )
+    if func in ("MIN", "MAX") and start.kind != "UNBOUNDED_PRECEDING":
+        raise NotImplementedError(
+            "MIN/MAX window functions: only cumulative frames "
+            "(UNBOUNDED PRECEDING ..) are supported yet"
+        )
+    return Frame(mode, start, end)
+
+
+def _frame_bound(val, side):
+    """Lower one sqlglot frame bound (a Literal or the strings
+    ``UNBOUNDED`` / ``CURRENT ROW``) to a :class:`FrameBound`."""
+    if val is None:
+        return None
+    if isinstance(val, exp.Literal):
+        n = int(val.this)
+        if side == "PRECEDING":
+            return FrameBound("PRECEDING", n)
+        if side == "FOLLOWING":
+            return FrameBound("FOLLOWING", n)
+        raise NotImplementedError(f"unsupported frame bound: {val} {side}")
+    if val == "UNBOUNDED":
+        return FrameBound(
+            "UNBOUNDED_PRECEDING" if side == "PRECEDING" else "UNBOUNDED_FOLLOWING"
+        )
+    if val == "CURRENT ROW":
+        return FrameBound("CURRENT_ROW")
+    raise NotImplementedError(f"unsupported frame bound: {val}")
 
 
 def _is_star(node) -> bool:

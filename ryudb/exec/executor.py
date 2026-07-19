@@ -1570,17 +1570,21 @@ class Engine:
         return out[by_names + [n for _, n in aggs]]
 
     # ------------------------------------------------------------------ #
-    # Window functions (Phase F-1). A row-preserving "compute" node: each
-    # window function is evaluated over the input frame and attached as a new
-    # column; the input columns pass through verbatim so the outer Project can
-    # reference both. Ranking/offset funcs sort by (partition, order) and
-    # compute position within partition via a global-position-minus-boundary
-    # method (NOT groupby.cumcount -- that returns NA for NULL-key partitions in
-    # cuDF); the original row order is restored via a position sentinel.
-    # Aggregate-over-partition (no ORDER BY) uses groupby(dropna=False).transform,
-    # which DOES include NULL-key partitions. Running/cumulative aggregates (an
-    # ORDER BY on an aggregate window) and explicit frames are deferred at parse
-    # time, so they never reach here.
+    # Window functions (Phase F-1 + G-3 frames). A row-preserving "compute"
+    # node: each window function is evaluated over the input frame and attached
+    # as a new column; the input columns pass through verbatim so the outer
+    # Project can reference both. Ranking/offset funcs sort by (partition,
+    # order) and compute position within partition via a global-position-minus-
+    # boundary method (NOT groupby.cumcount -- that returns NA for NULL-key
+    # partitions in cuDF); the original row order is restored via a position
+    # sentinel. Aggregate-over-partition (no ORDER BY) uses
+    # groupby(dropna=False).transform, which DOES include NULL-key partitions.
+    # Running/cumulative aggregates (an ORDER BY on an aggregate window, with
+    # the SQL default frame or an explicit ROWS/RANGE frame) use
+    # _window_running: per-partition prefix sums (SUM/COUNT/AVG, O(n), any ROWS
+    # bounds incl. FOLLOWING) or cummin/cummax (MIN/MAX, cumulative), with
+    # peer-group semantics for RANGE (rows with equal order keys share the
+    # cumulative value, matching DuckDB's default frame).
     # ------------------------------------------------------------------ #
     def _window(self, node: Window) -> cudf.DataFrame:
         df = self._exec(node.input)
@@ -1594,6 +1598,11 @@ class Engine:
         is_agg = wf.func in _AGG_METHOD
         if is_agg and not wf.order_keys:
             col = self._window_broadcast(wf, df, part_names)
+            return col.astype("int64") if wf.func == "COUNT" else col
+        if is_agg:
+            # Running/cumulative aggregate (ORDER BY present, frame resolved at
+            # parse). Pure cuDF -- no fused kernel is involved in the window node.
+            col = self._window_running(wf, df, part_names)
             return col.astype("int64") if wf.func == "COUNT" else col
         # ranking / lag / lead: positioned path.
         col = self._window_positioned(wf, df, part_names)
@@ -1645,10 +1654,11 @@ class Engine:
         na_position = "last"
         work = df.copy()
         work["_pos"] = cudf.Series(range(len(work)), index=work.index)
-        by = part_names + order_names
-        work = work.sort_values(
-            by=by, ascending=[True] * len(part_names) + asc, na_position=na_position
-        ).reset_index(drop=True)
+        by, asc_all = self._dedup_sort_keys(
+            part_names + order_names, [True] * len(part_names) + asc
+        )
+        work = work.sort_values(by=by, ascending=asc_all, na_position=na_position) \
+            .reset_index(drop=True)
         gpos = cudf.Series(range(len(work)), index=work.index)
         boundary = self._partition_boundary(work, part_names, gpos)
         pstart = gpos.where(boundary).ffill()
@@ -1692,6 +1702,167 @@ class Engine:
         work["_wf"] = result
         restored = work.sort_values("_pos").reset_index(drop=True)
         return restored["_wf"]
+
+    def _window_running(self, wf, df, part_names):
+        """Running/cumulative aggregate window function (an aggregate with an
+        ORDER BY and a resolved frame). Sort by (partition, order), compute the
+        per-row windowed aggregate, then restore the original row order via a
+        position sentinel.
+
+        Frame semantics:
+          - RANGE default (UNBOUNDED PRECEDING .. CURRENT ROW): peer-group
+            cumulative -- rows with equal order keys share the cumulative value
+            (matches DuckDB's default frame).
+          - ROWS: positional sliding window [lo_i, hi_i] within the partition;
+            SUM/COUNT/AVG via per-partition prefix sums (O(n), any bounds incl.
+            FOLLOWING); MIN/MAX cumulative via cummin/cummax (start UNBOUNDED
+            PRECEDING only -- trailing MIN/MAX is deferred at parse).
+
+        NULLs: NULL order keys sort last (NULLS LAST) and form one peer group.
+        NULLs in the agg arg are skipped (SQL): SUM/AVG ignore them (an all-null
+        or empty window yields NULL, not 0); MIN/MAX skip them via ffill of the
+        cumulative; COUNT(col) counts non-nulls; COUNT(*) counts rows. Pure cuDF
+        -- no fused kernel is involved in the window node.
+        """
+        order_names = [e.name for e, _ in wf.order_keys]
+        asc = [a for _, a in wf.order_keys]
+        na_position = "last"
+        work = df.copy()
+        work["_pos"] = cudf.Series(range(len(work)), index=work.index)
+        by, asc_all = self._dedup_sort_keys(
+            part_names + order_names, [True] * len(part_names) + asc
+        )
+        work = work.sort_values(by=by, ascending=asc_all, na_position=na_position) \
+            .reset_index(drop=True)
+        gpos = cudf.Series(range(len(work)), index=work.index)
+        boundary = self._partition_boundary(work, part_names, gpos)
+        pstart = gpos.where(boundary).ffill()
+        pos_in_part = gpos - pstart  # 0-based within partition (sorted order)
+        is_last = boundary.shift(-1).fillna(True)
+        pend = gpos.where(is_last).bfill()
+        psize = pend - pstart + 1
+        work["_pid"] = boundary.cumsum().astype("int64")  # per-partition group id
+
+        # Peer-group start/end (0-based within partition) for RANGE frames: a
+        # peer group is a run of equal order keys (null-aware, NULL == NULL).
+        peer_bdry = boundary
+        for c in order_names:
+            peer_bdry = peer_bdry | self._col_changed(work[c], work[c].shift(1))
+        peer_start = gpos.where(peer_bdry).ffill() - pstart
+        peer_end = gpos.where(peer_bdry.shift(-1).fillna(True)).bfill()
+        peer_end = peer_end.where(peer_end <= pend, pend) - pstart
+
+        lo, hi = self._frame_bounds(wf.frame, pos_in_part, psize, peer_start, peer_end)
+        nonempty = lo <= hi
+
+        is_count_star = wf.func == "COUNT" and isinstance(wf.arg, Star)
+        if is_count_star:
+            # COUNT(*): window row count = hi - lo + 1 (empty -> 0).
+            result = (hi - lo + 1).astype("int64").where(nonempty, 0)
+        elif wf.func == "COUNT":  # COUNT(col): non-null count in the window.
+            arg_s = eval_expr(wf.arg, work)
+            work["_nn"] = arg_s.notna().astype("int64")
+            pnn = work.groupby("_pid", dropna=False)["_nn"].cumsum()
+            cnt = self._gather_diff(pnn, pstart, lo, hi).where(nonempty, 0)
+            result = cnt.astype("int64")
+        elif wf.func in ("SUM", "AVG"):
+            arg_s = eval_expr(wf.arg, work)
+            work["_nn"] = arg_s.notna().astype("int64")
+            pnn = work.groupby("_pid", dropna=False)["_nn"].cumsum()
+            cnt = self._gather_diff(pnn, pstart, lo, hi).where(nonempty, 0)
+            work["_a0"] = arg_s.fillna(0)  # fillna BEFORE groupby (skips nulls)
+            pref = work.groupby("_pid", dropna=False)["_a0"].cumsum()
+            s = self._gather_diff(pref, pstart, lo, hi)
+            if wf.func == "SUM":
+                result = s.where(cnt > 0)  # all-null / empty window -> NULL
+            else:  # AVG
+                result = (s / cnt).where(cnt > 0)
+        else:  # MIN / MAX (cumulative only; parse rejects non-cumulative)
+            arg_s = eval_expr(wf.arg, work)
+            result = self._window_running_minmax(wf, work, arg_s, pstart, hi)
+
+        work = work.copy()
+        work["_wf"] = result
+        restored = work.sort_values("_pos").reset_index(drop=True)
+        return restored["_wf"]
+
+    def _frame_bounds(self, frame, pos_in_part, psize, peer_start, peer_end):
+        """Resolve a Frame to per-row inclusive window bounds [lo, hi] (0-based
+        within the partition), clamped to [0, psize-1]. peer_start/peer_end are
+        the peer-group bounds for RANGE; pos_in_part is the row's 0-based
+        position; psize is the partition size. Clamping uses .where (not .clip,
+        which rejects a Series upper bound in cuDF 26.06)."""
+        zero = pos_in_part - pos_in_part  # int zeros, aligned
+        if frame.mode == "RANGE":
+            # Only UNBOUNDED_PRECEDING / CURRENT_ROW start and CURRENT_ROW /
+            # UNBOUNDED_FOLLOWING end are allowed (parse rejects value offsets).
+            lo = peer_start if frame.start.kind == "CURRENT_ROW" else zero
+            hi = peer_end if frame.end.kind == "CURRENT_ROW" else (psize - 1)
+        else:  # ROWS
+            lo = self._rows_offset(frame.start, pos_in_part, psize)
+            hi = self._rows_offset(frame.end, pos_in_part, psize)
+        lo = lo.where(lo >= 0, 0)
+        hi = hi.where(hi <= psize - 1, psize - 1)
+        return lo, hi
+
+    def _rows_offset(self, b, pos_in_part, psize):
+        """A ROWS frame bound as a per-row 0-based within-partition index."""
+        if b.kind == "UNBOUNDED_PRECEDING":
+            return pos_in_part - pos_in_part  # zeros
+        if b.kind == "UNBOUNDED_FOLLOWING":
+            return psize - 1
+        if b.kind == "CURRENT_ROW":
+            return pos_in_part.astype("int64")
+        if b.kind == "PRECEDING":
+            return pos_in_part - b.n
+        return pos_in_part + b.n  # FOLLOWING
+
+    def _gather_diff(self, prefix, pstart, lo, hi):
+        """Windowed prefix-sum difference: prefix[hi] - prefix[lo-1], subtracting
+        0 where lo == 0 (partition start). prefix is a per-partition cumulative
+        sum aligned to the sorted work frame; pstart is each row's partition-
+        start absolute position; lo/hi are 0-based within-partition bounds. cuDF
+        .iloc[int_series] returns a Series indexed by the index-array's values,
+        so reset_index(drop=True) after each gather keeps the operands aligned."""
+        pref_r = prefix.reset_index(drop=True)
+        lo_r = lo.reset_index(drop=True)
+        pstart_r = pstart.reset_index(drop=True)
+        abs_hi = pstart_r + hi.reset_index(drop=True)
+        abs_lo_m1 = (pstart_r + lo_r - 1).where(lo_r > 0, 0)
+        hi_val = pref_r.iloc[abs_hi].reset_index(drop=True)
+        sub = pref_r.iloc[abs_lo_m1].reset_index(drop=True).where(lo_r > 0, 0)
+        return hi_val - sub
+
+    def _window_running_minmax(self, wf, work, arg_s, pstart, hi):
+        """Cumulative MIN/MAX (start UNBOUNDED PRECEDING): min/max over [0..hi]
+        per partition, skipping NULLs. cummin/cummax propagate NULL at null-arg
+        rows then recover; ffill over null-arg rows yields the last non-null
+        running value (SQL MIN/MAX skip nulls); leading all-null windows stay
+        NULL. hi may be the peer-group end (RANGE default) or a FOLLOWING offset;
+        cummin[hi] = min over [0..hi] either way."""
+        work["_arg"] = arg_s
+        grp = work.groupby("_pid", dropna=False)["_arg"]
+        cm = grp.cummin() if wf.func == "MIN" else grp.cummax()
+        cm = cm.where(arg_s.notna()).ffill()
+        cm_r = cm.reset_index(drop=True)
+        abs_hi = pstart.reset_index(drop=True) + hi.reset_index(drop=True)
+        return cm_r.iloc[abs_hi].reset_index(drop=True)
+
+    @staticmethod
+    def _dedup_sort_keys(by, asc):
+        """Drop duplicate sort-key names (preserving first occurrence) so cuDF
+        sort_values does not reject a key that appears in both PARTITION BY and
+        ORDER BY (e.g. ``PARTITION BY k ORDER BY k, w``). A duplicate key is a
+        no-op for the sort, so the row order is unchanged."""
+        seen: set[str] = set()
+        out_by, out_asc = [], []
+        for name, a in zip(by, asc):
+            if name in seen:
+                continue
+            seen.add(name)
+            out_by.append(name)
+            out_asc.append(a)
+        return out_by, out_asc
 
     def _partition_boundary(self, work, part_names, gpos):
         """Boolean Series: True at the first row of each partition in the sorted

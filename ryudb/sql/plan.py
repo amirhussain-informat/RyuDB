@@ -96,8 +96,29 @@ class AggFunc(Expr):
 
 
 @dataclass(frozen=True)
+class FrameBound:
+    """One bound of a window frame. ``kind`` is one of ``UNBOUNDED_PRECEDING`` /
+    ``PRECEDING`` / ``CURRENT_ROW`` / ``FOLLOWING`` / ``UNBOUNDED_FOLLOWING``.
+    ``n`` is the integer row offset for PRECEDING/FOLLOWING (None otherwise)."""
+    kind: str
+    n: int | None = None
+
+
+@dataclass(frozen=True)
+class Frame:
+    """A window frame ``<mode> BETWEEN <start> AND <end>``. ``mode`` is ``ROWS``
+    or ``RANGE``. RANGE peer-group semantics (rows with equal order keys share
+    a cumulative value) apply only to the supported bounds (see parse); value
+    offsets are deferred. ``None`` on a WindowFunc means no frame (whole-partition
+    broadcast, i.e. no ORDER BY on an aggregate window)."""
+    mode: str
+    start: FrameBound
+    end: FrameBound
+
+
+@dataclass(frozen=True)
 class WindowFunc(Expr):
-    """A window function call ``func(arg) OVER (PARTITION BY .. ORDER BY ..)``.
+    """A window function call ``func(arg) OVER (PARTITION BY .. ORDER BY .. [frame])``.
 
     Each window function carries its OWN OVER clause (partition + order can
     differ per function). ``func`` is one of ROW_NUMBER / RANK / DENSE_RANK /
@@ -107,9 +128,13 @@ class WindowFunc(Expr):
     optional integer offset (default 1) and default value (default NULL).
     ``partition_keys`` / ``order_keys`` are the OVER clause's PARTITION BY and
     ORDER BY (``order_keys`` is ``((Expr, ascending), ...)``); either may be
-    empty. F-1 scope: aggregate funcs (SUM/COUNT/AVG/MIN/MAX) require an EMPTY
-    ``order_keys`` (whole-partition broadcast); an ORDER BY on an aggregate
-    window (running/cumulative) is deferred.
+    empty. ``frame`` is the window frame (ROWS/RANGE BETWEEN ...); it is set for
+    aggregate funcs (SUM/COUNT/AVG/MIN/MAX) when an ORDER BY is present -- the
+    SQL default (RANGE UNBOUNDED PRECEDING TO CURRENT ROW, peer-group cumulative)
+    is synthesized when no explicit frame is given -- and ``None`` for the
+    whole-partition broadcast (aggregate, no ORDER BY) and for ranking/offset
+    funcs (which ignore frames). ``columns()`` does not include the frame: its
+    bound offsets are literal ints, not per-row expressions.
     """
     func: str
     arg: Expr | None
@@ -117,6 +142,7 @@ class WindowFunc(Expr):
     order_keys: tuple[tuple[Expr, bool], ...] = ()
     offset: Expr | None = None
     default: Expr | None = None
+    frame: Frame | None = None
 
     def columns(self) -> set[str]:
         cols: set[str] = set()
@@ -544,6 +570,21 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
     return f"{pad}<{type(node).__name__}>"
 
 
+def _estr_bound(b: FrameBound) -> str:
+    if b.kind == "UNBOUNDED_PRECEDING":
+        return "UNBOUNDED PRECEDING"
+    if b.kind == "UNBOUNDED_FOLLOWING":
+        return "UNBOUNDED FOLLOWING"
+    if b.kind == "CURRENT_ROW":
+        return "CURRENT ROW"
+    side = "PRECEDING" if b.kind == "PRECEDING" else "FOLLOWING"
+    return f"{b.n} {side}"
+
+
+def _estr_frame(f: Frame) -> str:
+    return f"{f.mode} BETWEEN {_estr_bound(f.start)} AND {_estr_bound(f.end)}"
+
+
 def _estr(e: Expr) -> str:
     if isinstance(e, Col):
         return e.name
@@ -573,6 +614,8 @@ def _estr(e: Expr) -> str:
             over.append(f"PARTITION BY {part}")
         if order:
             over.append(f"ORDER BY {order}")
+        if e.frame is not None:
+            over.append(_estr_frame(e.frame))
         return f"{e.func}({arg}) OVER ({' '.join(over)})"
     if isinstance(e, IsNull):
         return f"{_estr(e.expr)} IS {'NOT ' if e.negated else ''}NULL"
