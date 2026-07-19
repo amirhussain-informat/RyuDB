@@ -99,13 +99,17 @@ AGG_FUNCS = {
     exp.Avg: "AVG",
     exp.Min: "MIN",
     exp.Max: "MAX",
-    # Statistical aggregates (sample form, ddof=1 -- the SQL standard default;
-    # ``var_samp`` parses to ``exp.Variance`` too, so it's covered). The population
-    # forms ``stddev_pop`` / ``var_pop`` (ddof=0) are deferred -- see ``_expr``.
+    # Statistical aggregates. Sample form (ddof=1 -- the SQL standard default;
+    # ``var_samp`` parses to ``exp.Variance`` too, so it's covered) and population
+    # form (ddof=0): ``stddev_pop`` / ``var_pop``. The population forms need a
+    # per-agg ddof=0 path the single-pass dict-string form can't express, so the
+    # executor routes them through the per-agg fallback (see ``_AGG_METHOD``).
     exp.Stddev: "STDDEV",
     exp.StddevSamp: "STDDEV_SAMP",
     exp.Variance: "VARIANCE",
     exp.Median: "MEDIAN",
+    exp.StddevPop: "STDDEV_POP",
+    exp.VariancePop: "VAR_POP",
     # Logical aggregates: ``bool_and`` / ``logical_and`` = AND of a boolean arg
     # (all true -> true); ``bool_or`` / ``logical_or`` = OR (any true -> true).
     # Lowered to cuDF ``min`` / ``max`` on the boolean arg series (NULL-skipping,
@@ -980,11 +984,6 @@ def _expr(node) -> Expr:
         pred = _expr(w.this if isinstance(w, exp.Where) else w)
         return AggFunc(inner.func, inner.arg, filter=pred, distinct=inner.distinct)
     if isinstance(node, exp.AggFunc):
-        if isinstance(node, (exp.StddevPop, exp.VariancePop)):
-            raise NotImplementedError(
-                "population standard deviation / variance (stddev_pop, var_pop) "
-                "are not supported yet; use the sample forms stddev / variance"
-            )
         if isinstance(
             node,
             (
@@ -997,6 +996,8 @@ def _expr(node) -> Expr:
                 exp.StddevSamp,
                 exp.Variance,
                 exp.Median,
+                exp.StddevPop,
+                exp.VariancePop,
                 exp.LogicalAnd,
                 exp.LogicalOr,
             ),
