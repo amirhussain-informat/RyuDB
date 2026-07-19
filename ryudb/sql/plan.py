@@ -365,19 +365,23 @@ class SetOp:
 
 @dataclass
 class Insert:
-    """Write node: append literal value rows to a table's delta (Phase 2 step 3).
+    """Write node: append rows to a table's delta (step 3 + INSERT...SELECT).
 
-    A leaf (no ``input``), like ``Scan``. ``columns`` is the user-supplied column
-    list (``None`` => INSERT without a column list => use the table's catalog
-    column order); ``rows`` is one ``list[Expr]`` per value row, each cell a
-    ``Lit`` lowered by the parser. The executor resolves the full schema, fills
-    DEFAULTs, enforces NOT NULL, builds a typed cuDF batch, and appends it to the
-    delta. PK/UNIQUE enforcement is deferred (step 4+).
+    Two mutually exclusive forms: ``INSERT ... VALUES`` carries literal rows in
+    ``rows`` (one ``list[Expr]`` per value row, each cell a ``Lit``);
+    ``INSERT ... SELECT`` carries a relational subplan in ``source``. Exactly one
+    is set. For VALUES ``rows`` is a leaf (no ``input``); for SELECT the subplan
+    is the single child. ``columns`` is the user-supplied target column list
+    (``None`` => catalog order); row cells / SELECT output columns map positionally
+    to it (SELECT output names are ignored). The executor resolves the full
+    schema, fills DEFAULTs, enforces NOT NULL, builds a typed cuDF batch, and
+    appends it to the delta. PK/UNIQUE is enforced before any durable write.
     """
 
     table: str
     columns: list[str] | None = None
     rows: list[list[Expr]] = field(default_factory=list)
+    source: "PlanNode | None" = None  # INSERT ... SELECT subplan (else rows)
 
 
 @dataclass
@@ -448,6 +452,10 @@ def children(node: PlanNode) -> list[PlanNode]:
         return [node.left, node.right]
     if isinstance(node, (Aggregate, Window, Limit)):
         return [node.input]
+    if isinstance(node, Insert):
+        # INSERT ... SELECT: the subplan is the single child. INSERT ... VALUES
+        # (rows set, source None) is a leaf.
+        return [node.source] if node.source is not None else []
     return []
 
 
@@ -471,6 +479,8 @@ def exprs_in(node: PlanNode) -> list[Expr]:
         return [e for _, e in node.assignments] + (
             [node.predicate] if node.predicate is not None else []
         )
+    # Insert's payload (VALUES Lits / SELECT subplan) is not a relational
+    # expression to surface here; the optimizer does not rewrite a write node.
     return []
 
 

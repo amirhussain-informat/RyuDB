@@ -125,7 +125,7 @@ def parse(sql: str, schema: dict[str, list[str]] | None = None) -> object:
     if isinstance(stmt, (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery)):
         return _build_query(stmt, schema)
     if isinstance(stmt, exp.Insert):
-        return _build_insert(stmt)
+        return _build_insert(stmt, schema)
     if isinstance(stmt, exp.Delete):
         return _build_delete(stmt)
     if isinstance(stmt, exp.Update):
@@ -146,15 +146,21 @@ def parse(sql: str, schema: dict[str, list[str]] | None = None) -> object:
                      f"(got {type(stmt).__name__})")
 
 
-def _build_insert(stmt: exp.Insert) -> Insert:
-    """Lower ``INSERT INTO t [(cols)] VALUES (...),(...)`` into an Insert node.
+def _build_insert(stmt: exp.Insert, schema, ctes=None) -> Insert:
+    """Lower ``INSERT INTO t [(cols)] {VALUES (...)|SELECT ...}`` into an Insert.
 
     sqlglot wraps the target in ``exp.Schema`` when a column list is present and
-    leaves it as a bare ``exp.Table`` otherwise; the value rows live in
-    ``stmt.expression`` as an ``exp.Values`` (one ``exp.Tuple`` per row). Each cell
-    is lowered with ``_expr`` to a ``Lit`` (so ``date '...'`` casts and NULLs are
-    handled by the existing expression machinery). Unsupported INSERT variants
-    (ON CONFLICT, RETURNING, WHERE, INSERT ... SELECT, ...) raise.
+    leaves it as a bare ``exp.Table`` otherwise. The body lives in
+    ``stmt.expression``: an ``exp.Values`` (one ``exp.Tuple`` per row) for VALUES,
+    or an ``exp.Select`` / set-op / ``exp.Subquery`` for INSERT ... SELECT (sqlglot
+    28.10 puts the SELECT in ``stmt.expression`` -- the same slot -- never in
+    ``args["source"]``). Each VALUES cell is lowered with ``_expr`` to a ``Lit``;
+    the SELECT body is lowered via ``_build_query`` to a subplan stored on the
+    ``Insert`` as ``source``. The two forms are mutually exclusive. Column mapping
+    is positional (SELECT output names are ignored) and validated by the executor.
+    Unsupported INSERT variants (ON CONFLICT, RETURNING, WHERE on VALUES, ...)
+    raise. ``INSERT INTO t WITH cte AS (...) SELECT ...`` works because the
+    ``exp.Select`` carries its own WITH, which ``_build_select`` reads itself.
     """
     for arg in ("conflict", "returning", "where", "partition", "ignore",
                 "overwrite", "alternative", "source"):
@@ -173,19 +179,26 @@ def _build_insert(stmt: exp.Insert) -> Insert:
             raise ParseError("INSERT column list is empty or malformed")
         if len(set(cols)) != len(cols):
             raise ParseError("INSERT column list has duplicates")
-    values = stmt.expression
-    if not isinstance(values, exp.Values):
-        raise NotImplementedError("only INSERT ... VALUES is supported")
-    rows = [[_expr(cell) for cell in row.expressions] for row in values.expressions]
-    if cols is not None:
-        for i, row in enumerate(rows):
-            if len(row) != len(cols):
-                raise ParseError(
-                    f"INSERT row {i} has {len(row)} values for {len(cols)} columns"
-                )
-    if not rows:
-        raise ParseError("INSERT has no value rows")
-    return Insert(table=table, columns=cols, rows=rows)
+    body = stmt.expression
+    if body is None:
+        raise ParseError("INSERT has no body (expected VALUES or SELECT)")
+    if isinstance(body, exp.Values):
+        rows = [[_expr(cell) for cell in row.expressions] for row in body.expressions]
+        if cols is not None:
+            for i, row in enumerate(rows):
+                if len(row) != len(cols):
+                    raise ParseError(
+                        f"INSERT row {i} has {len(row)} values for {len(cols)} columns"
+                    )
+        if not rows:
+            raise ParseError("INSERT has no value rows")
+        return Insert(table=table, columns=cols, rows=rows)
+    # INSERT ... SELECT: the body is a Select / set-op / parenthesized Subquery.
+    # _build_query unwraps exp.Subquery and dispatches; the executor maps the
+    # subplan's output columns positionally onto ``cols`` (or the table's full
+    # catalog order when no column list is given).
+    source = _build_query(body, schema, ctes)
+    return Insert(table=table, columns=cols, source=source)
 
 
 def _build_delete(stmt: exp.Delete) -> Delete:
