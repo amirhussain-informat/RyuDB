@@ -53,9 +53,18 @@ def test_insert_parse_rejects_on_conflict():
         parse("INSERT INTO lineitem (l_orderkey) VALUES (1) ON CONFLICT DO NOTHING")
 
 
-def test_insert_parse_rejects_insert_select():
-    with pytest.raises(NotImplementedError):
-        parse("INSERT INTO lineitem SELECT * FROM orders")
+def test_insert_parse_select_yields_source():
+    # INSERT ... SELECT now builds an Insert carrying a subplan (source) rather
+    # than literal rows; the two forms are mutually exclusive.
+    plan = parse(
+        "INSERT INTO lineitem SELECT * FROM orders",
+        {"orders": ["o_orderkey", "o_custkey", "o_totalprice", "o_orderdate"]},
+    )
+    assert isinstance(plan, Insert)
+    assert plan.table == "lineitem"
+    assert plan.columns is None
+    assert plan.rows == []
+    assert plan.source is not None
 
 
 def test_select_parse_still_routes_to_select():

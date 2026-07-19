@@ -754,6 +754,11 @@ class Engine:
         insert leaves no durable or in-transaction state); only NOT NULL +
         DEFAULT + type coercion otherwise. Returns the row count appended.
         """
+        if node.source is not None:
+            # INSERT ... SELECT: the rows come from executing the subplan, not
+            # from literal cells. The two forms share the durable tail but differ
+            # in how the typed batch is built, so dispatch to a dedicated helper.
+            return self._insert_select(node)
         info = self.catalog.get(node.table)
         if info is None:
             raise RuntimeError(f"unknown table: {node.table}")
@@ -827,6 +832,92 @@ class Engine:
         # batch is also written+fsync'd to the WAL before the in-memory delta
         # mutates (durable). The buffered (txn) path never touches the WAL -- an
         # uncommitted txn is implicitly rolled back on process exit.
+        if self._txn is not None:
+            self._txn.buffer_append(node.table, frame)
+            self._invalidate_table_caches(node.table)
+        else:
+            self._write_commit([(node.table, "insert", frame)])
+        return len(frame)
+
+    def _insert_select(self, node: Insert) -> int:
+        """Append an ``INSERT ... SELECT`` result to the table's delta.
+
+        The subplan (already optimized in ``sql``/``explain``) is materialized to
+        a cuDF frame, whose output columns map **positionally** onto the target
+        column list (standard SQL -- SELECT output names are ignored, exactly
+        like ``_setop``'s positional rename). Omitted target columns take DEFAULT
+        then NULL. The frame is round-tripped through pandas and each column is
+        coerced via the same ``_arrow_match_dtype`` path ``_insert`` uses for
+        VALUES, so the resulting batch is byte-compatible with a VALUES batch:
+        ``_merge_delta`` casts it to ``base[c].dtype`` cleanly, WAL replay
+        reconstructs it identically, and ``_enforce_unique`` reconciles key
+        dtypes. NOT NULL is enforced on the frame (frame-based ``isna``, like
+        ``_update``) BEFORE ``_enforce_unique`` so a NULL PK can't slip past the
+        latter's ``dropna``. ``_enforce_unique`` runs BEFORE the WAL write /
+        buffer append (all-or-nothing). The txn / autocommit tail is identical to
+        the VALUES path.
+        """
+        info = self.catalog.get(node.table)
+        if info is None:
+            raise RuntimeError(f"unknown table: {node.table}")
+        all_cols = list(info.columns)
+        cols = list(node.columns) if node.columns is not None else list(all_cols)
+        unknown = [c for c in cols if c not in all_cols]
+        if unknown:
+            raise ParseError(f"unknown columns in {node.table}: {unknown}")
+        if len(set(cols)) != len(cols):
+            raise ParseError(f"INSERT column list has duplicates: {cols}")
+
+        src = self._exec(node.source)
+        # 0 rows: a valid no-op insert (e.g. WHERE false). Avoid a pointless WAL
+        # record and any empty-frame edge case in the durable tail.
+        if len(src) == 0:
+            return 0
+        if len(src.columns) != len(cols):
+            raise ParseError(
+                f"INSERT ... SELECT column count mismatch: "
+                f"{len(src.columns)} source vs {len(cols)} target"
+            )
+
+        not_null = info.constraints.not_null
+        defaults = info.constraints.defaults
+        types = info.types
+
+        # Positional map: SELECT output column i -> target cols[i] (names ignored).
+        # reset_index: a filtered source frame carries a non-contiguous index
+        # (the surviving row positions); without reset, a provided column becomes
+        # a Series with that index while an omitted (DEFAULT/NULL) column becomes
+        # a Series with a fresh RangeIndex, and pd.DataFrame(out) aligns the two
+        # -> "array length ... does not match index length ...". Reset so every
+        # column Series shares RangeIndex(0, n); ExtensionArray columns are
+        # positional and never align.
+        src_pdf = src.to_pandas().reset_index(drop=True)
+        provided = {c: src_pdf.iloc[:, i] for i, c in enumerate(cols)}
+
+        # Full-schema pandas frame in catalog order, with DEFAULT/NULL fill and
+        # the same per-column dtype coercion _insert uses for VALUES.
+        out: dict = {}
+        n = len(src_pdf)
+        for c in all_cols:
+            if c in provided:
+                s = provided[c]
+            elif c in defaults:
+                s = pd.Series([defaults[c]] * n)
+            else:
+                s = pd.Series([None] * n)
+            dt = _arrow_match_dtype(types[c])
+            if "datetime" in str(dt):
+                out[c] = pd.to_datetime(s, errors="coerce")
+            elif str(dt).startswith("int"):
+                # Nullable Int64 so a NULL on a nullable col is pd.NA, not a
+                # coercion error; _merge_delta casts to base int64 at read time.
+                out[c] = pd.array(s, dtype="Int64")
+            else:
+                out[c] = pd.array(s, dtype=dt)
+            if c in not_null and out[c].isna().any():
+                raise RuntimeError(f"NOT NULL violation: {node.table}.{c}")
+        frame = cudf.DataFrame(pd.DataFrame(out))
+        self._enforce_unique(node.table, frame)
         if self._txn is not None:
             self._txn.buffer_append(node.table, frame)
             self._invalidate_table_caches(node.table)
@@ -1018,6 +1109,16 @@ class Engine:
                 self.restore(m.group(1))
                 return None
         plan = parse(sql, self.catalog.schema_dict())
+        # INSERT ... SELECT carries a relational subplan that DOES need
+        # optimizing (predicate pushdown, projection pruning, ...); the Insert
+        # shell itself is not a relational node, so optimize the child in place
+        # before the leaf-bypass below. INSERT ... VALUES has no source.
+        if isinstance(plan, Insert) and plan.source is not None:
+            plan.source = optimize(
+                plan.source,
+                self.catalog.schema_dict(),
+                self.catalog.stats_dict(),
+            )
         # INSERT, DELETE, UPDATE, and TxnControl are non-relational leaves with no
         # predicate / projection / join to optimize; bypass the optimizer (the
         # rules are pass-through-safe today, but a future Select-shaped rule
@@ -1044,6 +1145,12 @@ class Engine:
             if m:
                 return f"RestoreToSnapshot({m.group(1)})"
         plan = parse(sql, self.catalog.schema_dict())
+        # INSERT ... SELECT: optimize the subplan so EXPLAIN shows the optimized
+        # plan (predicate pushdown etc.), mirroring sql().
+        if isinstance(plan, Insert) and plan.source is not None:
+            plan.source = optimize(
+                plan.source, self.catalog.schema_dict(), self.catalog.stats_dict()
+            )
         if not isinstance(plan, (Insert, Delete, Update, TxnControl)):
             plan = optimize(plan, self.catalog.schema_dict(), self.catalog.stats_dict())
         return pretty(plan)
