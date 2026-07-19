@@ -271,11 +271,12 @@ def _build_update(stmt: exp.Update) -> Update:
 
 
 def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None, ctes=None):
-    if sel.args.get("qualify") or sel.args.get("windows"):
-        raise NotImplementedError("window functions are not supported yet")
+    if sel.args.get("windows"):
+        raise NotImplementedError("named window definitions (WINDOW ...) are not supported yet")
     if sel.args.get("connect") or sel.args.get("start"):
         raise NotImplementedError("recursive/hierarchical queries are not supported")
     having = sel.args.get("having")
+    qualify = sel.args.get("qualify")
 
     # --- WITH / CTEs (Phase F-2c) ---------------------------------------- #
     # Build each CTE's subplan eagerly, in order, into a *copy* of the incoming
@@ -359,13 +360,31 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None, c
     # ``exp.Window`` is rewritten into a ``Window`` plan node and replaced in the
     # projection item by a bare Column ref to its output; the rewritten items then
     # flow into the normal Project/Aggregate building.
-    if any(_contains_window(it) for it in proj_items):
+    if any(_contains_window(it) for it in proj_items) or _qualify_has_window(qualify):
         if sel.args.get("group") or sel.args.get("having"):
             raise NotImplementedError(
                 "window functions with GROUP BY / HAVING are not supported yet"
             )
-        plan = _build_window(plan, proj_items, schema)
+        plan, wf_sql_map = _build_window(plan, proj_items, schema)
+        if qualify is not None:
+            # QUALIFY filters on window-function results. It lowers to a Filter
+            # directly above the Window node (below the outer Project), mirroring
+            # HAVING's Aggregate -> Filter -> Project shape. The predicate is
+            # rewritten to reference the Window's _wfN/_qfN output columns: inline
+            # exp.Window nodes are matched by sql() to an already-extracted _wfN
+            # (or synthesized as a new _qfN appended to the Window node), and bare
+            # Column refs to a projected window alias are resolved to its _wfN.
+            wf_names = set(wf_sql_map.values())
+            alias_map: dict[str, str] = {}
+            for it in proj_items:
+                e, alias = _proj_item(it)
+                if isinstance(e, Col) and e.name in wf_names:
+                    alias_map[alias] = e.name
+            pred = _build_qualify_predicate(qualify, wf_sql_map, alias_map, plan, schema)
+            plan = Filter(plan, pred)
     else:
+        if qualify is not None:
+            raise NotImplementedError("QUALIFY requires a window function")
         # A window in GROUP BY / HAVING (not the projection) is malformed for F-1
         # and would otherwise be silently dropped (the GROUP BY builder reads keys
         # from the projection list). Catch it explicitly.
@@ -1859,14 +1878,15 @@ def _contains_window(node) -> bool:
 
 
 def _reject_window_outside_projection(sel):
-    """Raise if a window function appears in GROUP BY / HAVING / QUALIFY (a
-    window in the projection list is supported; one elsewhere is malformed for
-    F-1 and would otherwise be silently dropped)."""
-    for key in ("group", "having", "qualify"):
+    """Raise if a window function appears in GROUP BY / HAVING (a window in the
+    projection list, or one inline in QUALIFY, is supported; a window elsewhere
+    is malformed for F-1 and would otherwise be silently dropped). QUALIFY
+    windows are consumed by ``_build_qualify_predicate``, not rejected here."""
+    for key in ("group", "having"):
         part = sel.args.get(key)
         if part is not None and part.find(exp.Window) is not None:
             raise NotImplementedError(
-                "window functions in GROUP BY / HAVING / QUALIFY are not supported"
+                "window functions in GROUP BY / HAVING are not supported"
             )
 
 
@@ -1874,9 +1894,10 @@ def _reject_window_outside_projection(sel):
 # require an ORDER BY; aggregate funcs (SUM/COUNT/AVG/MIN/MAX) broadcast over the
 # whole partition when there is no ORDER BY, and compute a running/cumulative
 # aggregate (with the SQL default frame RANGE UNBOUNDED PRECEDING TO CURRENT ROW,
-# or an explicit ROWS/RANGE frame) when an ORDER BY is present. Deferred:
-# QUALIFY, expression PARTITION BY / ORDER BY keys, window + GROUP BY, RANGE
-# value offsets, EXCLUDE, and MIN/MAX with a FOLLOWING bound.
+# or an explicit ROWS/RANGE frame) when an ORDER BY is present. QUALIFY
+# (window-function filtering) is supported (G-4). Deferred: expression PARTITION
+# BY / ORDER BY keys, window + GROUP BY, RANGE value offsets, EXCLUDE, and
+# MIN/MAX with a FOLLOWING bound.
 _WINDOW_RANK_FUNCS = {exp.RowNumber: "ROW_NUMBER", exp.Rank: "RANK",
                       exp.DenseRank: "DENSE_RANK"}
 
@@ -1887,18 +1908,69 @@ def _build_window(plan, proj_items, schema):
     item with a bare Column ref (``_wfN``). An item may contain multiple windows
     (e.g. ``LAG(w) - LEAD(w) OVER (...)``); each is extracted separately. Mutates
     ``proj_items`` in place (the sqlglot tree) so the rewritten items flow into
-    the normal Project/Aggregate building. Returns the new plan (Window over the
-    prior plan)."""
+    the normal Project/Aggregate building. Returns ``(new plan, wf_sql_map)`` --
+    the map from each window's ``sql()`` to its ``_wfN`` output name, used by
+    ``_build_qualify_predicate`` to match an inline QUALIFY window to an
+    already-extracted one (so it is not computed twice)."""
     funcs: list[tuple[WindowFunc, str]] = []
+    wf_sql_map: dict[str, str] = {}
     n = 0
     for it in proj_items:
         for win in list(it.find_all(exp.Window)):
             n += 1
             name = f"_wf{n}"
+            wf_sql_map[win.sql()] = name
             wf = _build_one_window(win, schema)
             funcs.append((wf, name))
             win.replace(exp.column(name))
-    return Window(plan, funcs=funcs)
+    return Window(plan, funcs=funcs), wf_sql_map
+
+
+def _qualify_has_window(qualify) -> bool:
+    """True if the QUALIFY clause carries an inline window function (one not in
+    the SELECT list). A QUALIFY that only references a projected window alias has
+    no inline window -- the window path is taken via the projection instead."""
+    return qualify is not None and qualify.this.find(exp.Window) is not None
+
+
+def _build_qualify_predicate(qualify, wf_sql_map, alias_map, window_node, schema):
+    """Lower a QUALIFY predicate to a plan ``Expr`` referencing the Window node's
+    ``_wfN``/``_qfN`` output columns, and append any qualify-only windows to
+    ``window_node.funcs`` so the executor computes them. Mirrors
+    ``_having_predicate`` (which rewrites HAVING aggregates to Aggregate-output
+    aliases / synthetic ``_hvN`` aggregates).
+
+    - Inline ``exp.Window`` nodes in the predicate are matched by ``sql()`` to an
+      already-extracted ``_wfN`` (so a window projected AND referenced in QUALIFY
+      is computed once); an unmatched window is synthesized as a new ``_qfN``
+      appended to ``window_node.funcs`` (the ``Window`` dataclass is mutable).
+    - Bare ``Column`` refs to a projected window alias are rewritten to its
+      ``_wfN`` (the alias is only materialized by the outer Project ABOVE this
+      Filter, so the predicate must reference the Window's own output name).
+    - Subqueries in the predicate are rejected (mirrors HAVING).
+
+    After rewriting the predicate contains only ``Col(_wfN/_qfN)``, base columns,
+    and ``BinOp``/``And``/``Or``/``Not``/``Lit`` -- all handled by ``_expr`` (no
+    ``exp.Window`` reaches it)."""
+    qthis = qualify.this
+    if qthis.find(exp.Subquery) is not None or qthis.find(exp.Select) is not None:
+        raise NotImplementedError("subqueries in QUALIFY are not supported")
+    n_qf = 0
+    for win in list(qthis.find_all(exp.Window)):
+        key = win.sql()
+        if key in wf_sql_map:
+            name = wf_sql_map[key]
+        else:
+            n_qf += 1
+            name = f"_qf{n_qf}"
+            wf = _build_one_window(win, schema)
+            window_node.funcs.append((wf, name))
+            wf_sql_map[key] = name
+        win.replace(exp.column(name))
+    for col in list(qthis.find_all(exp.Column)):
+        if col.name in alias_map:
+            col.replace(exp.column(alias_map[col.name]))
+    return _expr(qthis)
 
 
 def _build_one_window(win, schema):
