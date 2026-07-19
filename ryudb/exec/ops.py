@@ -490,6 +490,58 @@ def _func(e: Func, df: cudf.DataFrame):
         if isinstance(v, cudf.Series):
             return np.floor(v)
         return None if v is None else math.floor(v)
+    if name == "sign":
+        v = eval_expr(args[0], df)
+        if isinstance(v, cudf.Series):
+            return np.sign(v)  # -1/0/1, NaN for NULL (DuckDB returns TINYINT)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        return 0 if v == 0 else (1 if v > 0 else -1)
+    if name == "nullif":
+        a = eval_expr(args[0], df)
+        b = eval_expr(args[1], df)
+        if not isinstance(a, cudf.Series) and not isinstance(b, cudf.Series):
+            # Scalar: NULL if a == b (SQL three-valued: a=NULL -> NULL, b=NULL -> a).
+            if a is None or (isinstance(a, float) and pd.isna(a)):
+                return None
+            if b is None or (isinstance(b, float) and pd.isna(b)):
+                return a
+            return None if a == b else a
+        a = _as_series(a, df)
+        b = _as_series(b, df)
+        eq = (a == b)  # NA where a or b is NA
+        # Keep a where (a == b) is not TRUE; NULL where it is TRUE. fillna(False)
+        # treats NA (a or b NULL) as not-equal -> keeps a (matches DuckDB: a=NULL
+        # -> a is NULL; b=NULL -> a).
+        return a.where(~eq.fillna(False))
+    if name in ("greatest", "least"):
+        vals = [eval_expr(a, df) for a in args]
+        if not any(isinstance(v, cudf.Series) for v in vals):
+            nn = [v for v in vals if v is not None and not (isinstance(v, float) and pd.isna(v))]
+            if not nn:
+                return None
+            return (max if name == "greatest" else min)(nn)
+        # Pairwise NaN-ignoring reduce (DuckDB skips NULLs; all-NULL -> NULL).
+        # Works for numeric and string columns uniformly (cuDF rowwise max/min
+        # rejects mixed dtypes and object/string columns). Drop all-NULL args
+        # first (they contribute nothing and would false-trigger the mixed-type
+        # guard); mixed numeric+string is a type mismatch (DuckDB rejects at bind
+        # time) -> reject here.
+        aligned = [s for s in (_as_series(v, df) for v in vals) if not s.isna().all()]
+        if not aligned:
+            return cudf.Series([None] * len(df), index=df.index)
+        kinds = {pd.api.types.is_numeric_dtype(s.dtype) for s in aligned}
+        if True in kinds and False in kinds:
+            raise NotImplementedError(
+                f"{name.upper()} with mixed numeric and string types is not supported"
+            )
+        greatest = name == "greatest"
+        acc = aligned[0]
+        for s in aligned[1:]:
+            take = (s.gt(acc) if greatest else s.lt(acc)).fillna(False)
+            take = take | (acc.isna() & s.notna())  # fill acc's NULL with s
+            acc = acc.where(~take, s)
+        return acc
     if name == "round":
         v = eval_expr(args[0], df)
         d = int(eval_expr(args[1], df)) if len(args) > 1 else 0

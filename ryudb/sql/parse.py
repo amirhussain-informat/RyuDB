@@ -1572,6 +1572,19 @@ _SCALAR_FUNC_BUILDERS = {
     exp.Floor: _scalar_unary("floor"),
     exp.Initcap: _scalar_unary("initcap"),
     exp.Reverse: _scalar_unary("reverse"),
+    exp.Sign: _scalar_unary("sign"),
+    # NULLIF(a, b) -> CASE WHEN a = b THEN NULL ELSE a (NULL-aware: a=NULL -> NULL,
+    # b=NULL -> a; the executor matches DuckDB's three-valued equality).
+    exp.Nullif: lambda n: Func("nullif", (_expr(n.this), _expr(n.expression))),
+    # GREATEST/LEAST take N args (sqlglot puts the first on .this, the rest on
+    # .expressions); the executor reduces them NaN-ignoring (DuckDB skips NULLs,
+    # all-NULL -> NULL).
+    exp.Greatest: lambda n: Func(
+        "greatest", tuple([_expr(n.this), *(_expr(x) for x in n.expressions)])
+    ),
+    exp.Least: lambda n: Func(
+        "least", tuple([_expr(n.this), *(_expr(x) for x in n.expressions)])
+    ),
     exp.Substring: _substr,
     exp.Round: _round,
     exp.Concat: lambda n: Func("concat", tuple(_expr(x) for x in n.expressions)),
