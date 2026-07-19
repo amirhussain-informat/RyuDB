@@ -231,6 +231,7 @@ _MATH_UNARY = {
     "log10": np.log10, "sin": np.sin, "cos": np.cos, "tan": np.tan,
     "asin": np.arcsin, "acos": np.arccos, "atan": np.arctan,
     "degrees": np.degrees, "radians": np.radians,
+    "sinh": np.sinh, "cosh": np.cosh, "tanh": np.tanh,
 }
 
 
@@ -509,6 +510,89 @@ def _func(e: Func, df: cudf.DataFrame):
         for p in parts[1:]:
             acc = acc.str.cat(p)
         return acc
+    if name == "concat_ws":
+        # CONCAT_WS(sep, a, b, ...): join non-NULL args per row with sep;
+        # all-NULL -> '' (DuckDB skips NULL args). args[0] is the separator.
+        sep = str(eval_expr(args[0], df))
+        rest = [eval_expr(a, df) for a in args[1:]]
+        if not any(isinstance(v, cudf.Series) for v in rest):
+            vals = [str(v) for v in rest if not _isnull_scalar(v)]
+            return sep.join(vals)
+        cols = [_as_str_series(v, df).to_pandas() for v in rest]
+        pdf = pd.DataFrame({i: c for i, c in enumerate(cols)})
+        joined = pdf.apply(
+            lambda row: sep.join(str(x) for x in row if pd.notna(x)), axis=1
+        )
+        return cudf.Series(joined.values, index=df.index)
+    if name == "repeat":
+        v = eval_expr(args[0], df)
+        n = int(eval_expr(args[1], df))
+        if isinstance(v, cudf.Series):
+            return v.str.repeat(n)
+        if _isnull_scalar(v):
+            return None
+        return str(v) * n
+    if name in ("lpad", "rpad"):
+        v = eval_expr(args[0], df)
+        width = int(eval_expr(args[1], df))
+        fill = str(eval_expr(args[2], df)) if len(args) > 2 else " "
+        if isinstance(v, cudf.Series):
+            side = "left" if name == "lpad" else "right"
+            # cuDF str.pad does not truncate; DuckDB truncates to `width` (kept
+            # from the left). Pad then slice(0, width).
+            return v.str.pad(width, side=side, fillchar=fill).str.slice(0, width)
+        if _isnull_scalar(v):
+            return None
+        padded = str(v).rjust(width, fill) if name == "lpad" else str(v).ljust(width, fill)
+        return padded[:width]
+    if name == "regexp_replace":
+        v = eval_expr(args[0], df)
+        pat = str(eval_expr(args[1], df))
+        repl = str(eval_expr(args[2], df))
+        if isinstance(v, cudf.Series):
+            # DuckDB 3-arg REGEXP_REPLACE replaces the FIRST match (occurrence=1).
+            return v.str.replace(pat, repl, n=1, regex=True)
+        if _isnull_scalar(v):
+            return None
+        return re.sub(pat, repl, str(v), count=1)
+    if name == "regexp_matches":
+        v = eval_expr(args[0], df)
+        pat = str(eval_expr(args[1], df))
+        if isinstance(v, cudf.Series):
+            return v.str.contains(pat, regex=True)
+        if _isnull_scalar(v):
+            return None
+        return re.search(pat, str(v)) is not None
+    if name == "split_part":
+        v = eval_expr(args[0], df)
+        delim = str(eval_expr(args[1], df))
+        part = int(eval_expr(args[2], df))
+        if isinstance(v, cudf.Series):
+            # Per-row split with a LITERAL delimiter (Python str.split, not
+            # regex -- matches DuckDB). cuDF's expand-DataFrame has a fixed global
+            # column count, so negative indexing (last part) varies per row and
+            # can't be done by column; map per element instead. NULL -> NULL.
+            ps = v.to_pandas()
+
+            def _sp(x):
+                if pd.isna(x):
+                    return None
+                xs = str(x).split(delim)
+                if part == 0:
+                    return ""
+                if part > 0:
+                    return xs[part - 1] if 0 < part <= len(xs) else ""
+                return xs[part] if -len(xs) <= part < 0 else ""
+
+            return cudf.Series(ps.map(_sp), index=df.index)
+        if _isnull_scalar(v):
+            return None
+        if part == 0:
+            return ""
+        xs = str(v).split(delim)
+        if part > 0:
+            return xs[part - 1] if 0 < part <= len(xs) else ""
+        return xs[part] if -len(xs) <= part < 0 else ""
 
     # --- numeric funcs --------------------------------------------------- #
     if name == "abs":
