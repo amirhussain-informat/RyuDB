@@ -957,16 +957,34 @@ def _expr(node) -> Expr:
         # exp.Filter is NOT an exp.AggFunc subclass, but its `this` child is, so
         # _contains_agg (node.find(exp.AggFunc)) still routes the query into the
         # aggregate branch; the filter is honoured by the cuDF aggregate paths.
+        # ``SUM(DISTINCT x) FILTER (WHERE p)`` composes: the inner AggFunc already
+        # carries ``distinct`` from the AggFunc branch below, so preserve it.
         inner = _expr(node.this)
         if not isinstance(inner, AggFunc):
             raise NotImplementedError("FILTER only supports aggregate functions")
         w = node.expression
         pred = _expr(w.this if isinstance(w, exp.Where) else w)
-        return AggFunc(inner.func, inner.arg, filter=pred)
+        return AggFunc(inner.func, inner.arg, filter=pred, distinct=inner.distinct)
     if isinstance(node, exp.AggFunc):
         if isinstance(node, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)):
-            arg = _expr(node.this) if node.this is not None else Star()
-            return AggFunc(AGG_FUNCS[type(node)], arg)
+            inner = node.this
+            distinct = False
+            if isinstance(inner, exp.Distinct):
+                # ``F(DISTINCT x)`` -> sqlglot wraps the arg in exp.Distinct. Pull
+                # out the single distinct expression; reject multi-arg distinct
+                # (``count(DISTINCT k, v)`` -- DuckDB's binder rejects it too) and
+                # ``COUNT(DISTINCT *)`` (not standard SQL).
+                exprs = inner.expressions
+                if len(exprs) != 1:
+                    raise NotImplementedError(
+                        "DISTINCT aggregate with multiple arguments is not supported"
+                    )
+                inner = exprs[0]
+                distinct = True
+            arg = _expr(inner) if inner is not None else Star()
+            if distinct and isinstance(arg, Star):
+                raise NotImplementedError("COUNT(DISTINCT *) is not supported")
+            return AggFunc(AGG_FUNCS[type(node)], arg, distinct=distinct)
     raise NotImplementedError(f"unsupported expression: {type(node).__name__}")
 
 
