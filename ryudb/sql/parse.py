@@ -316,6 +316,24 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None, c
         how, on_left, on_right, on_predicate = _join_spec(
             j, aliases, ralias, rname, schema, left_tables
         )
+        # USING / NATURAL coalesce their keys into one column; any OTHER column
+        # name shared across the two sides would be cuDF-suffixed (``_x``/``_y``)
+        # and unaddressable by a flat ``Col`` (the alias-disambiguation path in
+        # the executor only handles equi/CROSS joins, not coalesced-key joins).
+        # DuckDB also errors on a colliding non-key column here, so defer with a
+        # clear message rather than silently dropping/overwriting it.
+        if schema is not None and (
+            (j.method or "").upper() == "NATURAL" or j.args.get("using")
+        ):
+            left_cols: set[str] = set()
+            for t in left_tables:
+                left_cols |= set(schema.get(t, []))
+            shared_nonkey = (left_cols & set(schema.get(rname, []))) - set(on_left)
+            if shared_nonkey:
+                raise NotImplementedError(
+                    "USING/NATURAL join with a colliding non-key column is not "
+                    "supported; use ON with qualified columns"
+                )
         plan = Join(
             left=plan,
             right=r_source,
@@ -323,6 +341,7 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None, c
             on_right=on_right,
             how=how,
             on_predicate=on_predicate,
+            using=(j.method or "").upper() == "NATURAL" or bool(j.args.get("using")),
         )
         aliases[ralias] = rname
 
@@ -439,7 +458,7 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None, c
                 # The HAVING-only aggregates (_hvN) were added to compute the
                 # predicate but must not leak into the output; re-project only the
                 # user's columns (group keys + selected aggregates).
-                items = (
+                items = _dedup_output_names(
                     [(Col(a), a) for _, a in group_keys]
                     + [(Col(a), a) for _, a in user_aggs]
                 )
@@ -454,7 +473,7 @@ def _build_select(sel: exp.Select, schema: dict[str, list[str]] | None = None, c
             for it in proj_items:
                 e, alias = _proj_item(it)
                 items.append((e, alias))
-            plan = Project(plan, items=items)
+            plan = Project(plan, items=_dedup_output_names(items))
 
     if sel.args.get("distinct"):
         d = sel.args["distinct"]
@@ -588,7 +607,7 @@ def _build_tail(stmt, plan):
             e = _expr(o.this)
             if not isinstance(e, Col):
                 raise NotImplementedError("ORDER BY only supports column references")
-            keys.append((Col(e.name), not o.args.get("desc", False)))
+            keys.append((Col(e.name, table=e.table), not o.args.get("desc", False)))
         plan = Sort(plan, keys=keys)
 
     limit = stmt.args.get("limit")
@@ -820,7 +839,7 @@ def _expr(node) -> Expr:
     if isinstance(node, exp.Column):
         if isinstance(node.this, exp.Star):
             return Star()
-        return Col(node.name)
+        return Col(node.name, table=node.table or None)
     if isinstance(node, exp.Identifier):
         return Col(node.name)
     if isinstance(node, exp.Star):
@@ -1047,11 +1066,16 @@ def _exists_conjunct(exists_node, negated, outer_aliases):
     corr = _classify_correlation(inner, outer_aliases)
     if corr is None:
         return None  # uncorrelated (already handled by _flatten_outer_subqueries)
-    outer_key, inner_key, local_conjuncts = corr
+    outer_key, inner_key, inner_table, local_conjuncts = corr
     _set_local_where(inner, local_conjuncts)
     # The SELECT list is irrelevant to EXISTS -- project the inner key so the
-    # right side exposes it as the join key column.
-    inner.set("expressions", [exp.column(inner_key)])
+    # right side exposes it as the join key column. Keep the qualifier so a
+    # subquery whose own join renamed the key (``b__k``) still resolves it.
+    inner.set(
+        "expressions",
+        [exp.column(inner_key) if not inner_table
+         else exp.column(inner_key, table=inner_table)],
+    )
     return ("anti" if negated else "semi"), outer_key, inner
 
 
@@ -1153,7 +1177,10 @@ def _references_outer(node, outer, local) -> bool:
 
 def _equi_correlation_pair(conj, outer, local):
     """If ``conj`` is ``inner.col = outer.col`` (bare columns, exactly one side
-    referencing an outer alias), return ``(outer_key, inner_key)``; else None."""
+    referencing an outer alias), return ``(outer_key, inner_key, inner_table)``;
+    else None. ``inner_table`` is the inner column's qualifier (``b`` in ``b.k``)
+    so the decorrelated group key / projection resolves to the alias-renamed
+    ``b__k`` when the subquery's own join renames a colliding key."""
     if not isinstance(conj, exp.EQ):
         return None
     lhs, rhs = conj.this, conj.expression
@@ -1162,9 +1189,11 @@ def _equi_correlation_pair(conj, outer, local):
     lhs_outer = _col_table_is_outer(lhs, outer, local)
     rhs_outer = _col_table_is_outer(rhs, outer, local)
     if lhs_outer and not rhs_outer:
-        return rhs.name, lhs.name  # rhs is outer, lhs is inner
+        # lhs is outer, rhs is the subquery's (inner) column.
+        return rhs.name, lhs.name, rhs.table
     if rhs_outer and not lhs_outer:
-        return lhs.name, rhs.name  # lhs is outer, rhs is inner
+        # rhs is outer, lhs is the subquery's (inner) column.
+        return lhs.name, rhs.name, lhs.table
     return None  # both outer or both inner -> not a single correlation pair
 
 
@@ -1357,7 +1386,7 @@ def _decorrelate_scalar(plan, inner_select, corr, name, schema, ctes=None):
     but cuDF ``merge`` would match NULL==NULL, so the NULL-key group is removed and
     a NULL outer key finds no match -> null-pad (MAX/MIN/SUM -> NULL; COUNT -> the
     COALESCE default 0)."""
-    outer_key, inner_key, local_conjuncts = corr
+    outer_key, inner_key, inner_table, local_conjuncts = corr
     _set_local_where(inner_select, local_conjuncts)
     subplan = _build_query(inner_select, schema, ctes)
     _require_global_aggregate(subplan)
@@ -1369,7 +1398,7 @@ def _decorrelate_scalar(plan, inner_select, corr, name, schema, ctes=None):
     agg_expr, orig_name = core.aggs[0]
     grouped = Aggregate(
         core.input,
-        [(Col(inner_key), name + "_k")],
+        [(Col(inner_key, table=inner_table), name + "_k")],
         [(agg_expr, orig_name)],
     )
     # Rename both outputs to unique names (avoid the optimizer's global column-
@@ -1786,7 +1815,13 @@ def _table_ref(node, schema, ctes=None) -> tuple[object, str, str]:
     if not name:
         raise ParseError("table reference has no name")
     alias = node.alias or name
-    return Scan(name), alias, name
+    # Always carry the alias (defaults to the real table name when unaliased) so
+    # the join executor can disambiguate colliding columns on a cross-table
+    # same-named-column join qualified by real table name (``ON t1.k=t2.k``).
+    # An unaliased self-join (``FROM t CROSS JOIN t``) gets the same alias on
+    # both sides and is rejected by the executor (DuckDB also errors: bare
+    # columns are ambiguous).
+    return Scan(name, alias=alias), alias, name
 
 
 def _join_spec(j, left_aliases, ralias, rtable, schema, left_tables):
@@ -2282,6 +2317,24 @@ def _output_name(node) -> str:
     if isinstance(node, exp.AggFunc):
         return f"{AGG_FUNCS.get(type(node), type(node).__name__).lower()}_{_describe(node.this)}"
     return node.alias_or_name
+
+
+def _dedup_output_names(items: list[tuple[Expr, str]]) -> list[tuple[Expr, str]]:
+    """Disambiguate repeated output names (``SELECT a.v, b.v`` -> ``v``, ``v_1``)
+    so the Project executor (``out[name] = v`` in a loop, ``executor._project``)
+    doesn't silently overwrite the first column with the second. Matches
+    DuckDB's auto-naming. A flat ``Col`` cannot otherwise carry two same-named
+    columns from a self-join / cross-table same-named-column join."""
+    seen: dict[str, int] = {}
+    out: list[tuple[Expr, str]] = []
+    for e, name in items:
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}_{seen[name]}"
+        else:
+            seen[name] = 0
+        out.append((e, name))
+    return out
 
 
 def _describe(node) -> str:
