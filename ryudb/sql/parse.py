@@ -887,6 +887,9 @@ def _expr(node) -> Expr:
             if len(xs) == 1:
                 return Func("trunc", (_expr(xs[0]),))
             return Func("trunc", (_expr(xs[0]), _expr(xs[1])))
+        if up == "REGEXP_MATCHES" and len(xs) == 2:
+            # Returns a boolean (NULL input -> NULL).
+            return Func("regexp_matches", (_expr(xs[0]), _expr(xs[1])))
     # DATEDIFF('unit', start, end): the default dialect mis-parses this as
     # exp.DateDiff(this=Literal('unit'), expression=start, unit=Var(end)) -- the
     # end column lands in the `unit` slot, uppercased as if it were a unit
@@ -1510,6 +1513,40 @@ def _log(node) -> Expr:
     return Func("log", (_expr(node.this), _expr(node.expression)))
 
 
+def _pad(node) -> Expr:
+    """Lower exp.Pad (LPAD / RPAD). ``is_left`` selects the side; ``expression``
+    is the width; ``fill_pattern`` (optional, default space) is the fill char.
+    DuckDB truncates strings longer than width (kept from the left); the
+    executor applies that after padding."""
+    is_left = node.args.get("is_left", True)
+    tag = "lpad" if is_left else "rpad"
+    s = _expr(node.this)
+    width = _expr(node.expression)
+    fp = node.args.get("fill_pattern")
+    if fp is not None:
+        return Func(tag, (s, width, _expr(fp)))
+    return Func(tag, (s, width))
+
+
+def _split_part(node) -> Expr:
+    """Lower exp.SplitPart (SPLIT_PART(s, delim, n)). ``part_index`` may be a
+    Literal or an exp.Neg (negative part counts from the end); _expr lowers
+    Neg to ``0 - n`` so the executor recovers the signed int at runtime."""
+    return Func("split_part", (
+        _expr(node.this),
+        _expr(node.args["delimiter"]),
+        _expr(node.args["part_index"]),
+    ))
+
+
+def _concat_ws(node) -> Expr:
+    """Lower exp.ConcatWs (CONCAT_WS(sep, a, b, ...)). sqlglot puts the separator
+    as the FIRST expression and the rest as the values; safe=True means NULLs are
+    skipped (DuckDB CONCAT_WS ignores NULL args, all-NULL -> '')."""
+    xs = node.expressions
+    return Func("concat_ws", tuple(_expr(x) for x in xs))
+
+
 def _substr(node) -> Expr:
     start = node.args.get("start")
     length = node.args.get("length")
@@ -1625,6 +1662,18 @@ _SCALAR_FUNC_BUILDERS = {
     exp.Radians: _scalar_unary("radians"),
     # PI() is a no-arg scalar (broadcast per row by _project, like current_date).
     exp.Pi: lambda n: Func("pi", ()),
+    # --- hyperbolic + string functions -------------------------------- #
+    exp.Sinh: _scalar_unary("sinh"),
+    exp.Cosh: _scalar_unary("cosh"),
+    exp.Tanh: _scalar_unary("tanh"),
+    exp.Repeat: lambda n: Func("repeat", (_expr(n.this), _expr(n.args["times"]))),
+    exp.Pad: _pad,
+    exp.SplitPart: _split_part,
+    exp.RegexpReplace: lambda n: Func(
+        "regexp_replace",
+        (_expr(n.this), _expr(n.expression), _expr(n.args["replacement"])),
+    ),
+    exp.ConcatWs: _concat_ws,
     exp.Substring: _substr,
     exp.Round: _round,
     exp.Concat: lambda n: Func("concat", tuple(_expr(x) for x in n.expressions)),
