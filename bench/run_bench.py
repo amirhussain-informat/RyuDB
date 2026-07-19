@@ -84,6 +84,21 @@ QUERIES: dict[str, str] = {
          ORDER BY revenue DESC, o_orderdate
          LIMIT 10
     """,
+    # High-cardinality group-from-join: GROUP BY a high-NDV dimension key reached
+    # by the chain (o_orderkey, ~1.5M distinct at SF=10) with SUM/COUNT. Previously
+    # deferred to cuDF by the DENSE-only join accumulator (n_groups*nagg >
+    # MAX_ACC_CELLS); now hits the fused C++ probe_hash_agg_kernel (the join-path
+    # analogue of Q_high_card_orderkey's non-join HASH).
+    "Q_join_high_card_orderkey": """
+        SELECT o_orderkey,
+               sum(l_quantity) AS sum_qty,
+               sum(l_extendedprice) AS sum_base_price,
+               count(*) AS count_order
+          FROM lineitem
+          JOIN orders ON l_orderkey = o_orderkey
+         GROUP BY o_orderkey
+         ORDER BY o_orderkey
+    """,
     "scan_agg_full": """
         SELECT count(*) AS n, sum(l_extendedprice) AS s, avg(l_quantity) AS q,
                min(l_discount) AS md, max(l_tax) AS mt
