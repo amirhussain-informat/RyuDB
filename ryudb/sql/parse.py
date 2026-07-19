@@ -873,6 +873,17 @@ def _expr(node) -> Expr:
     if isinstance(node, exp.Binary):
         op = _binop_symbol(node)
         return BinOp(op, _expr(node.this), _expr(node.expression))
+    if isinstance(node, exp.Filter):
+        # ``SUM(x) FILTER (WHERE p)`` -> AggFunc with the predicate attached.
+        # exp.Filter is NOT an exp.AggFunc subclass, but its `this` child is, so
+        # _contains_agg (node.find(exp.AggFunc)) still routes the query into the
+        # aggregate branch; the filter is honoured by the cuDF aggregate paths.
+        inner = _expr(node.this)
+        if not isinstance(inner, AggFunc):
+            raise NotImplementedError("FILTER only supports aggregate functions")
+        w = node.expression
+        pred = _expr(w.this if isinstance(w, exp.Where) else w)
+        return AggFunc(inner.func, inner.arg, filter=pred)
     if isinstance(node, exp.AggFunc):
         if isinstance(node, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)):
             arg = _expr(node.this) if node.this is not None else Star()
