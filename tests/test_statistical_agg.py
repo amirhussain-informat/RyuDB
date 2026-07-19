@@ -9,7 +9,9 @@ parses to the same ``exp.Variance`` as ``variance``). cuDF's ``.std()`` /
 (``_fused_agg`` -> ``groupby.agg({col: [method]})``, which supports
 ``"std"`` / ``"var"`` / ``"median"`` as func strings). The population forms
 ``stddev_pop`` / ``var_pop`` (ddof=0) need a per-agg ddof path the single-pass
-dict-string form can't express, so they are deferred.
+dict-string form can't express, so they are routed through the per-agg fallback
+(``_distinct_grouped_agg``) with an explicit ``.std(ddof=0)`` / ``.var(ddof=0)``
+(grouped) and a special case in ``_scalar_agg`` (global).
 
 NULL semantics match DuckDB: cuDF reductions skip nulls, and a sample
 stddev/variance over fewer than 2 non-null values is NULL (ddof=1 divides by
@@ -240,26 +242,85 @@ def test_median_with_null(nengine):
 
 
 # --------------------------------------------------------------------------- #
+# Population forms: stddev_pop / var_pop (ddof=0)
+# --------------------------------------------------------------------------- #
+#
+# The population forms use ddof=0 (divide by n, not n-1), so the func-string
+# path (fixed at ddof=1) can't express them: the executor routes them through
+# the per-agg fallback (grouped) and an explicit ``.std(ddof=0)`` / ``.var(ddof=0)``
+# (global). The load-bearing difference from the sample forms: a single non-null
+# value (n=1) gives 0.0, NOT NULL (divides by n); an empty or all-null group is
+# NULL, matching DuckDB.
+
+
+def test_global_stddev_pop_var_pop(sengine):
+    eng, duck = sengine
+    sql = "SELECT stddev_pop(v), var_pop(v) FROM t"
+    assert_same(_ryu(eng, sql), _duck(duck, sql))
+
+
+def test_grouped_stddev_pop_var_pop(sengine):
+    eng, duck = sengine
+    sql = "SELECT g, stddev_pop(v), var_pop(v) FROM t GROUP BY g ORDER BY g"
+    assert_same(_ryu(eng, sql), _duck(duck, sql))
+
+
+def test_pop_single_value_is_zero(nengine):
+    """A single non-null value -> population var/stddev = 0.0 (NOT NULL, unlike
+    the sample form which divides by n-1). Group ``b`` has one non-null (10.0)."""
+    eng, duck = nengine
+    sql = "SELECT g, stddev_pop(v), var_pop(v) FROM tn GROUP BY g ORDER BY g"
+    assert_same(_ryu(eng, sql), _duck(duck, sql))
+
+
+def test_pop_null_skipped_grouped(nengine):
+    """A NULL arg is skipped; group ``a`` has one non-null (1.0) + one NULL ->
+    population var/stddev = 0.0 (n=1 after skipping the NULL)."""
+    eng, duck = nengine
+    sql = "SELECT g, stddev_pop(v), var_pop(v) FROM tn GROUP BY g ORDER BY g"
+    assert_same(_ryu(eng, sql), _duck(duck, sql))
+
+
+def test_pop_empty_is_null(nengine):
+    """An empty set -> population var/stddev are NULL."""
+    eng, duck = nengine
+    sql = "SELECT stddev_pop(v), var_pop(v) FROM tn WHERE v > 100"
+    assert_same(_ryu(eng, sql), _duck(duck, sql))
+
+
+def test_pop_mixed_with_sample_aggs(sengine):
+    """Population and sample forms together in one grouped SELECT (population
+    aggs force the per-agg fallback, so the sample aggs in the same query also
+    go per-agg -- still matches DuckDB)."""
+    eng, duck = sengine
+    sql = "SELECT g, stddev(v), stddev_pop(v), variance(v), var_pop(v) FROM t GROUP BY g ORDER BY g"
+    assert_same(_ryu(eng, sql), _duck(duck, sql))
+
+
+def test_pop_distinct(sengine):
+    """``stddev_pop(DISTINCT k)`` dedupes the arg before the ddof=0 reduction."""
+    eng, duck = sengine
+    sql = "SELECT stddev_pop(DISTINCT k) FROM t"
+    assert_same(_ryu(eng, sql), _duck(duck, sql))
+
+
+def test_pop_with_filter(sengine):
+    """``var_pop(v) FILTER (WHERE p)``: reduce the arg of passing rows only."""
+    eng, duck = sengine
+    sql = "SELECT g, var_pop(v) FILTER (WHERE v > 5) FROM t GROUP BY g ORDER BY g"
+    assert_same(_ryu(eng, sql), _duck(duck, sql))
+
+
+def test_pop_in_having(sengine):
+    """HAVING references the population aggregate by its full shape."""
+    eng, duck = sengine
+    sql = "SELECT g, var_pop(v) AS vp FROM t GROUP BY g HAVING stddev_pop(v) > 1 ORDER BY g"
+    assert_same(_ryu(eng, sql), _duck(duck, sql))
+
+
+# --------------------------------------------------------------------------- #
 # Rejections (deferred forms)
 # --------------------------------------------------------------------------- #
-
-
-def test_stddev_pop_rejected(sengine):
-    eng, _duck = sengine
-    with pytest.raises(NotImplementedError):
-        eng.sql("SELECT stddev_pop(v) FROM t")
-
-
-def test_var_pop_rejected(sengine):
-    eng, _duck = sengine
-    with pytest.raises(NotImplementedError):
-        eng.sql("SELECT var_pop(v) FROM t")
-
-
-def test_grouped_stddev_pop_rejected(sengine):
-    eng, _duck = sengine
-    with pytest.raises(NotImplementedError):
-        eng.sql("SELECT g, stddev_pop(v) FROM t GROUP BY g")
 
 
 def test_window_stddev_rejected(sengine):
@@ -268,6 +329,13 @@ def test_window_stddev_rejected(sengine):
     eng, _duck = sengine
     with pytest.raises(NotImplementedError):
         eng.sql("SELECT g, stddev(v) OVER (PARTITION BY g) FROM t")
+
+
+def test_window_stddev_pop_rejected(sengine):
+    """The population form is likewise rejected as a window function."""
+    eng, _duck = sengine
+    with pytest.raises(NotImplementedError):
+        eng.sql("SELECT g, stddev_pop(v) OVER (PARTITION BY g) FROM t")
 
 
 # --------------------------------------------------------------------------- #

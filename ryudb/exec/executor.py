@@ -80,6 +80,14 @@ _AGG_METHOD = {
     "BOOL_OR": "max",
 }
 
+# Population statistical aggregates (``stddev_pop`` / ``var_pop``, ddof=0). These
+# are NOT in ``_AGG_METHOD``: the func-string form (``groupby.agg({col:
+# ["std"]})`` / the Series ``.std()`` default) is fixed at ddof=1 (sample), so a
+# population form is reduced explicitly with ``ddof=0`` -- ``_scalar_agg`` for the
+# global path and the per-agg fallback (``_distinct_grouped_agg``) for grouped.
+# Its presence on any aggregate forces the per-agg fallback (see ``_fused_agg``).
+_POP_FUNCS = frozenset({"STDDEV_POP", "VAR_POP"})
+
 # Insertion-timestamp sentinel for in-txn buffered writes (step 9). The
 # timestamp-aware DELETE anti-join only removes a row when a matching tombstone
 # has ``tomb_ts >= ins_ts``; a buffered insert (no commit_ts yet) is tagged
@@ -1672,13 +1680,15 @@ class Engine:
             return (
                 work.groupby(by_names, dropna=dropna).size().reset_index()[by_names]
             )
-        if any(af.distinct for af, _ in aggs):
-            # A DISTINCT-qualified aggregate dedupes its arg within each group
-            # before reducing; the fused single-pass groupby.agg below cannot do
-            # that, so route to the per-agg path (one groupby per aggregate, then
-            # concat along the group-key index -- the same alignment the single
-            # pass uses). Non-distinct aggs in the same query aggregate over all
-            # rows; FILTER composes (nulls failing rows' arg before dedup/reduce).
+        if any(af.distinct or af.func in _POP_FUNCS for af, _ in aggs):
+            # Route to the per-agg fallback (one groupby per aggregate, then concat
+            # along the group-key index -- the same alignment the single pass uses)
+            # when a single-pass ``groupby.agg`` dict-string spec can't express the
+            # aggregate: a DISTINCT-qualified agg dedupes its arg within each group
+            # first, and a population stddev/variance (``stddev_pop`` / ``var_pop``)
+            # needs ``ddof=0`` while the func-string form is fixed at ddof=1.
+            # Non-distinct sample aggs in the same query aggregate over all rows;
+            # FILTER composes (nulls failing rows' arg before dedup/reduce).
             return self._distinct_grouped_agg(
                 work, src, group_keys, aggs, by_names, dropna
             )
@@ -1769,8 +1779,17 @@ class Engine:
                 # collapses the survivors. work and src share length+index (the
                 # single-pass path relies on the same alignment for work[tmp]=col).
                 sub = sub.drop_duplicates(subset=by_names + [n])
-            func = "count" if af.func == "COUNT" else _AGG_METHOD[af.func]
-            s = sub.groupby(by_names, dropna=dropna)[n].agg(func)
+            if af.func == "STDDEV_POP":
+                # Population stddev (ddof=0): the func-string ``"std"`` is fixed at
+                # ddof=1 (sample), so reduce explicitly. A single non-null value
+                # gives 0.0 (divides by n, not n-1), matching DuckDB; an empty or
+                # all-null group is NULL.
+                s = sub.groupby(by_names, dropna=dropna)[n].std(ddof=0)
+            elif af.func == "VAR_POP":
+                s = sub.groupby(by_names, dropna=dropna)[n].var(ddof=0)
+            else:
+                func = "count" if af.func == "COUNT" else _AGG_METHOD[af.func]
+                s = sub.groupby(by_names, dropna=dropna)[n].agg(func)
             pieces.append(s.rename(n))
         out = cudf.concat(pieces, axis=1).reset_index()
         return out[by_names + [n for _, n in aggs]]
@@ -2260,6 +2279,10 @@ class Engine:
 def _scalar_agg(func: str, series) -> object:
     if func == "COUNT":
         return int(series.count())
+    if func == "STDDEV_POP":
+        return series.std(ddof=0)
+    if func == "VAR_POP":
+        return series.var(ddof=0)
     method = _AGG_METHOD[func]
     return getattr(series, method)()
 
