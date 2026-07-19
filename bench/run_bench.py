@@ -50,6 +50,19 @@ QUERIES: dict[str, str] = {
          GROUP BY l_orderkey
          ORDER BY l_orderkey
     """,
+    # High-cardinality single int64 GROUP BY with MIN/MAX/AVG -- exercises the
+    # extended C++ hash_kernel per-slot dispatch (atomic_min/max_d + AVG running
+    # sum/hidden count) over the raw int64 key. Previously deferred to cuDF.
+    "Q_high_card_minmax": """
+        SELECT l_orderkey,
+               min(l_quantity) AS min_qty,
+               max(l_quantity) AS max_qty,
+               avg(l_quantity) AS avg_qty
+          FROM lineitem
+         WHERE l_shipdate <= date '1998-09-02'
+         GROUP BY l_orderkey
+         ORDER BY l_orderkey
+    """,
     "Q6_filter_agg": """
         SELECT sum(l_extendedprice * l_discount) AS revenue, count(*) AS n
           FROM lineitem
