@@ -258,9 +258,14 @@ def _match(node: Aggregate, child) -> "dict | None":
     aggs = node.aggs
     # NOTE: empty group_keys is allowed -- a global aggregate (single group).
 
-    # Group keys must be plain columns present in the frame.
+    # Group keys must be plain columns present in the frame, and non-null: the
+    # kernel factorises group keys (NA -> -1 code), which would drop genuine
+    # NULL-key groups. Defer to cuDF, whose groupby(dropna=False) keeps them
+    # (matching DuckDB, which retains NULL groups). See test_null_group_keys.
     for ge, _gn in group_keys:
         if not isinstance(ge, Col) or ge.name not in child.columns:
+            return None
+        if child[ge.name].null_count != 0:
             return None
 
     # Aggregates: COUNT(*), or SUM/AVG/MIN/MAX over a numeric arithmetic expr.
