@@ -724,13 +724,12 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
         strategy = _STRAT_DENSE
         n_groups = 1
         capacity = 0
-    elif all_numeric:
-        # HASH direct: bind the group key as an int64 array (datetime -> seconds).
-        # The C++ hash kernel handles a SINGLE int64 group key only (it reads
-        # p.gkey_idx[0] and uses atomicCAS-on-key). Multi-column numeric GROUP BY
-        # is deferred to cuDF for now.
-        if ngkey != 1:
-            return None
+    elif all_numeric and ngkey == 1:
+        # HASH direct: bind the SINGLE int64 group key raw (datetime -> seconds).
+        # The C++ hash kernel reads p.gkey_idx[0] and uses atomicCAS-on-key, so
+        # only a single int64 column can bind here. Multi-column numeric GROUP BY
+        # falls through to the factorize->stride-combine branch below (collapse the
+        # key tuple to one int64 perfect-hash code -> same single-int64 hash_kernel).
         strategy = _STRAT_HASH
         capacity = _next_pow2(min(n, _HASH_CAP_MAX, _HASH_ACC_BUDGET // (nagg * 8)))
         if capacity < 4:
@@ -749,31 +748,58 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
             col_dtypes.append(_DT_INT64)
             gkey_idx.append(idx)
     else:
-        # Factorize all group keys (cached) -> codes. DENSE if low-card, else the
-        # string high-card HASH-codes path is deferred (host decode of millions of
-        # codes is slow) -> return None and let cuDF handle it.
+        # Non-int (string/float) keys, or multi-column numeric keys. Factorize each
+        # key col (cached) -> per-col int64 codes; compute row-major strides. If the
+        # full product of per-cardinalities fits the DENSE accumulator (<= MAX_ACC_CELLS)
+        # bind the per-col codes + strides for dense_kernel (unchanged low-card path).
+        # Otherwise collapse the key TUPLE to a single int64 code (sum code_j*stride_j
+        # -- a lossless perfect hash of the tuple) and feed it to the existing
+        # single-int64 hash_kernel (global HT, high-card). The kernel reads gkey_idx[0]
+        # unchanged; keys are reconstructed at read-out by decomposing the code back to
+        # per-col codes (// stride % size) and mapping via the cached uniques.
         sizes: list[int] = []
         uniques: list = []
+        per_col_codes: list = []
         for ge, _gn in spec["group_keys"]:
             if engine is not None and table is not None:
                 codes, uniq = engine.get_codes(table, ge.name, child[ge.name])
             else:
                 codes, uniq = child[ge.name].factorize()
                 uniq = list(uniq.to_pandas())
-            idx = len(col_ptrs)
-            _kept.append(codes)
-            col_ptrs.append(_dev_ptr(codes))
-            col_dtypes.append(_DT_INT64)
-            gkey_idx.append(idx)
+            per_col_codes.append(codes)
             sizes.append(len(uniq))
             uniques.append(uniq)
-            gkey_decoders.append(("codes", uniq))
         for j in range(len(sizes)):
             gkey_stride.append(int(np.prod(sizes[j + 1:], dtype=np.int64)))
         n_groups = int(np.prod(sizes, dtype=np.int64)) if sizes else 1
-        if n_groups * nagg_eff > MAX_ACC_CELLS:
-            return None  # too many accumulator cells (incl. hidden AVG count) -> cuDF
-        strategy = _STRAT_DENSE
+        if n_groups * nagg_eff <= MAX_ACC_CELLS:
+            # DENSE: bind each per-col code col; dense_kernel combines them in-kernel.
+            for codes, uniq in zip(per_col_codes, uniques):
+                idx = len(col_ptrs)
+                _kept.append(codes)
+                col_ptrs.append(_dev_ptr(codes))
+                col_dtypes.append(_DT_INT64)
+                gkey_idx.append(idx)
+                gkey_decoders.append(("codes", uniq))
+            strategy = _STRAT_DENSE
+        else:
+            # HASH: combine per-col codes into one int64 code = the DENSE group index
+            # (perfect hash). Vectorized cuDF, no host loop; reuses the cached factorize.
+            combined = per_col_codes[0].astype("int64") * gkey_stride[0]
+            for j in range(1, len(per_col_codes)):
+                combined = combined + per_col_codes[j].astype("int64") * gkey_stride[j]
+            capacity = _next_pow2(min(n, _HASH_CAP_MAX, _HASH_ACC_BUDGET // (nagg * 8)))
+            if capacity < 4:
+                return None
+            idx = len(col_ptrs)
+            _kept.append(combined)
+            col_ptrs.append(_dev_ptr(combined))
+            col_dtypes.append(_DT_INT64)
+            gkey_idx.append(idx)
+            gkey_decoders.append(
+                ("codes_strided", uniques, list(gkey_stride), sizes)
+            )
+            strategy = _STRAT_HASH
 
     # --- predicate (conjunction only) ---
     pred = _flatten_and_pred(spec["predicate"], bind_named, child)
@@ -820,12 +846,9 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
         agg_tok_start.append(start)
         agg_tok_len.append(len(toks))
 
-    # The HASH path supports SUM/COUNT only (no per-slot inf/-inf init for it).
-    # MIN/MAX/AVG over a high-card numeric key defer to cuDF.
-    if strategy == _STRAT_HASH and any(
-        k in (_AGG_MIN, _AGG_MAX, _AGG_AVG) for k in agg_kind
-    ):
-        return None
+    # The HASH path now supports MIN/MAX/AVG too (hash_kernel mirrors dense_kernel's
+    # per-slot dispatch; AVG stores a running SUM + hidden COUNT, divided at read-out;
+    # MIN/MAX use +/-inf-inited slots + atomic_min/max_d). No deferral here.
 
     # Hidden per-group passing-row count slot: the AVG denominator. One slot,
     # appended after the visible aggs; not emitted as an output column.
@@ -848,15 +871,20 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
     agg_tok_start_np = np.array(agg_tok_start, dtype=np.int32)
     agg_tok_len_np = np.array(agg_tok_len, dtype=np.int32)
 
-    # Per-slot accumulator init: +inf for MIN, -inf for MAX, 0 otherwise. DENSE
-    # only (HASH is SUM/COUNT-only and zero-inits). Length n_groups * nagg_internal
-    # with slot a as the inner index (matches acc[g * nagg_internal + a]).
+    # Per-slot accumulator init: +inf for MIN, -inf for MAX, 0 otherwise. DENSE tiles
+    # per_slot across n_groups (shared-mem acc); HASH tiles it across `capacity` (the
+    # global HT accumulator) when any MIN/MAX is present -- the host copies acc_init
+    # into the HASH acc and hash_kernel's atomic_min/max_d lower from +/-inf. SUM/COUNT
+    # and AVG (running sum + hidden count) all start at 0, so a HASH plan with no
+    # MIN/MAX passes an empty acc_init and the host memsets the acc to 0.
+    per_slot = np.array(
+        [np.inf if k == _AGG_MIN else -np.inf if k == _AGG_MAX else 0.0
+         for k in agg_kind], dtype=np.float64,
+    )
     if strategy == _STRAT_DENSE:
-        per_slot = np.array(
-            [np.inf if k == _AGG_MIN else -np.inf if k == _AGG_MAX else 0.0
-             for k in agg_kind], dtype=np.float64,
-        )
         acc_init = np.tile(per_slot, n_groups)
+    elif strategy == _STRAT_HASH and any(k in (_AGG_MIN, _AGG_MAX) for k in agg_kind):
+        acc_init = np.tile(per_slot, capacity)
     else:
         acc_init = np.empty(0, dtype=np.float64)
 
@@ -883,9 +911,11 @@ def _assemble_agg_frame(spec, keys_list, aggs_list, gkey_decoders, hidden_count_
     """Build the cuDF result frame from the C++ kernel's output arrays. Shared by
     the warm `_run_cpp` path and the cold `fused_scan_aggregate` path.
 
-    `gkey_decoders[j]` is ('codes', uniques) | ('datetime',) | ('int',); for a
-    global aggregate the group-keys loop is a no-op. `hidden_count_idx` is the
-    internal AVG-denominator slot index, or None when no AVG is present."""
+    `gkey_decoders[j]` is ('codes', uniques) | ('datetime',) | ('int',) for the
+    per-key DENSE/HASH-int paths, OR a single ('codes_strided', uniques, strides,
+    sizes) entry spanning ALL key columns for the multi-col stride-combined HASH
+    path (one bound int64 code = sum code_j*stride_j; decomposed at read-out).
+    `hidden_count_idx` is the internal AVG-denominator slot index, or None."""
     import cudf
 
     hidden_count = (
@@ -893,16 +923,27 @@ def _assemble_agg_frame(spec, keys_list, aggs_list, gkey_decoders, hidden_count_
         if hidden_count_idx is not None else None
     )
     data: dict = {}
-    for j, (_ge, gn) in enumerate(spec["group_keys"]):
-        codes = np.asarray(keys_list[j], dtype=np.int64)
-        dec = gkey_decoders[j]
-        if dec[0] == "codes":
-            uniq = dec[1]
-            data[gn] = cudf.Series([uniq[int(c)] for c in codes])
-        elif dec[0] == "datetime":
-            data[gn] = cudf.Series(codes.astype("datetime64[s]"))
-        else:  # 'int'
-            data[gn] = cudf.Series(codes)
+    # Multi-col stride-combined HASH: one bound key column holds the perfect-hash
+    # code for the whole key tuple; decompose it back into per-col codes
+    # (sub = (code // strides[j]) % sizes[j]) and map each via its cached uniques.
+    if len(gkey_decoders) == 1 and gkey_decoders[0][0] == "codes_strided":
+        _uniq, strides, sizes = gkey_decoders[0][1], gkey_decoders[0][2], gkey_decoders[0][3]
+        codes = np.asarray(keys_list[0], dtype=np.int64)
+        for j, (_ge, gn) in enumerate(spec["group_keys"]):
+            sub = (codes // strides[j]) % sizes[j]
+            uniq = _uniq[j]
+            data[gn] = cudf.Series([uniq[int(c)] for c in sub])
+    else:
+        for j, (_ge, gn) in enumerate(spec["group_keys"]):
+            codes = np.asarray(keys_list[j], dtype=np.int64)
+            dec = gkey_decoders[j]
+            if dec[0] == "codes":
+                uniq = dec[1]
+                data[gn] = cudf.Series([uniq[int(c)] for c in codes])
+            elif dec[0] == "datetime":
+                data[gn] = cudf.Series(codes.astype("datetime64[s]"))
+            else:  # 'int'
+                data[gn] = cudf.Series(codes)
     for a, (af, n) in enumerate(spec["aggs"]):
         vals = np.asarray(aggs_list[a], dtype=np.float64)
         if af.func == "AVG":
@@ -1645,11 +1686,11 @@ def fused_scan_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
             agg_tok_start.append(start)
             agg_tok_len.append(len(toks))
 
-        # HASH supports SUM/COUNT only (no per-slot inf/-inf init).
-        if strategy == _STRAT_HASH and any(
-            k in (_AGG_MIN, _AGG_MAX, _AGG_AVG) for k in agg_kind
-        ):
-            return None
+        # Cold HASH now supports MIN/MAX/AVG over the single PLAIN int64 key
+        # (page_hash_kernel mirrors page_dense_kernel's per-slot dispatch; the host
+        # copies acc_init into the cold HASH acc when non-empty). Multi-col/string
+        # HASH stays cold-deferred (the key is read raw from the Parquet page, so a
+        # Python-combined code does not exist on disk) -> warm `fused_aggregate`.
 
         # Hidden per-group passing-row count slot: the AVG denominator.
         hidden_count_idx = None
@@ -1663,14 +1704,20 @@ def fused_scan_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
         if strategy == _STRAT_DENSE and n_groups * nagg_eff > MAX_ACC_CELLS:
             return None
 
-        # Per-slot accumulator init: +inf for MIN, -inf for MAX, 0 otherwise (DENSE
-        # only; HASH is SUM/COUNT and zero-inits).
+        # Per-slot accumulator init: +inf for MIN, -inf for MAX, 0 otherwise. DENSE
+        # tiles across n_groups (shared-mem acc); HASH tiles across `capacity` (the
+        # global HT acc) when any MIN/MAX is present -- the host copies acc_init into
+        # the HASH acc and page_hash_kernel's atomic_min/max_d lower from +/-inf.
+        # SUM/COUNT and AVG (running sum + hidden count) start at 0, so a HASH plan
+        # with no MIN/MAX passes an empty acc_init and the host memsets the acc to 0.
+        per_slot = np.array(
+            [np.inf if k == _AGG_MIN else -np.inf if k == _AGG_MAX else 0.0
+             for k in agg_kind], dtype=np.float64,
+        )
         if strategy == _STRAT_DENSE:
-            per_slot = np.array(
-                [np.inf if k == _AGG_MIN else -np.inf if k == _AGG_MAX else 0.0
-                 for k in agg_kind], dtype=np.float64,
-            )
             acc_init = np.tile(per_slot, n_groups)
+        elif strategy == _STRAT_HASH and any(k in (_AGG_MIN, _AGG_MAX) for k in agg_kind):
+            acc_init = np.tile(per_slot, capacity)
         else:
             acc_init = np.empty(0, dtype=np.float64)
 

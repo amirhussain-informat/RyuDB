@@ -264,9 +264,21 @@ __global__ void hash_kernel(Plan p, long long *key, double *acc, int capacity, i
             slot = (slot + 1) & (capacity - 1);
         }
         if (gid < 0) { atomicExch(overflow, 1); continue; }
+        // Per-slot dispatch mirrors dense_kernel: MIN/MAX via compare-and-swap
+        // (acc slots inited to +/-inf by the host when MIN/MAX present); AVG stores
+        // a running SUM here (divided by the hidden per-group count slot at read-out);
+        // SUM/COUNT atomicAdd. atomic_min/max_d work on global memory.
         for (int a = 0; a < p.nagg; a++) {
-            double val = p.agg_kind[a] == AGG_COUNT ? 1.0 : eval_agg(p, i, a);
-            atomicAdd(&acc[(long long)gid * nagg + a], val);
+            int kind = p.agg_kind[a];
+            double *slot = &acc[(long long)gid * nagg + a];
+            if (kind == AGG_MIN) {
+                atomic_min_d(slot, eval_agg(p, i, a));
+            } else if (kind == AGG_MAX) {
+                atomic_max_d(slot, eval_agg(p, i, a));
+            } else {
+                double val = kind == AGG_COUNT ? 1.0 : eval_agg(p, i, a);
+                atomicAdd(slot, val);  // SUM, AVG (running sum), hidden COUNT
+            }
         }
     }
 }
@@ -613,7 +625,16 @@ py::tuple fused_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes
         check(cudaMalloc(&ovf, sizeof(int)), "malloc ovf");
         // 0xFF bytes -> every int64 slot = -1 = HASH_EMPTY.
         check(cudaMemset(key, 0xFF, sizeof(long long) * capacity), "memset key");
-        check(cudaMemset(acc, 0, sizeof(double) * (size_t)capacity * nagg), "memset acc");
+        // Per-slot init: +inf for MIN, -inf for MAX, 0 otherwise (capacity*nagg, tiled by
+        // the host) when MIN/MAX present; else zero (SUM/COUNT/AVG running-sum + hidden
+        // count all start at 0). Mirrors the DENSE acc_init path above.
+        auto h_init = acc_init.request();
+        if (h_init.size > 0) {
+            check(cudaMemcpy(acc, h_init.ptr, sizeof(double) * (size_t)capacity * nagg,
+                             cudaMemcpyHostToDevice), "cp acc_init hash");
+        } else {
+            check(cudaMemset(acc, 0, sizeof(double) * (size_t)capacity * nagg), "memset acc");
+        }
         check(cudaMemset(distinct, 0, sizeof(int)), "memset distinct");
         check(cudaMemset(ovf, 0, sizeof(int)), "memset ovf");
 
@@ -1055,9 +1076,19 @@ __global__ void page_hash_kernel(Plan p, PageSrc s, long long *key, double *acc,
             slot = (slot + 1) & (capacity - 1);
         }
         if (gid < 0) { atomicExch(overflow, 1); continue; }
+        // Per-slot dispatch mirrors page_dense_kernel (MIN/MAX via compare-and-swap
+        // on +/-inf-inited slots; AVG running SUM + hidden COUNT; SUM/COUNT atomicAdd).
         for (int a = 0; a < p.nagg; a++) {
-            double val = p.agg_kind[a] == AGG_COUNT ? 1.0 : page_eval_agg(p, s, i, a);
-            atomicAdd(&acc[(long long)gid * nagg + a], val);
+            int kind = p.agg_kind[a];
+            double *slot = &acc[(long long)gid * nagg + a];
+            if (kind == AGG_MIN) {
+                atomic_min_d(slot, page_eval_agg(p, s, i, a));
+            } else if (kind == AGG_MAX) {
+                atomic_max_d(slot, page_eval_agg(p, s, i, a));
+            } else {
+                double val = kind == AGG_COUNT ? 1.0 : page_eval_agg(p, s, i, a);
+                atomicAdd(slot, val);  // SUM, AVG (running sum), hidden COUNT
+            }
         }
     }
 }
@@ -1527,7 +1558,14 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
         check(dev_alloc_async((void **)&acc, sizeof(double) * (size_t)capacity * nagg, 0), "malloc acc hash");
         check(dev_alloc_async((void **)&distinct, sizeof(int), 0), "malloc distinct");
         check(cudaMemsetAsync(key, 0xFF, sizeof(long long) * capacity, 0), "memset key");  // EMPTY = -1
-        check(cudaMemsetAsync(acc, 0, sizeof(double) * (size_t)capacity * nagg, 0), "memset acc hash");
+        // Per-slot init (+inf MIN / -inf MAX) tiled across capacity*nagg when
+        // MIN/MAX present; else zero (SUM/COUNT/AVG). Mirrors the DENSE init above.
+        auto ii2 = acc_init.request();
+        if (ii2.ndim > 0 && ii2.shape[0] > 0)
+            check(cudaMemcpyAsync(acc, ii2.ptr, sizeof(double) * (size_t)capacity * nagg,
+                                  cudaMemcpyHostToDevice, 0), "cp acc_init hash");
+        else
+            check(cudaMemsetAsync(acc, 0, sizeof(double) * (size_t)capacity * nagg, 0), "memset acc hash");
         check(cudaMemsetAsync(distinct, 0, sizeof(int), 0), "memset distinct");
     }
 

@@ -161,10 +161,10 @@ def test_datetime_group_key_hash(hc_engine, hc_duck):
     _match(hc_engine.sql(HC_DATETIME_KEY), hc_duck.execute(HC_DATETIME_KEY).fetchdf())
 
 
-def test_multi_column_numeric_groupby_deferred(hc_engine):
-    """Multi-column numeric GROUP BY is NOT handled by the C++ hash kernel (it
-    supports a single int64 key); fused_aggregate returns None so the executor
-    falls back to cuDF."""
+def test_multi_column_numeric_groupby_fires(hc_engine, hc_duck):
+    """Multi-column numeric GROUP BY now hits the C++ HASH path: each int64 key is
+    factorized to per-col codes and collapsed to one int64 perfect-hash code
+    (stride-combine) -> the single-int64 hash_kernel. Matches DuckDB row-for-row."""
     if not CPP:
         pytest.skip("C++ fused kernel not built")
     sql = """
@@ -175,7 +175,9 @@ def test_multi_column_numeric_groupby_deferred(hc_engine):
     """
     agg = _agg_node(sql, hc_engine)
     child = hc_engine._exec(agg.input.input)
-    assert fused.fused_aggregate(agg, child, hc_engine) is None
+    assert fused.fused_aggregate(agg, child, hc_engine) is not None, (
+        "multi-col numeric GROUP BY should hit the C++ HASH (stride-combine) path")
+    _match(hc_engine.sql(sql), hc_duck.execute(sql).fetchdf())
 
 
 def test_fallback_when_extension_disabled(hc_engine, hc_duck):
@@ -268,15 +270,16 @@ def test_grouped_minmaxavg_matches_duckdb(hc_engine, hc_duck):
     _match(hc_engine.sql(GROUPED_MINMAXAVG), hc_duck.execute(GROUPED_MINMAXAVG).fetchdf())
 
 
-def test_hash_min_max_guard_defers(hc_engine, hc_duck):
-    """MIN/MAX over a high-cardinality numeric GROUP BY (HASH path) is NOT
-    supported by the C++ hash kernel -> fused_aggregate returns None and the
-    query falls back to cuDF, still matching DuckDB."""
+def test_hash_min_max_guard_fires(hc_engine, hc_duck):
+    """MIN/MAX over a high-cardinality numeric GROUP BY now hits the C++ HASH
+    path (hash_kernel's per-slot atomic_min/max_d dispatch) instead of deferring
+    to cuDF, and matches DuckDB row-for-row."""
     if not CPP:
         pytest.skip("C++ fused kernel not built")
     agg = _agg_node(HASH_MIN_GUARD, hc_engine)
     child = hc_engine._exec(agg.input.input)
-    assert fused.fused_aggregate(agg, child, hc_engine) is None
+    assert fused.fused_aggregate(agg, child, hc_engine) is not None, (
+        "HASH MIN/MAX over a high-card int64 key should hit the C++ path")
     _match(hc_engine.sql(HASH_MIN_GUARD), hc_duck.execute(HASH_MIN_GUARD).fetchdf())
 
 
