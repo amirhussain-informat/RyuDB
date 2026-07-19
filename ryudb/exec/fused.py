@@ -36,7 +36,8 @@ import numpy as np
 from numba import cuda
 
 from .. import kernels as _kernels
-from ..sql.plan import Aggregate, And, BinOp, Col, Filter, Join, Lit, Or, Scan, Star, walk
+from ..sql.plan import Aggregate, And, BinOp, Col, Expr, Filter, Join, Lit, Or, Scan, Star, walk
+from .ops import eval_expr
 
 if TYPE_CHECKING:
     import cudf
@@ -604,6 +605,14 @@ def _lit_to_double(lit: Lit) -> float:
     return float(v)
 
 
+def _and_all(conjuncts: list) -> Expr:
+    """AND a list of conjuncts into one Expr (single conjunct -> itself)."""
+    e = conjuncts[0]
+    for c in conjuncts[1:]:
+        e = And(e, c)
+    return e
+
+
 def _to_postfix(e, bind_named) -> list[tuple[int, int, float]]:
     """Lower an agg-arg Expr to postfix tokens: (kind, col_or_op, lit).
 
@@ -988,18 +997,31 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     high-cardinality group-from-join (SUM/COUNT over a high-NDV dimension group
     key reaches the chain -- the carried code is hashed into a global open-addressed
     HT instead of the dense shared-mem accumulator, the direct analogue of the
-    non-join HASH path); and no Filter/Project/Sort under the Aggregate. Q3
-    (multi-key group + cross-table filter), non-int join keys, dimension agg args,
-    AVG/MIN/MAX/COUNT(col) over joins, CROSS joins, multi-stage FULL outer (the
-    dim-only semantics across a chain are subtle and rare), outer joins whose
-    preserved side is the dimension (the fact would be null-supplying -> not
+    non-join HASH path); and a conjunctive WHERE directly under the Aggregate folds
+    -- fact predicates into the kernel's pass_pred and dim predicates into a
+    pre-HT-build dim frame filter (inner plans only for dim predicates; outer plans
+    with a dim predicate defer). Q3 (multi-key group + group-key-in-fact), OR /
+    cross-table-compound / unknown-column predicates, non-int join keys, dimension
+    agg args, AVG/MIN/MAX/COUNT(col) over joins, CROSS joins, multi-stage FULL
+    outer (the dim-only semantics across a chain are subtle and rare), outer joins
+    whose preserved side is the dimension (the fact would be null-supplying -> not
     streamable), and global-over-join all defer.
     """
     import cudf
 
     if not _kernels.is_available:
         return None
-    if not isinstance(node.input, Join):
+    # Peel a Filter directly under the Aggregate (Aggregate -> Filter -> Join):
+    # the WHERE's conjuncts fold into the fused plan -- fact predicates into the
+    # kernel's `pass_pred` descriptor, dim predicates into a pre-HT-build dim
+    # frame filter (see below). `join_root` is the Join the rest of this function
+    # walks.
+    filt = None
+    join_root = node.input
+    if isinstance(join_root, Filter):
+        filt = join_root
+        join_root = filt.input
+    if not isinstance(join_root, Join):
         return None
 
     group_keys = node.group_keys
@@ -1019,20 +1041,29 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
             continue
         return None
 
-    # Only Scan and Join may appear under the Aggregate (no Filter/Project/...).
-    # Each join must be a single-pair equi-join; INNER / LEFT / RIGHT / FULL outer
-    # (CROSS defers to cuDF -- it has no key). The how is carried per edge so the
-    # path walk can tell an INNER stage (a probe miss drops the fact row) from an
-    # outer stage (a miss null-pads).
+    # Only Scan and Join may appear under the Aggregate (no Project/Sort/...; the
+    # Filter, if any, was peeled above into `filt`). Each join must be a single-pair
+    # equi-join; INNER / LEFT / RIGHT / FULL outer (CROSS defers to cuDF -- it has no
+    # key). The how is carried per edge so the path walk can tell an INNER stage (a
+    # probe miss drops the fact row) from an outer stage (a miss null-pads).
     scans: list[Scan] = []
     edges: list[tuple[str, str, str]] = []
-    for n in walk(node.input):
+    filter_nodes: list[Filter] = []
+    # A pushed-down single-table WHERE conjunct sits as Filter -> Scan under the
+    # join tree (the optimizer pushes every single-table predicate to its scan;
+    # only cross-table / OR predicates stay above as Filter -> Join). Collect the
+    # Filter nodes here and fold the Filter -> Scan ones after the table map is
+    # built; a Filter above a Join (cross-table compound / OR) is not foldable ->
+    # defer (handled below).
+    for n in walk(join_root):
         if isinstance(n, Scan):
             scans.append(n)
         elif isinstance(n, Join):
             if n.how not in ("inner", "left", "right", "full") or len(n.on_left) != 1:
                 return None  # cross/non-equi -> cuDF (FULL single-stage handled below)
             edges.append((n.on_left[0], n.on_right[0], n.how))
+        elif isinstance(n, Filter):
+            filter_nodes.append(n)
         else:
             return None
     if not scans or len(edges) != len(scans) - 1:
@@ -1128,6 +1159,77 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     if {fact_table} | {d[0] for d in path_dims} != set(scan_tables):
         return None
 
+    # --- split the WHERE (if any) into fact vs dim conjuncts by table ---
+    # Fact conjuncts -> the kernel's `pass_pred` descriptor (fact cols at row i).
+    # Dim conjuncts -> filter the dim frame BEFORE its HT is built (a fact row
+    # probing a filtered-out dim key misses -> inner drop). A conjunct spanning
+    # 2+ tables, an unknown column, OR, or a table not in the chain defers.
+    # Predicates arrive from two places: the peeled `filt` (Aggregate -> Filter ->
+    # Join -- a cross-table / OR predicate the optimizer left above the join) and
+    # the pushed-down `scan_filter_pred` (Filter -> Scan under the join tree -- a
+    # single-table WHERE conjunct the optimizer pushed to its scan).
+    def _conjuncts(e):
+        if isinstance(e, And):
+            left = _conjuncts(e.left)
+            right = _conjuncts(e.right)
+            return None if left is None or right is None else left + right
+        if isinstance(e, Or):
+            return None  # OR -> defer (the C++ kernel + this fold are conjunctive)
+        return [e]
+
+    # Fold the Filter -> Scan predicates collected above. A Filter whose chain
+    # bottoms at a Scan is a pushed single-table predicate (foldable); one that
+    # bottoms at a Join is cross-table / OR above a sub-join (not foldable ->
+    # defer). Stacked Filter -> Filter -> Scan chains are folded from the top
+    # (the top's climb ANDs the whole chain below it; inner Filters are skipped).
+    scan_filter_pred: dict[str, object] = {}
+    if filter_nodes:
+        inner_ids = {id(f.input) for f in filter_nodes if isinstance(f.input, Filter)}
+        for n in filter_nodes:
+            if id(n) in inner_ids:
+                continue
+            cur = n.input
+            chain = [n.predicate]
+            while isinstance(cur, Filter):
+                chain.append(cur.predicate)
+                cur = cur.input
+            if not isinstance(cur, Scan):
+                return None  # Filter above a Join (cross-table / OR) -> defer
+            t = cur.table
+            pred = _and_all(chain)
+            scan_filter_pred[t] = pred if t not in scan_filter_pred else And(scan_filter_pred[t], pred)
+
+    fact_conjuncts: list = []
+    dim_conjuncts: dict[str, list] = {}   # dim_table -> conjuncts
+    dim_tables = {d[0] for d in path_dims}
+    all_preds: list = list(scan_filter_pred.values())
+    if filt is not None:
+        all_preds.append(filt.predicate)
+    for pred in all_preds:
+        cs = _conjuncts(pred)
+        if cs is None:
+            return None
+        for c in cs:
+            cols = c.columns()
+            if any(n not in col_to_table for n in cols):
+                return None  # unknown / projected-alias column -> defer
+            tabs = {col_to_table[n] for n in cols}
+            if len(tabs) != 1:
+                return None  # cross-table compound conjunct -> defer
+            t = next(iter(tabs))
+            if t == fact_table:
+                fact_conjuncts.append(c)
+            elif t in dim_tables:
+                dim_conjuncts.setdefault(t, []).append(c)
+            else:
+                return None  # predicate on a table not in the chain -> defer
+    # Dim predicates on an outer plan would need the join to degrade to inner
+    # (filter the dim HT pre-build + DROP on miss, not null-pad). The kernel
+    # null-pads at a LEFT stage, so dim-predicate folding is inner-only; outer
+    # plans with a dim predicate defer. Fact predicates apply to all join types.
+    if dim_conjuncts and (has_left or full_outer):
+        return None
+
     # Payloads: dim j bridges to dim j+1 via payload = next step's probe key (a
     # col of dim j). The last dim's payload = the group-key col (factorised to a
     # dense code on the host). A pure-star leg (next probe is a fact col, not a
@@ -1150,6 +1252,21 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     scan_by_table = {s.table: s for s in scans}
     fact_frame = engine._exec(scan_by_table[fact_table])
     dim_frames = [engine._exec(scan_by_table[path_dims[j][0]]) for j in range(n_joins)]
+    # Apply each dim predicate to its dim frame BEFORE the HT is built (a fact row
+    # probing a filtered-out dim key misses -> inner drop). The frame shrinks, so
+    # the HT capacity + group count recompute downstream. An empty filtered dim ->
+    # the inner join yields no rows.
+    for j in range(n_joins):
+        dt = path_dims[j][0]
+        if dt in dim_conjuncts:
+            mask = eval_expr(_and_all(dim_conjuncts[dt]), dim_frames[j])
+            if isinstance(mask, cudf.Series):
+                dframe = dim_frames[j][mask]
+            else:
+                dframe = dim_frames[j] if mask else dim_frames[j].iloc[0:0]
+            dim_frames[j] = dframe.reset_index(drop=True)
+            if len(dim_frames[j]) == 0:
+                return _empty_result({"group_keys": group_keys, "aggs": aggs})
     n = len(fact_frame)
 
     # Verify needed columns survived projection pushdown; bail if not.
@@ -1157,6 +1274,8 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     for af, _ in aggs:
         if not (af.func == "COUNT" and isinstance(af.arg, Star)):
             fact_cols_needed |= af.arg.columns()
+    for c in fact_conjuncts:  # fact-predicate columns (bound + read by pass_pred)
+        fact_cols_needed |= c.columns()
     for c in fact_cols_needed:
         if c not in fact_frame.columns:
             return None
@@ -1260,7 +1379,18 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
             # miss at an outer stage); n_groups grows by 1 to include that slot. A
             # pure-inner plan skips the offset -- slot 0 is an ordinary group and
             # the output is byte-identical to the inner-only kernel.
-            codes, uniq = engine.get_codes(path_dims[j][0], payloads[j], dframe[payloads[j]])
+            # A dim predicate on this last (group-key) dim shrinks `dframe`; the
+            # codes must be row-aligned to that filtered frame. engine.get_codes
+            # caches by (table, col) over the FULL scan and would return stale
+            # full-frame codes (wrong length / wrong row alignment -> garbage
+            # grouping), so factorise the filtered frame directly. Dim predicates
+            # on outer plans defer (above), so has_left is False whenever a dim
+            # predicate reaches this last dim.
+            if path_dims[j][0] in dim_conjuncts:
+                codes, uniq = dframe[payloads[j]].factorize()
+                uniq = list(uniq.to_pandas())
+            else:
+                codes, uniq = engine.get_codes(path_dims[j][0], payloads[j], dframe[payloads[j]])
             if has_left:
                 codes = codes + 1  # int64; code 0 -> NULL group slot
             _kept.append(codes)
@@ -1318,10 +1448,19 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
         agg_tok_start.append(start)
         agg_tok_len.append(len(toks))
 
-    # No predicate (this path requires no Filter under the Aggregate).
-    pred_col = np.empty(0, dtype=np.int32)
-    pred_op = np.empty(0, dtype=np.int32)
-    pred_lit = np.empty(0, dtype=np.float64)
+    # Fact predicate (folded into the kernel's pass_pred; bound against fact cols).
+    # Dim predicates were already applied to the dim frames pre-HT-build above.
+    if fact_conjuncts:
+        fact_pred = _flatten_and_pred(_and_all(fact_conjuncts), bind_fact, fact_frame)
+        if fact_pred is None:
+            return None  # OR / unsupported comparison (e.g. col-vs-col) -> defer
+        pred_col = np.array([p[0] for p in fact_pred], dtype=np.int32)
+        pred_op = np.array([p[1] for p in fact_pred], dtype=np.int32)
+        pred_lit = np.array([p[2] for p in fact_pred], dtype=np.float64)
+    else:
+        pred_col = np.empty(0, dtype=np.int32)
+        pred_op = np.empty(0, dtype=np.int32)
+        pred_lit = np.empty(0, dtype=np.float64)
 
     # Per-slot acc init: +inf/-inf for MIN/MAX, 0 otherwise (all 0 for SUM/COUNT).
     per_slot = np.array(

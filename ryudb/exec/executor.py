@@ -1854,6 +1854,15 @@ class Engine:
                     res = fused_scan_aggregate(node, self) if not _force_fallback else None
                     if res is not None:
                         return res
+            # Aggregate -> Filter -> Join: fold the WHERE into the fused join
+            # path (fact predicates into pass_pred, dim predicates into a pre-HT
+            # dim filter) instead of materialising the join. fused_join_aggregate
+            # peels the Filter itself; returns None for unsupported shapes ->
+            # materialise + cuDF groupby below.
+            if isinstance(in_node.input, Join):
+                res = fused_join_aggregate(node, self) if not _force_fallback else None
+                if res is not None:
+                    return res
             child = self._exec(in_node.input)
             # Phase 3b/4: try the fused C++/CUDA filter+groupby+aggregate kernel
             # first -- it now handles grouped AND global aggregates, and the

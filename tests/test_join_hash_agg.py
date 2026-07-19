@@ -270,3 +270,153 @@ def test_high_card_join_smoke(hcj_engine, hcj_duck):
             assert np.array_equal(x, y)
         else:
             assert np.allclose(x, y, rtol=1e-6, atol=1e-2)
+
+
+# =========================================================================== #
+# PR #52: fold a cross-table WHERE (Filter under the Aggregate) on the join
+# path. The optimizer pushes single-table WHERE conjuncts to Filter -> Scan
+# under the join tree; fused_join_aggregate collects those, folds fact
+# predicates into the kernel's pass_pred and dim predicates into a pre-HT-build
+# dim frame filter (the last/group-key dim is factorised directly off the
+# filtered frame -- engine.get_codes caches by (table,col) over the full scan).
+# OR / cross-table-compound / outer-plan-dim predicates still defer.
+# =========================================================================== #
+
+# Fact predicate (l_quantity < 50, on the streamed lineitem) over the high-card
+# GROUP BY o_orderkey join -> pass_pred, HASH (NDV*nagg > MAX_ACC_CELLS).
+WHERE_FACT = """
+    SELECT o_orderkey, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     WHERE l_quantity < 50
+     GROUP BY o_orderkey
+     ORDER BY o_orderkey
+"""
+
+# Dim predicate on the LAST (group-key) dim (orders), filtered to ~7327 groups
+# -> pre-HT-build dim frame filter + last-dim factorise-off-filtered-frame.
+WHERE_DIM_LAST = """
+    SELECT o_orderkey, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     WHERE o_custkey < 500
+     GROUP BY o_orderkey
+     ORDER BY o_orderkey
+"""
+
+# Fact + last-dim predicate together.
+WHERE_FACT_AND_DIM_LAST = """
+    SELECT o_orderkey, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     WHERE l_quantity < 50 AND o_custkey < 500
+     GROUP BY o_orderkey
+     ORDER BY o_orderkey
+"""
+
+# Dim predicate on a MIDDLE dim (orders), group key on the LAST dim (customer)
+# -> the bridging payload is read straight off the filtered frame (no get_codes).
+WHERE_DIM_MIDDLE = """
+    SELECT c_custkey, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders   ON l_orderkey = o_orderkey
+      JOIN customer ON o_custkey = c_custkey
+     WHERE o_custkey < 1000
+     GROUP BY c_custkey
+     ORDER BY c_custkey
+"""
+
+# Fact + middle-dim predicate, group key on the last dim, DENSE.
+WHERE_FACT_AND_DIM_MIDDLE = """
+    SELECT c_custkey, sum(l_extendedprice) AS rev, count(*) AS n
+      FROM lineitem
+      JOIN orders   ON l_orderkey = o_orderkey
+      JOIN customer ON o_custkey = c_custkey
+     WHERE l_quantity < 24 AND o_custkey < 800
+     GROUP BY c_custkey
+     ORDER BY c_custkey
+"""
+
+# String dim predicate on the last dim (customer.c_name equality) -> the
+# eval_expr string path + last-dim factorise-off-filtered-frame.
+WHERE_STRING_DIM = """
+    SELECT c_custkey, sum(l_extendedprice) AS rev, count(*) AS n
+      FROM lineitem
+      JOIN orders   ON l_orderkey = o_orderkey
+      JOIN customer ON o_custkey = c_custkey
+     WHERE c_name = 'cust_42'
+     GROUP BY c_custkey
+"""
+
+# OR predicate -> defer (the kernel + this fold are conjunctive only).
+WHERE_OR = """
+    SELECT o_orderkey, sum(l_quantity) AS sq
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     WHERE l_quantity < 5 OR l_quantity > 90
+     GROUP BY o_orderkey
+     ORDER BY o_orderkey
+"""
+
+# LEFT join + a dim predicate on the preserved dim -> defer (degrades to inner;
+# the kernel null-pads at a LEFT stage, so dim-predicate folding is inner-only).
+WHERE_LEFT_DIM = """
+    SELECT o_orderkey, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      LEFT JOIN orders ON l_orderkey = o_orderkey
+     WHERE o_custkey < 500
+     GROUP BY o_orderkey
+     ORDER BY o_orderkey
+"""
+
+
+@pytest.mark.parametrize("sql", [WHERE_FACT, WHERE_DIM_LAST, WHERE_FACT_AND_DIM_LAST,
+                                 WHERE_DIM_MIDDLE, WHERE_FACT_AND_DIM_MIDDLE,
+                                 WHERE_STRING_DIM])
+def test_join_where_predicate_fires_and_matches(hcj_engine, hcj_duck, sql):
+    """Each foldable WHERE shape fires the fused join path and matches DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    agg = _agg_node(sql, hcj_engine)
+    assert fused.fused_join_aggregate(agg, hcj_engine) is not None, (
+        f"a foldable WHERE should hit the fused join path: {sql!r}")
+    _match(hcj_engine.sql(sql), hcj_duck.execute(sql).fetchdf())
+
+
+def test_join_where_or_predicate_defers_and_matches(hcj_engine, hcj_duck):
+    """An OR predicate defers (returns None) and the cuDF fallback matches DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    assert fused.fused_join_aggregate(_agg_node(WHERE_OR, hcj_engine), hcj_engine) is None, (
+        "an OR WHERE should defer to cuDF")
+    _match(hcj_engine.sql(WHERE_OR), hcj_duck.execute(WHERE_OR).fetchdf())
+
+
+def test_join_where_dim_predicate_outer_defers(hcj_engine, hcj_duck):
+    """A dim predicate on a LEFT (outer) join defers; the cuDF fallback matches."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    assert fused.fused_join_aggregate(_agg_node(WHERE_LEFT_DIM, hcj_engine), hcj_engine) is None, (
+        "a dim predicate on an outer join should defer to cuDF")
+    _match(hcj_engine.sql(WHERE_LEFT_DIM), hcj_duck.execute(WHERE_LEFT_DIM).fetchdf())
+
+
+def test_join_where_dispatch_fires(hcj_engine, hcj_duck, monkeypatch):
+    """engine.sql dispatches a WHERE-bearing join to the fused path (not cuDF):
+    patch ryudb.exec.executor.fused_join_aggregate with a counter, assert one call,
+    and match DuckDB. Covers the executor's Filter-branch routing (the
+    executor-module-patching gotcha: patch the executor's imported name)."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    calls = {"n": 0}
+    orig = ex_mod.fused_join_aggregate
+
+    def wrap(node, engine, _o=orig):
+        r = _o(node, engine)
+        calls["n"] += 1
+        return r
+
+    monkeypatch.setattr(ex_mod, "fused_join_aggregate", wrap)
+    got = hcj_engine.sql(WHERE_FACT_AND_DIM_LAST)
+    assert calls["n"] == 1, "a WHERE-bearing join should dispatch to the fused path once"
+    _match(got, hcj_duck.execute(WHERE_FACT_AND_DIM_LAST).fetchdf())
