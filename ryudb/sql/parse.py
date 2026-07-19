@@ -882,6 +882,11 @@ def _expr(node) -> Expr:
         if up == "DATEDIFF" and len(xs) == 3:
             return Func("datediff", (_expr(xs[1]), _expr(xs[2]),
                                     Lit(xs[0].name.lower(), "str")))
+        if up == "TRUNC":
+            # TRUNC(x) -> truncate toward zero; TRUNC(x, n) -> n decimal places.
+            if len(xs) == 1:
+                return Func("trunc", (_expr(xs[0]),))
+            return Func("trunc", (_expr(xs[0]), _expr(xs[1])))
     # DATEDIFF('unit', start, end): the default dialect mis-parses this as
     # exp.DateDiff(this=Literal('unit'), expression=start, unit=Var(end)) -- the
     # end column lands in the `unit` slot, uppercased as if it were a unit
@@ -1489,6 +1494,22 @@ def _scalar_unary(tag: str):
     return build
 
 
+def _log(node) -> Expr:
+    """Lower exp.Log (DuckDB LOG semantics).
+
+    sqlglot collapses LOG / LOG10 / LOG2 / LOG(b, x) all to ``exp.Log``:
+    - 1-arg ``LOG(x)`` (``expression is None``): base-10 log (DuckDB ``LOG(x)``
+      == ``LOG10(x)``) -> ``Func("log10", (x,))``.
+    - 2-arg ``LOG(b, x)`` / ``LOG10(x)`` / ``LOG2(x)``: ``this``=base,
+      ``expression``=value -> ``Func("log", (base, value))`` (executor computes
+      ``ln(value)/ln(base)``; ``LOG10(x)`` parses with base=Literal(10),
+      ``LOG2(x)`` with base=Literal(2), so they fall out correctly).
+    """
+    if node.expression is None:
+        return Func("log10", (_expr(node.this),))
+    return Func("log", (_expr(node.this), _expr(node.expression)))
+
+
 def _substr(node) -> Expr:
     start = node.args.get("start")
     length = node.args.get("length")
@@ -1585,6 +1606,25 @@ _SCALAR_FUNC_BUILDERS = {
     exp.Least: lambda n: Func(
         "least", tuple([_expr(n.this), *(_expr(x) for x in n.expressions)])
     ),
+    # --- numeric math functions --------------------------------------- #
+    # POWER/ATAN2 are 2-arg (this, expression); the rest are _scalar_unary.
+    exp.Pow: lambda n: Func("power", (_expr(n.this), _expr(n.expression))),
+    exp.Atan2: lambda n: Func("atan2", (_expr(n.this), _expr(n.expression))),
+    exp.Sqrt: _scalar_unary("sqrt"),
+    exp.Cbrt: _scalar_unary("cbrt"),
+    exp.Exp: _scalar_unary("exp"),
+    exp.Ln: _scalar_unary("ln"),
+    exp.Log: _log,
+    exp.Sin: _scalar_unary("sin"),
+    exp.Cos: _scalar_unary("cos"),
+    exp.Tan: _scalar_unary("tan"),
+    exp.Asin: _scalar_unary("asin"),
+    exp.Acos: _scalar_unary("acos"),
+    exp.Atan: _scalar_unary("atan"),
+    exp.Degrees: _scalar_unary("degrees"),
+    exp.Radians: _scalar_unary("radians"),
+    # PI() is a no-arg scalar (broadcast per row by _project, like current_date).
+    exp.Pi: lambda n: Func("pi", ()),
     exp.Substring: _substr,
     exp.Round: _round,
     exp.Concat: lambda n: Func("concat", tuple(_expr(x) for x in n.expressions)),
