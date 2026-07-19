@@ -985,10 +985,13 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     group slot instead of dropping the fact row); and single-stage FULL outer
     (a FULL join reuses the LEFT null-pad for fact misses, then the host readout
     emits the dim-only groups -- COUNT=1, SUM=NULL -- that FULL adds over LEFT);
-    no Filter/Project/Sort under the Aggregate. Q3 (multi-key group + cross-table
-    filter), high-card group-from-join (HASH), non-int join keys, dimension agg
-    args, AVG/MIN/MAX/COUNT(col) over joins, CROSS joins, multi-stage FULL outer
-    (the dim-only semantics across a chain are subtle and rare), outer joins whose
+    high-cardinality group-from-join (SUM/COUNT over a high-NDV dimension group
+    key reaches the chain -- the carried code is hashed into a global open-addressed
+    HT instead of the dense shared-mem accumulator, the direct analogue of the
+    non-join HASH path); and no Filter/Project/Sort under the Aggregate. Q3
+    (multi-key group + cross-table filter), non-int join keys, dimension agg args,
+    AVG/MIN/MAX/COUNT(col) over joins, CROSS joins, multi-stage FULL outer (the
+    dim-only semantics across a chain are subtle and rare), outer joins whose
     preserved side is the dimension (the fact would be null-supplying -> not
     streamable), and global-over-join all defer.
     """
@@ -1272,8 +1275,18 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
         ht_cap.append(_next_pow2(2 * dn))
 
     nagg = len(aggs)
-    if n_groups * nagg > MAX_ACC_CELLS:
-        return None  # high-card group-from-join -> defer (DENSE only)
+    strategy = _STRAT_DENSE
+    capacity = 0
+    if n_groups * nagg <= MAX_ACC_CELLS:
+        strategy = _STRAT_DENSE                       # unchanged low-card path
+    else:
+        # High-card group-from-join: the carried group code is hashed into a global
+        # open-addressed HT instead of indexing a shared-mem dense accumulator (the
+        # direct analogue of the non-join HASH path, PR #50).
+        strategy = _STRAT_HASH
+        capacity = _next_pow2(min(n, _HASH_CAP_MAX, _HASH_ACC_BUDGET // (nagg * 8)))
+        if capacity < 4:
+            return None  # too few rows for an HT -> cuDF
 
     # --- aggregate descriptors (SUM/COUNT only this step; no hidden AVG slot) ---
     _AGG_KIND = {"COUNT": _AGG_COUNT, "SUM": _AGG_SUM}
@@ -1315,7 +1328,12 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
         [np.inf if k == _AGG_MIN else -np.inf if k == _AGG_MAX else 0.0 for k in agg_kind],
         dtype=np.float64,
     )
-    acc_init = np.tile(per_slot, n_groups)
+    if strategy == _STRAT_DENSE:
+        acc_init = np.tile(per_slot, n_groups)
+    elif strategy == _STRAT_HASH and any(k in (_AGG_MIN, _AGG_MAX) for k in agg_kind):
+        acc_init = np.tile(per_slot, capacity)  # MIN/MAX over-join (future) -> inf/-inf init
+    else:
+        acc_init = np.empty(0, dtype=np.float64)  # SUM/COUNT -> host memsets acc to 0
 
     try:
         overflow, n_out, keys_list, aggs_list = _kernels.fused_join_agg(
@@ -1331,7 +1349,7 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
             np.array(agg_tok_len, dtype=np.int32),
             np.array(tok_kind, dtype=np.int32), np.array(tok_col, dtype=np.int32),
             np.array(tok_lit, dtype=np.float64), np.array(tok_op, dtype=np.int32),
-            acc_init, int(n_groups), int(n),
+            acc_init, int(strategy), int(capacity), int(n_groups), int(n),
         )
     except Exception:  # noqa: BLE001 -- never let a C++ fault break correctness
         return None

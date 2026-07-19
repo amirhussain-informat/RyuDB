@@ -421,6 +421,90 @@ __global__ void probe_agg_kernel(Plan p, const long long **ht_key, const long lo
     }
 }
 
+// Probe the chain of dimension HTs and accumulate per group (HASH). Same probe
+// preamble as probe_agg_kernel (the chain walk + LEFT-outer routing is identical),
+// but the carried group code g is hashed into a global open-addressed HT instead of
+// indexing a shared-mem dense accumulator -- so this scales to NDV*nagg beyond
+// MAX_ACC_CELLS. No shared memory, no __syncthreads, no cross-block reduce: the
+// global acc IS the accumulator and atomics publish across blocks. The HT
+// insert+accumulate is a verbatim copy of hash_kernel (the non-join HASH path); only
+// the key source differs (the carried code g, not a fact column).
+//
+// g >= 0 always: dim codes are non-negative, and the +1 Python offset keeps the NULL
+// group (code 0 for an outer plan) distinct from real dim codes (>=1). g == 0 hashes
+// to a normal slot like any key -- correct, it is a real group. build_ht_kernel
+// rejects a dim key of -1 with overflow, so g == HASH_EMPTY (-1) is never produced
+// (no mykey == HASH_EMPTY guard, unlike hash_kernel).
+__global__ void probe_hash_agg_kernel(Plan p, const long long **ht_key, const long long **ht_payload,
+                                      const int *ht_cap, int n_joins, int first_probe_col,
+                                      const int *left_per_stage,
+                                      long long *gkey, double *acc, int capacity, int nagg,
+                                      int *distinct, int *overflow) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < p.n; i += gridDim.x * blockDim.x) {
+        if (!pass_pred(p, i)) continue;
+        long long key = ((const long long *)p.cols[first_probe_col])[i];
+        bool dropped = false;
+        for (int j = 0; j < n_joins; j++) {
+            if (key == HASH_EMPTY) {
+                if (left_per_stage[j]) continue;
+                dropped = true; break;
+            }
+            int cap = ht_cap[j];
+            unsigned long long h = (unsigned long long)key;
+            h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+            h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
+            int slot = (int)(h & (unsigned long long)(cap - 1));
+            int found = -1;
+            for (int probe = 0; probe < 64; probe++) {
+                long long k = ht_key[j][slot];  // read-only HT
+                if (k == HASH_EMPTY) break;      // miss
+                if (k == key) { found = slot; break; }
+                slot = (slot + 1) & (cap - 1);
+            }
+            if (found < 0) {
+                if (left_per_stage[j]) { key = HASH_EMPTY; continue; }  // null-pad
+                dropped = true; break;                                  // inner drop
+            }
+            key = ht_payload[j][found];  // carry payload -> next probe key
+        }
+        if (dropped) continue;
+        long long g = (key == HASH_EMPTY) ? 0 : key;  // sentinel -> NULL group code 0
+        // ---- HASH insert+accumulate (verbatim copy of hash_kernel) ----
+        unsigned long long hh = (unsigned long long)g;
+        hh ^= hh >> 33;
+        hh *= 0xff51afd7ed558ccdULL;
+        hh ^= hh >> 33;
+        hh *= 0xc4ceb9fe1a85ec53ULL;
+        hh ^= hh >> 33;  // MurmurHash3 finalizer (good avalanche for int keys)
+        int slot = (int)(hh & (unsigned long long)(capacity - 1));
+        int gid = -1;
+        for (int probe = 0; probe < 64; probe++) {
+            long long old = (long long)atomicCAS((unsigned long long *)&gkey[slot],
+                                                 (unsigned long long)HASH_EMPTY,
+                                                 (unsigned long long)g);
+            if (old == HASH_EMPTY) { atomicAdd(distinct, 1); gid = slot; break; }
+            if (old == g) { gid = slot; break; }
+            slot = (slot + 1) & (capacity - 1);
+        }
+        if (gid < 0) { atomicExch(overflow, 1); continue; }
+        // Per-slot dispatch mirrors hash_kernel: MIN/MAX via compare-and-swap (acc
+        // slots inited to +/-inf by the host when MIN/MAX present); SUM/COUNT/AVG
+        // atomicAdd. atomic_min/max_d work on global memory.
+        for (int a = 0; a < p.nagg; a++) {
+            int kind = p.agg_kind[a];
+            double *slot = &acc[(long long)gid * nagg + a];
+            if (kind == AGG_MIN) {
+                atomic_min_d(slot, eval_agg(p, i, a));
+            } else if (kind == AGG_MAX) {
+                atomic_max_d(slot, eval_agg(p, i, a));
+            } else {
+                double val = kind == AGG_COUNT ? 1.0 : eval_agg(p, i, a);
+                atomicAdd(slot, val);
+            }
+        }
+    }
+}
+
 // ---------------- helpers ----------------
 static void check(cudaError_t e, const char *what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
@@ -740,7 +824,7 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
                          py::array_t<int> tok_kind, py::array_t<int> tok_col,
                          py::array_t<double> tok_lit, py::array_t<int> tok_op,
                          py::array_t<double> acc_init,
-                         int n_groups, int n_rows) {
+                         int strategy, int capacity, int n_groups, int n_rows) {
     int ncol = (int)col_ptrs.shape(0);
     int nagg = (int)agg_kind.shape(0);
     int ntok = (int)tok_kind.shape(0);
@@ -833,52 +917,126 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
           "memcpy d_htpayload");
     d_htcap = np_dev(ht_cap);
 
-    // --- DENSE accumulator (single int64 group key = code 0..n_groups-1) ---
-    int nga = n_groups * nagg;
-    double *acc = nullptr;
-    int *seen = nullptr;
-    check(cudaMalloc(&acc, sizeof(double) * nga), "malloc join acc");
-    check(cudaMalloc(&seen, sizeof(int) * n_groups), "malloc join seen");
-    auto init_info = acc_init.request();
-    if (init_info.ndim > 0 && init_info.shape[0] > 0) {
-        check(cudaMemcpy(acc, init_info.ptr, sizeof(double) * nga, cudaMemcpyHostToDevice),
-              "cp join acc_init");
-    } else {
-        check(cudaMemset(acc, 0, sizeof(double) * nga), "memset join acc");
-    }
-    check(cudaMemset(seen, 0, sizeof(int) * n_groups), "memset join seen");
-
     int blocks = (n_rows + THREADS - 1) / THREADS;
     if (blocks > 65535) blocks = 65535;
-    size_t shbytes = sizeof(double) * nga;
-    probe_agg_kernel<<<blocks, THREADS, shbytes>>>(
-        p, (const long long **)d_htkey, (const long long **)d_htpayload, d_htcap,
-        n_joins, first_probe_col, d_left, acc, seen, n_groups, nagg);
-    check(cudaGetLastError(), "probe_agg_kernel launch");
-    check(cudaDeviceSynchronize(), "probe sync");
 
-    // --- read-out (single group key: code == group index g) ---
-    std::vector<double> h_acc(nga);
-    std::vector<int> h_seen(n_groups);
-    check(cudaMemcpy(h_acc.data(), acc, sizeof(double) * nga, cudaMemcpyDeviceToHost), "cp join acc");
-    check(cudaMemcpy(h_seen.data(), seen, sizeof(int) * n_groups, cudaMemcpyDeviceToHost), "cp join seen");
-    for (int g = 0; g < n_groups; g++)
-        if (h_seen[g]) n_out++;
-    std::vector<long long> h_keys(n_out);
-    std::vector<std::vector<double>> h_aggs(nagg, std::vector<double>(n_out));
-    int row = 0;
-    for (int g = 0; g < n_groups; g++) {
-        if (!h_seen[g]) continue;
-        h_keys[row] = g;  // code == group index
-        for (int a = 0; a < nagg; a++) h_aggs[a][row] = h_acc[g * nagg + a];
-        row++;
+    if (strategy == STRAT_DENSE) {
+        // --- DENSE accumulator (single int64 group key = code 0..n_groups-1) ---
+        int nga = n_groups * nagg;
+        double *acc = nullptr;
+        int *seen = nullptr;
+        check(cudaMalloc(&acc, sizeof(double) * nga), "malloc join acc");
+        check(cudaMalloc(&seen, sizeof(int) * n_groups), "malloc join seen");
+        auto init_info = acc_init.request();
+        if (init_info.ndim > 0 && init_info.shape[0] > 0) {
+            check(cudaMemcpy(acc, init_info.ptr, sizeof(double) * nga, cudaMemcpyHostToDevice),
+                  "cp join acc_init");
+        } else {
+            check(cudaMemset(acc, 0, sizeof(double) * nga), "memset join acc");
+        }
+        check(cudaMemset(seen, 0, sizeof(int) * n_groups), "memset join seen");
+
+        size_t shbytes = sizeof(double) * nga;
+        probe_agg_kernel<<<blocks, THREADS, shbytes>>>(
+            p, (const long long **)d_htkey, (const long long **)d_htpayload, d_htcap,
+            n_joins, first_probe_col, d_left, acc, seen, n_groups, nagg);
+        check(cudaGetLastError(), "probe_agg_kernel launch");
+        check(cudaDeviceSynchronize(), "probe sync");
+
+        // --- read-out (single group key: code == group index g) ---
+        std::vector<double> h_acc(nga);
+        std::vector<int> h_seen(n_groups);
+        check(cudaMemcpy(h_acc.data(), acc, sizeof(double) * nga, cudaMemcpyDeviceToHost), "cp join acc");
+        check(cudaMemcpy(h_seen.data(), seen, sizeof(int) * n_groups, cudaMemcpyDeviceToHost), "cp join seen");
+        for (int g = 0; g < n_groups; g++)
+            if (h_seen[g]) n_out++;
+        std::vector<long long> h_keys(n_out);
+        std::vector<std::vector<double>> h_aggs(nagg, std::vector<double>(n_out));
+        int row = 0;
+        for (int g = 0; g < n_groups; g++) {
+            if (!h_seen[g]) continue;
+            h_keys[row] = g;  // code == group index
+            for (int a = 0; a < nagg; a++) h_aggs[a][row] = h_acc[g * nagg + a];
+            row++;
+        }
+        keys_list.append(py::array_t<long long>(n_out, h_keys.data()));
+        for (int a = 0; a < nagg; a++)
+            aggs_list.append(py::array_t<double>(n_out, h_aggs[a].data()));
+
+        cudaFree(acc); cudaFree(seen);
+    } else {
+        // --- HASH accumulator (high-card group-from-join: code g hashed into a
+        // global open-addressed HT; reuses d_ovf as the group-HT overflow flag) ---
+        long long *gkey = nullptr;
+        double *acc = nullptr;
+        int *distinct = nullptr;
+        check(cudaMalloc(&gkey, sizeof(long long) * capacity), "malloc join gkey");
+        check(cudaMalloc(&acc, sizeof(double) * (long long)capacity * nagg), "malloc join hash acc");
+        check(cudaMalloc(&distinct, sizeof(int)), "malloc join distinct");
+        check(cudaMemset(gkey, 0xFF, sizeof(long long) * capacity), "memset join gkey");  // EMPTY
+        check(cudaMemset(distinct, 0, sizeof(int)), "memset join distinct");
+        auto init_info = acc_init.request();
+        if (init_info.ndim > 0 && init_info.shape[0] > 0) {
+            check(cudaMemcpy(acc, init_info.ptr, sizeof(double) * (long long)capacity * nagg,
+                             cudaMemcpyHostToDevice), "cp join hash acc_init");
+        } else {
+            check(cudaMemset(acc, 0, sizeof(double) * (long long)capacity * nagg), "memset join hash acc");
+        }
+
+        probe_hash_agg_kernel<<<blocks, THREADS>>>(
+            p, (const long long **)d_htkey, (const long long **)d_htpayload, d_htcap,
+            n_joins, first_probe_col, d_left, gkey, acc, capacity, nagg, distinct, d_ovf);
+        check(cudaGetLastError(), "probe_hash_agg_kernel launch");
+        check(cudaDeviceSynchronize(), "probe hash sync");
+        check(cudaMemcpy(&overflow, d_ovf, sizeof(int), cudaMemcpyDeviceToHost), "cp join hash ovf");
+
+        if (overflow != 0) {
+            cudaFree(gkey); cudaFree(acc); cudaFree(distinct);
+            cudaFree(d_htkey); cudaFree(d_htpayload); cudaFree((void *)d_htcap);
+            for (int j = 0; j < n_joins; j++) { cudaFree(ht_key[j]); cudaFree(ht_payload[j]); }
+            cudaFree((void *)p.dtypes); cudaFree((void *)p.pred_col); cudaFree((void *)p.pred_op);
+            cudaFree((void *)p.pred_lit); cudaFree((void *)p.agg_kind); cudaFree((void *)p.agg_tok_start);
+            cudaFree((void *)p.agg_tok_len); cudaFree((void *)p.tok_kind); cudaFree((void *)p.tok_col);
+            cudaFree((void *)p.tok_lit); cudaFree((void *)p.tok_op); cudaFree(d_cols);
+            cudaFree(d_ovf); cudaFree((void *)d_left);
+            return py::make_tuple(overflow, n_out, keys_list, aggs_list);
+        }
+
+        // --- read-out: reuse compact_kernel (scans gkey for non-empty slots) ---
+        int h_distinct = 0;
+        check(cudaMemcpy(&h_distinct, distinct, sizeof(int), cudaMemcpyDeviceToHost), "cp join distinct");
+        long long *out_keys = nullptr;
+        double *out_acc = nullptr;
+        int *counter = nullptr;
+        check(cudaMalloc(&out_keys, sizeof(long long) * (h_distinct ? h_distinct : 1)), "malloc join out_keys");
+        check(cudaMalloc(&out_acc, sizeof(double) * (long long)(h_distinct ? h_distinct : 1) * nagg), "malloc join out_acc");
+        check(cudaMalloc(&counter, sizeof(int)), "malloc join counter");
+        check(cudaMemset(counter, 0, sizeof(int)), "memset join counter");
+        int cblocks = (capacity + THREADS - 1) / THREADS;
+        if (cblocks > 65535) cblocks = 65535;
+        compact_kernel<<<cblocks, THREADS>>>(gkey, acc, capacity, nagg, out_keys, out_acc, counter);
+        check(cudaGetLastError(), "compact_kernel launch");
+        check(cudaDeviceSynchronize(), "compact sync");
+        n_out = h_distinct;
+        std::vector<long long> h_keys(n_out);
+        std::vector<std::vector<double>> h_aggs(nagg, std::vector<double>(n_out));
+        if (n_out > 0) {
+            check(cudaMemcpy(h_keys.data(), out_keys, sizeof(long long) * n_out, cudaMemcpyDeviceToHost), "cp join out_keys");
+            std::vector<double> h_acc((long long)n_out * nagg);
+            check(cudaMemcpy(h_acc.data(), out_acc, sizeof(double) * (long long)n_out * nagg, cudaMemcpyDeviceToHost), "cp join out_acc");
+            for (int r = 0; r < n_out; r++)
+                for (int a = 0; a < nagg; a++) h_aggs[a][r] = h_acc[(long long)r * nagg + a];
+        }
+        keys_list.append(py::array_t<long long>(n_out, h_keys.data()));
+        for (int a = 0; a < nagg; a++)
+            aggs_list.append(py::array_t<double>(n_out, h_aggs[a].data()));
+
+        cudaFree(gkey); cudaFree(acc); cudaFree(distinct);
+        cudaFree(out_keys); cudaFree(out_acc); cudaFree(counter);
     }
-    keys_list.append(py::array_t<long long>(n_out, h_keys.data()));
-    for (int a = 0; a < nagg; a++)
-        aggs_list.append(py::array_t<double>(n_out, h_aggs[a].data()));
 
-    // --- free everything ---
-    cudaFree(acc); cudaFree(seen); cudaFree(d_ovf); cudaFree((void *)d_left);
+    // --- free everything (shared by both strategies) ---
+    cudaFree(d_ovf); cudaFree((void *)d_left);
     cudaFree(d_htkey); cudaFree(d_htpayload); cudaFree((void *)d_htcap);
     for (int j = 0; j < n_joins; j++) { cudaFree(ht_key[j]); cudaFree(ht_payload[j]); }
     cudaFree((void *)p.dtypes); cudaFree((void *)p.pred_col); cudaFree((void *)p.pred_op);
