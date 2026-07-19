@@ -86,9 +86,13 @@ class Not(Expr):
 class AggFunc(Expr):
     func: str  # COUNT SUM AVG MIN MAX
     arg: Expr  # Star() for COUNT(*)
+    filter: "Expr | None" = None  # SQL ``FILTER (WHERE ...)`` predicate; None = no filter
 
     def columns(self) -> set[str]:
-        return self.arg.columns() if not isinstance(self.arg, Star) else set()
+        cols = self.arg.columns() if not isinstance(self.arg, Star) else set()
+        if self.filter is not None:
+            cols |= self.filter.columns()
+        return cols
 
 
 @dataclass(frozen=True)
@@ -504,7 +508,7 @@ def pretty(node: PlanNode, indent: int = 0) -> str:
         )
     if isinstance(node, Aggregate):
         g = ", ".join(n for _, n in node.group_keys)
-        a = ", ".join(f"{af.func}({_estr(af.arg)}) AS {n}" for af, n in node.aggs)
+        a = ", ".join(f"{_estr(af)} AS {n}" for af, n in node.aggs)
         return f"{pad}Aggregate(group=[{g}] aggs=[{a}])\n" + pretty(node.input, indent + 1)
     if isinstance(node, Window):
         fs = ", ".join(f"{_estr(wf)} AS {n}" for wf, n in node.funcs)
@@ -556,7 +560,10 @@ def _estr(e: Expr) -> str:
     if isinstance(e, Not):
         return f"(NOT {_estr(e.expr)})"
     if isinstance(e, AggFunc):
-        return f"{e.func}({_estr(e.arg)})"
+        s = f"{e.func}({_estr(e.arg)})"
+        if e.filter is not None:
+            s += f" FILTER (WHERE {_estr(e.filter)})"
+        return s
     if isinstance(e, WindowFunc):
         arg = "" if e.arg is None else _estr(e.arg)
         part = ", ".join(_estr(p) for p in e.partition_keys)

@@ -1385,6 +1385,10 @@ class Engine:
         group_keys = node.group_keys
         aggs = node.aggs
         by_names = [gn for _, gn in group_keys]
+        # A per-aggregate FILTER (WHERE ...) cannot be honoured by the C++ fused
+        # kernels (they read only af.func/af.arg) -> force the cuDF fallback paths
+        # (_fused_agg / _scalar_global_agg), which apply the per-agg mask.
+        _has_filter = _agg_has_filter(aggs)
 
         # No-gather optimization: when a Filter sits directly below the Aggregate
         # and every group key is a non-nullable column, fold the predicate into the
@@ -1409,7 +1413,7 @@ class Engine:
                 _skey = (scan_node.table,
                          frozenset(scan_node.columns) if scan_node.columns else None)
                 if _skey not in self._scan_cache:
-                    res = fused_scan_aggregate(node, self)
+                    res = fused_scan_aggregate(node, self) if not _has_filter else None
                     if res is not None:
                         return res
             child = self._exec(in_node.input)
@@ -1418,7 +1422,7 @@ class Engine:
             # SUM/AVG/MIN/MAX/COUNT(*) kinds. Returns None for unsupported shapes
             # (no Filter match, OR predicate, COUNT(col), nullable AVG/MIN/MAX
             # args, multi-col numeric GROUP BY, ...) -> cuDF fallback below.
-            res = fused_aggregate(node, child, self)
+            res = fused_aggregate(node, child, self) if not _has_filter else None
             if res is not None:
                 return res
             mask = eval_expr(in_node.predicate, child)
@@ -1442,7 +1446,7 @@ class Engine:
         # materialising the joined frame. It works on the plan (not an executed
         # frame) so the join output is never built; returns None instantly when
         # node.input isn't a Join, leaving the Aggregate -> Scan path unchanged.
-        res = fused_join_aggregate(node, self)
+        res = fused_join_aggregate(node, self) if not _has_filter else None
         if res is not None:
             return res
         df = self._exec(in_node)
@@ -1454,10 +1458,19 @@ class Engine:
         (and for `Aggregate -> Scan` shapes with no Filter)."""
         row: dict[str, list] = {}
         for af, n in aggs:
+            fmask = eval_expr(af.filter, df) if af.filter is not None else None
             if af.func == "COUNT" and isinstance(af.arg, Star):
-                row[n] = [int(len(df))]
+                # COUNT(*) FILTER (WHERE p) = count of rows where p is TRUE.
+                # fmask.sum() counts True (NULL/False -> 0); df is already
+                # WHERE-filtered so this composes with the outer WHERE.
+                row[n] = [int(fmask.sum()) if fmask is not None else int(len(df))]
             else:
                 col = eval_expr(af.arg, df)
+                if fmask is not None:
+                    # Null the arg where the FILTER predicate is False/NA; cuDF
+                    # reductions skip nulls, so failing rows drop out of this one
+                    # aggregate only (sibling aggs and group membership untouched).
+                    col = df_where(col, fmask)
                 row[n] = [_scalar_agg(af.func, col)]
         if not aggs:
             # No aggregates (a bare global "GROUP BY ()" / no-agg ROLLUP grand
@@ -1521,12 +1534,31 @@ class Engine:
         spec: dict[str, list[str]] = {}
         out_map: list[tuple[str, str, str]] = []
         for af, n in aggs:
+            fmask = eval_expr(af.filter, src) if af.filter is not None else None
             if af.func == "COUNT" and isinstance(af.arg, Star):
-                spec.setdefault("__cnt", []).append("count")
-                out_map.append(("__cnt", "count", n))
+                if fmask is not None:
+                    # Per-agg null'd ones: COUNT(*) FILTER counts rows where the
+                    # predicate is TRUE. A dedicated column (not the shared
+                    # __cnt) so two COUNT(*) with different filters don't collide.
+                    # work and src share length+index (the existing agg-arg
+                    # assignment relies on the same alignment), so df_where of
+                    # work["__cnt"] by the src-length mask is sound.
+                    tmp = f"__f_{n}"
+                    work[tmp] = df_where(work["__cnt"], fmask)
+                    spec.setdefault(tmp, []).append("count")
+                    out_map.append((tmp, "count", n))
+                else:
+                    spec.setdefault("__cnt", []).append("count")
+                    out_map.append(("__cnt", "count", n))
                 continue
             tmp = f"__a_{n}"
-            work[tmp] = eval_expr(af.arg, src)
+            col = eval_expr(af.arg, src)
+            if fmask is not None:
+                # Null the arg where the FILTER predicate is False/NA; cuDF
+                # reductions skip nulls, so failing rows drop out of this one
+                # aggregate only (sibling aggs and group membership untouched).
+                col = df_where(col, fmask)
+            work[tmp] = col
             func = "count" if af.func == "COUNT" else _AGG_METHOD[af.func]
             spec.setdefault(tmp, []).append(func)
             out_map.append((tmp, func, n))
@@ -1774,6 +1806,18 @@ def df_where(series, mask):
 
     Used by the no-gather aggregate path to drop filtered rows from a groupby
     by nulling their group keys (the groupby then drops them via dropna=True),
-    without materialising a filtered row copy.
+    without materialising a filtered row copy. Also the per-aggregate FILTER
+    mechanism: ``series.where(mask)`` nulls on False OR NA, so a NULL (unknown)
+    FILTER predicate excludes the row -- exactly SQL FILTER semantics.
     """
     return series.where(mask)
+
+
+def _agg_has_filter(aggs) -> bool:
+    """True if any aggregate carries a ``FILTER (WHERE ...)`` predicate.
+
+    The C++ fused kernels read only ``af.func``/``af.arg`` and would silently
+    aggregate over ALL rows (ignoring the filter), so a per-agg filter MUST
+    force the cuDF fallback (which honours the filter via df_where).
+    """
+    return any(af.filter is not None for af, _ in aggs)
