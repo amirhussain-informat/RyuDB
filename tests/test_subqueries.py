@@ -545,12 +545,18 @@ def test_non_equi_correlation_rejected(sengine):
         sengine.sql("SELECT k, v FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w > a.v)")
 
 
-def test_multi_equi_correlation_rejected(sengine):
-    # Two equi correlations (b.k = a.k AND b.w = a.v) are deferred (semi/anti and
-    # the decorrelated left join are single-key only).
-    with pytest.raises(NotImplementedError):
-        sengine.sql("SELECT k, v FROM a WHERE EXISTS (SELECT 1 FROM b "
-                    "WHERE b.k = a.k AND b.w = a.v)")
+def test_multi_equi_correlation_exists(sengine, sduck):
+    # Two equi correlations (b.k = a.k AND b.w = a.v) lower to a multi-key semi
+    # join (composite correlation key) -- supported, matches DuckDB.
+    sql = ("SELECT k, v FROM a WHERE EXISTS (SELECT 1 FROM b "
+           "WHERE b.k = a.k AND b.w = a.v)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_multi_equi_correlation_not_exists(sengine, sduck):
+    sql = ("SELECT k, v FROM a WHERE NOT EXISTS (SELECT 1 FROM b "
+           "WHERE b.k = a.k AND b.w = a.v)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
 
 
 def test_outer_ref_in_agg_arg_rejected(sengine):

@@ -1270,19 +1270,7 @@ class Engine:
             )
 
         if how in ("semi", "anti"):
-            # IN / NOT IN subquery lowering. The right side is the subquery frame
-            # (a single key column); the left side is preserved. ``dropna()`` on
-            # the key set makes IN NULL-safe: a NULL left key never matches (DuckDB
-            # ``NULL IN (...)`` is NULL -> filtered out by WHERE), and NULLs in the
-            # subquery set never spuriously match a non-NULL key. NOT IN is only
-            # correct for non-NULL keys on both sides (a NULL in the set makes
-            # DuckDB return NULL for every non-matching row, which ~isin does not
-            # reproduce) -- the parser/tests guard that.
-            keys = right[node.on_right[0]].dropna()
-            mask = left[node.on_left[0]].isin(keys)
-            if how == "anti":
-                mask = ~mask
-            return left[mask]
+            return self._semi_anti_join(node, left, right)
 
         if how == "cross":
             m = left.merge(right, how="cross", suffixes=("_x", "_y"))
@@ -1301,6 +1289,62 @@ class Engine:
             return self._filter_on_predicate(m, pred)
 
         return self._outer_join_with_predicate(node, left, right)
+
+    def _semi_anti_join(
+        self, node: Join, left: cudf.DataFrame, right: cudf.DataFrame
+    ) -> cudf.DataFrame:
+        """Semi/anti join (IN / NOT IN, correlated EXISTS / NOT EXISTS). Preserve
+        the left frame; keep left rows that have (semi) / don't have (anti) a
+        matching right row on the equi-keys.
+
+        Single-key, no residual: the fast ``isin`` path (NULL-safe via
+        ``dropna`` on the key set -- a NULL left key never matches, and NULLs in
+        the set never spuriously match a non-NULL key). NOT IN is only correct
+        for non-NULL keys on both sides (a NULL in the set makes DuckDB return
+        NULL for every non-matching row, which ``~isin`` does not reproduce) --
+        the parser/tests guard that.
+
+        Multi-key (a composite correlation, e.g. ``b.k=a.k AND b.j=a.j``):
+        inner-merge on the equi-keys, then keep the left rows whose row-id
+        appears (semi) / does not appear (anti) among the matched pairs.
+        ``dropna`` on the right keys first makes the match NULL-safe (cuDF merge
+        would match NULL==NULL, but SQL ``=`` matches nothing on NULL): a NULL
+        inner key can't match, and with no NULL right keys a NULL left key finds
+        no match either. The right side of a decorrelated EXISTS projects only
+        the equi-keys, so no cross-input column collision arises here. The fused
+        star-join kernel defers on semi/anti and on multi-key joins, so this path
+        is always the cuDF fallback for composite correlations."""
+        how = node.how
+        on_left = list(node.on_left)
+        on_right = list(node.on_right)
+        if len(on_left) == 1 and node.on_predicate is None:
+            keys = right[on_right[0]].dropna()
+            mask = left[on_left[0]].isin(keys)
+            if how == "anti":
+                mask = ~mask
+            return left[mask]
+
+        # Multi-key (composite correlation). Tag left rows so the matched set can
+        # be projected back to the surviving left rows in their original order.
+        L = left.reset_index(drop=True)
+        Lm = L.copy()
+        Lm["__lid"] = cudf.Series(range(len(Lm)), dtype="int64")
+        R = right.dropna(subset=on_right)
+        merged = Lm.merge(
+            R,
+            left_on=on_left,
+            right_on=on_right,
+            how="inner",
+            suffixes=("_x", "_y"),
+        )
+        if node.on_predicate is not None:
+            merged = self._filter_on_predicate(merged, node.on_predicate)
+        matched = merged["__lid"].drop_duplicates()
+        ids = cudf.Series(range(len(L)), dtype="int64")
+        hit = ids.isin(matched)
+        if how == "anti":
+            hit = ~hit
+        return L[hit]
 
     @staticmethod
     def _side_alias(node: PlanNode) -> str | None:
