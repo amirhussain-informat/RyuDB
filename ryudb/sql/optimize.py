@@ -80,7 +80,7 @@ def prune_projections(plan: PlanNode, schema: Schema) -> PlanNode:
             return replace(node, columns=cols)
         if isinstance(node, Join):
             return Join(rewrite(node.left), rewrite(node.right), node.on_left,
-                        node.on_right, node.how, node.on_predicate)
+                        node.on_right, node.how, node.on_predicate, node.using)
         if isinstance(node, SetOp):
             # A set op is a projection barrier: the columns each branch needs are
             # exactly what that branch projects, so recurse into both children
@@ -210,6 +210,7 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
                 plan.on_right,
                 plan.how,
                 plan.on_predicate,
+                plan.using,
             )
         if isinstance(plan, SetOp):
             # A set op is a pushdown barrier: a predicate above it cannot be
@@ -271,7 +272,7 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
             node = Derived(go(node.input), node.alias)
         elif isinstance(node, Join):
             node = Join(go(node.left), go(node.right), node.on_left,
-                        node.on_right, node.how, node.on_predicate)
+                        node.on_right, node.how, node.on_predicate, node.using)
         elif isinstance(node, SetOp):
             node = SetOp(go(node.left), go(node.right), node.op, node.distinct)
 
@@ -314,6 +315,17 @@ def push_predicates(plan: PlanNode, schema: Schema) -> PlanNode:
                     remaining.append(c)
                     continue
                 ts = tables_of(c) & join_tables
+                # Self-join ambiguity guard: when the same real table is on both
+                # sides (``FROM t a JOIN t b``), a conjunct whose columns map to
+                # that table (e.g. ``a.k = b.k``) is on BOTH sides -- ``tables_of``
+                # keys by real table name, so ``ts`` is ``{t}`` and the single-
+                # table push below would route it to the wrong alias. Keep it
+                # above the join as a true WHERE. Non-self-joins have an empty
+                # ``shared`` so this is inert (no TPC-H regression).
+                shared = left_tables & right_tables
+                if ts & shared:
+                    remaining.append(c)
+                    continue
                 if len(ts) == 1:
                     t = next(iter(ts))
                     if t in pushable_sides:
@@ -367,7 +379,7 @@ def select_join_sides(plan: PlanNode, stats: Stats) -> PlanNode:
                 # is preserved (and the right side is a subquery, not a probe
                 # input). Keep the order, just recurse into children.
                 return Join(left, right, node.on_left, node.on_right,
-                            node.how, node.on_predicate)
+                            node.how, node.on_predicate, node.using)
             if est_rows(right) < est_rows(left):
                 # swap sides so the smaller subtree is the build (left) side.
                 # Swapping a LEFT/RIGHT join flips the preserved side, so rewrite
@@ -378,9 +390,9 @@ def select_join_sides(plan: PlanNode, stats: Stats) -> PlanNode:
                 elif how == "right":
                     how = "left"
                 return Join(right, left, node.on_right, node.on_left,
-                            how, node.on_predicate)
+                            how, node.on_predicate, node.using)
             return Join(left, right, node.on_left, node.on_right,
-                        node.how, node.on_predicate)
+                        node.how, node.on_predicate, node.using)
         if isinstance(node, SetOp):
             # Symmetric: no build/probe side to choose, just recurse so joins
             # inside each branch still get side-selected.

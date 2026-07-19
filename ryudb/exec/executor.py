@@ -1225,6 +1225,50 @@ class Engine:
         merge_how = "outer" if how == "full" else how
         pred = node.on_predicate
 
+        # Disambiguate cross-input column-name collisions (self-join, or any join
+        # whose two inputs share a column name) by alias: rename each side's
+        # colliding columns to ``{alias}__{name}`` so qualified refs (``a.v`` /
+        # ``b.v``) resolve via ``eval_expr`` and same-named equi-join keys no
+        # longer collapse to one column (matching DuckDB, which keeps both). The
+        # rename only fires when a collision exists; TPC-H's join keys/columns
+        # are all prefix-unique, so this path is inert on the bench. USING /
+        # NATURAL joins (``node.using``) are skipped: their keys coalesce into a
+        # single column by design, and any non-key collision was rejected at
+        # parse time, so the only shared columns are the coalescing keys.
+        collision = set(left.columns) & set(right.columns)
+        if collision and not node.using and how not in ("semi", "anti"):
+            if how in ("left", "right", "full") and pred is not None:
+                raise NotImplementedError(
+                    "outer join with a residual ON predicate and a cross-input "
+                    "column-name collision is not supported; use ON with only "
+                    "equi-key predicates, or rename the colliding columns"
+                )
+            lalias = self._side_alias(node.left)
+            ralias = self._side_alias(node.right)
+            if lalias is None or ralias is None:
+                raise NotImplementedError(
+                    "a colliding join side must be a base table (optionally "
+                    "filtered); joins/subqueries/derived tables with a "
+                    "column-name collision are not supported"
+                )
+            left = left.rename(columns={c: f"{lalias}__{c}" for c in collision})
+            right = right.rename(columns={c: f"{ralias}__{c}" for c in collision})
+            on_left = [
+                f"{lalias}__{c}" if c in collision else c for c in node.on_left
+            ]
+            on_right = [
+                f"{ralias}__{c}" if c in collision else c for c in node.on_right
+            ]
+            node = Join(
+                left=node.left,
+                right=node.right,
+                how=how,
+                on_left=on_left,
+                on_right=on_right,
+                on_predicate=pred,
+                using=node.using,
+            )
+
         if how in ("semi", "anti"):
             # IN / NOT IN subquery lowering. The right side is the subquery frame
             # (a single key column); the left side is preserved. ``dropna()`` on
@@ -1257,6 +1301,22 @@ class Engine:
             return self._filter_on_predicate(m, pred)
 
         return self._outer_join_with_predicate(node, left, right)
+
+    @staticmethod
+    def _side_alias(node: PlanNode) -> str | None:
+        """The base-table alias for a (possibly filtered) join side, used to name
+        colliding columns ``{alias}__{col}``. ``Scan`` carries its alias; a
+        ``Filter`` sits between the join and its scan and is transparent; a
+        ``Derived`` (CTE / FROM-subquery) exposes its output columns under its
+        own alias, so its colliding columns are renamed ``{alias}__{col}`` too.
+        A ``Join``/``Project`` side has no single-table provenance (deferred)."""
+        if isinstance(node, Scan):
+            return node.alias
+        if isinstance(node, Filter):
+            return Engine._side_alias(node.input)
+        if isinstance(node, Derived):
+            return node.alias
+        return None
 
     def _filter_on_predicate(self, m: cudf.DataFrame, pred: Expr | None) -> cudf.DataFrame:
         """Apply a predicate as a plain post-filter (inner/cross semantics: a row
@@ -1619,25 +1679,37 @@ class Engine:
         """Return ``(df_copy, part_names, order_names)`` where non-column key
         expressions are evaluated into synthetic columns ``_wpN`` / ``_woN`` on
         the copy (bare columns use their own name). The copy keeps the caller's
-        frame (the Window node's output) free of synthetic sort columns."""
+        frame (the Window node's output) free of synthetic sort columns.
+
+        A qualified column key on a self-join / same-named-column join
+        (``PARTITION BY a.k``) resolves to the alias-renamed ``a__k`` produced by
+        ``_join``; the bare ``k`` is no longer in the frame, so it is addressed
+        by its renamed name (no synthetic copy needed when that column is
+        already present)."""
         out = df.copy()
         part_names: list[str] = []
         for i, p in enumerate(wf.partition_keys):
-            if isinstance(p, Col):
-                part_names.append(p.name)
-            else:
-                name = f"_wp{i}"
-                out[name] = eval_expr(p, out)
-                part_names.append(name)
+            part_names.append(self._window_key_name(p, out, "_wp", i))
         order_names: list[str] = []
         for i, (e, _a) in enumerate(wf.order_keys):
-            if isinstance(e, Col):
-                order_names.append(e.name)
-            else:
-                name = f"_wo{i}"
-                out[name] = eval_expr(e, out)
-                order_names.append(name)
+            order_names.append(self._window_key_name(e, out, "_wo", i))
         return out, part_names, order_names
+
+    @staticmethod
+    def _window_key_name(p: Expr, out: cudf.DataFrame, prefix: str, i: int) -> str:
+        """The sort/groupby column name for a window key. A bare unqualified
+        column present in the frame uses its own name; a qualified self-join
+        column uses the alias-renamed ``{table}__{name}`` column; anything else
+        (an expression, or a column not directly present) is materialized into a
+        synthetic ``{prefix}{i}`` column."""
+        if isinstance(p, Col):
+            if p.table is not None and f"{p.table}__{p.name}" in out.columns:
+                return f"{p.table}__{p.name}"
+            if p.name in out.columns:
+                return p.name
+        name = f"{prefix}{i}"
+        out[name] = eval_expr(p, out)
+        return name
 
     def _window_broadcast(self, wf, df, part_names):
         """Aggregate over the (whole) partition -- no ORDER BY. Broadcast the
@@ -1926,9 +1998,53 @@ class Engine:
         df = self._exec(node.input)
         if not node.keys:
             return df
-        by = [k.name for k, _ in node.keys]
+
+        def bare_safe(k: Expr) -> bool:
+            # The bare ``k.name`` is the correct sort column when it is
+            # unambiguous: an unqualified column, or a qualified column whose
+            # alias-renamed ``{table}__{name}`` is present (the renamed collision
+            # column itself), or a qualified column with no renamed column AND no
+            # deduped sibling (``v_1``) -- i.e. no collision happened. When a
+            # self-join dedups ``SELECT a.v, b.v`` to ``v``/``v_1``, a qualified
+            # ``ORDER BY b.v`` must NOT use the bare ``v`` (it is ``a.v``); it is
+            # resolved against the pre-projection frame below.
+            if not isinstance(k, Col) or k.name not in df.columns:
+                return False
+            if k.table is None:
+                return True
+            if f"{k.table}__{k.name}" in df.columns:
+                return True
+            return f"{k.name}_1" not in df.columns
+
+        if all(bare_safe(k) for k, _ in node.keys):
+            by = [k.name for k, _ in node.keys]
+            ascending = [a for _, a in node.keys]
+            return df.sort_values(by=by, ascending=ascending)
+
+        # A key needs materialization (qualified self-join key, or a non-column
+        # expression). Resolve qualified keys against the PRE-projection frame
+        # (the Project input) where the alias-renamed ``b__v`` still lives: the
+        # Project output dedups it to ``v_1`` and loses the alias. The Project is
+        # row-preserving (same index), so a key Series from its input aligns with
+        # the output and the sort order applies unchanged. Copy ``df`` first so a
+        # temp column never mutates a cached frame.
+        src = self._exec(node.input.input) if isinstance(node.input, Project) else df
+        work = df.copy()
+        by: list[str] = []
+        temps: list[str] = []
+        for i, (k, _) in enumerate(node.keys):
+            if bare_safe(k):
+                by.append(k.name)
+            else:
+                tmp = f"__sk{i}"
+                work[tmp] = eval_expr(k, src)
+                by.append(tmp)
+                temps.append(tmp)
         ascending = [a for _, a in node.keys]
-        return df.sort_values(by=by, ascending=ascending)
+        out = work.sort_values(by=by, ascending=ascending)
+        if temps:
+            out = out.drop(columns=temps)
+        return out
 
     def _limit(self, node: Limit) -> cudf.DataFrame:
         df = self._exec(node.input)

@@ -27,6 +27,14 @@ class Expr:
 @dataclass(frozen=True)
 class Col(Expr):
     name: str
+    # Optional table/alias qualifier (e.g. ``a`` in ``a.v``). Preserved at parse
+    # so a self-join / cross-table same-named-column join can disambiguate
+    # ``a.v`` from ``b.v`` after the join executor renames colliding columns to
+    # ``{alias}__{name}``. ``None`` for unqualified columns (the common case).
+    # ``columns()`` deliberately returns the BARE name so the optimizer's scan
+    # pruning / referenced-set logic (which keys on real table schemas) is
+    # unchanged -- the qualifier is resolved only at eval time.
+    table: str | None = None
 
     def columns(self) -> set[str]:
         return {self.name}
@@ -270,6 +278,10 @@ class Scan:
     table: str
     # None => all columns; otherwise the projected set (pushed down by optimizer)
     columns: set[str] | None = None
+    # The FROM/JOIN alias (``a`` in ``FROM t a``), or ``None`` when unaliased.
+    # The join executor reads it to alias-prefix colliding columns on a self-
+    # join / cross-table same-named-column join (``v`` -> ``a__v``).
+    alias: str | None = None
 
 
 @dataclass
@@ -306,6 +318,12 @@ class Join:
     # inside the join (see ``Engine._apply_on_predicate``); the optimizer never
     # pushes it down (it is not a Filter).
     on_predicate: Expr | None = None
+    # ``True`` for USING / NATURAL joins: their equi keys COALESCE into one column
+    # (cuDF merges same-named keys to a single column), so the executor's
+    # alias-rename collision path must NOT fire for them (it would un-coalesce the
+    # key into ``a__k``/``b__k``). Non-key column collisions on a USING/NATURAL
+    # join are rejected at parse time, so the only shared columns are the keys.
+    using: bool = False
 
 
 @dataclass

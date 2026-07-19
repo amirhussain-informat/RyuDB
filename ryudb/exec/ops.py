@@ -40,9 +40,20 @@ _CMP_SWAP = {"<": ">", ">": "<", "<=": ">=", ">=": "<=", "=": "=", "!=": "!="}
 
 def eval_expr(e: Expr, df: cudf.DataFrame):
     if isinstance(e, Col):
-        if e.name not in df.columns:
-            raise KeyError(f"unknown column {e.name!r}; available: {list(df.columns)}")
-        return df[e.name]
+        # A qualified column (``a.v``) on a self-join / same-named-column join
+        # is addressed by the alias-renamed column ``{table}__{name}`` produced
+        # by ``_join``; fall back to the bare name for non-colliding qualified
+        # columns (e.g. ``x.v`` on a single table) and unqualified columns.
+        if e.table is not None:
+            cand = f"{e.table}__{e.name}"
+            if cand in df.columns:
+                return df[cand]
+        if e.name in df.columns:
+            return df[e.name]
+        raise KeyError(
+            f"unknown column {e.name!r} (table={e.table!r}); "
+            f"available: {list(df.columns)}"
+        )
     if isinstance(e, Star):
         raise ValueError("'*' is only valid inside COUNT(*)")
     if isinstance(e, Lit):
