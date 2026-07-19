@@ -69,6 +69,15 @@ _AGG_METHOD = {
     "STDDEV_SAMP": "std",
     "VARIANCE": "var",
     "MEDIAN": "median",
+    # Logical aggregates: ``bool_and`` / ``logical_and`` = AND of a boolean arg
+    # (true iff every non-null arg is true); ``bool_or`` / ``logical_or`` = OR
+    # (true iff any non-null arg is true). Lowered to ``min`` / ``max`` on the
+    # boolean arg series -- cuDF reductions skip nulls, so a NULL predicate
+    # (unknown) is skipped (not false), an all-NULL or empty group is NULL, and
+    # bool_and([])/bool_or([]) = NULL, all matching DuckDB. The fused kernel only
+    # handles COUNT/SUM/AVG/MIN/MAX, so these always defer to cuDF.
+    "BOOL_AND": "min",
+    "BOOL_OR": "max",
 }
 
 # Insertion-timestamp sentinel for in-txn buffered writes (step 9). The
