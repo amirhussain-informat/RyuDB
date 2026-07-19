@@ -88,6 +88,18 @@ _AGG_METHOD = {
 # Its presence on any aggregate forces the per-agg fallback (see ``_fused_agg``).
 _POP_FUNCS = frozenset({"STDDEV_POP", "VAR_POP"})
 
+# Statistical / logical / population aggregates accepted as window functions
+# (broadcast via ``_window_broadcast``; running via the per-row gather-and-reduce
+# branch in ``_window_running``). Sample statistical + logical are in
+# ``_AGG_METHOD`` already; population forms are in ``_POP_FUNCS``. This set names
+# the funcs that share the window running gather-and-reduce code path (distinct
+# from COUNT/SUM/AVG prefix-sums and MIN/MAX cummin/cummax).
+_NEW_STAT_FUNCS = frozenset({
+    "STDDEV", "STDDEV_SAMP", "VARIANCE", "MEDIAN",
+    "STDDEV_POP", "VAR_POP",
+    "BOOL_AND", "BOOL_OR",
+})
+
 # Insertion-timestamp sentinel for in-txn buffered writes (step 9). The
 # timestamp-aware DELETE anti-join only removes a row when a matching tombstone
 # has ``tomb_ts >= ins_ts``; a buffered insert (no commit_ts yet) is tagged
@@ -1825,7 +1837,7 @@ class Engine:
         # downstream broadcast/positioned/running paths sort/group by these names
         # uniformly.
         work, part_names, order_names = self._window_keys(wf, df)
-        is_agg = wf.func in _AGG_METHOD
+        is_agg = wf.func in _AGG_METHOD or wf.func in _POP_FUNCS
         if is_agg and not wf.order_keys:
             col = self._window_broadcast(wf, work, part_names)
             return col.astype("int64") if wf.func == "COUNT" else col
@@ -1887,6 +1899,10 @@ class Engine:
                     val = len(df)
                 else:
                     val = int(eval_expr(wf.arg, df).notna().sum())
+            elif wf.func in _POP_FUNCS:
+                # Population std/var (ddof=0) -- the func-string form is ddof=1.
+                arg = eval_expr(wf.arg, df)
+                val = arg.std(ddof=0) if wf.func == "STDDEV_POP" else arg.var(ddof=0)
             else:
                 val = getattr(eval_expr(wf.arg, df), _AGG_METHOD[wf.func])()
             return cudf.Series([val] * len(df), index=df.index)
@@ -1897,6 +1913,24 @@ class Engine:
         elif wf.func == "COUNT":
             frame["_wc"] = eval_expr(wf.arg, df).notna().astype("int64")
             col = frame.groupby(part_names, dropna=False)["_wc"].transform("sum")
+        elif wf.func in _POP_FUNCS:
+            # Population std/var per partition (ddof=0). The func-string transform
+            # ("std"/"var") is fixed at ddof=1, and cuDF groupby.transform with a
+            # ddof=0 callable is not guaranteed, so reduce per group explicitly and
+            # merge back. NULL partition keys form their own group (dropna=False);
+            # to merge back NULL-safely (cuDF merge does not match NULL==NULL),
+            # encode groups as an integer _gid via ngroup and merge on that. _ord
+            # preserves the original row order (cuDF merge doesn't preserve left
+            # order); the result is realigned to df.index for the caller.
+            frame["_wc"] = eval_expr(wf.arg, df)
+            frame["_gid"] = frame.groupby(part_names, dropna=False).ngroup()
+            frame["_ord"] = cudf.Series(range(len(frame)), index=frame.index)
+            grp = frame.groupby("_gid", dropna=False)["_wc"]
+            per_group = grp.std(ddof=0) if wf.func == "STDDEV_POP" else grp.var(ddof=0)
+            mapped = per_group.reset_index(name="_wcv")
+            merged = frame[["_gid", "_ord"]].merge(mapped, on="_gid", how="left")
+            col = merged.sort_values("_ord")["_wcv"].reset_index(drop=True)
+            col.index = df.index
         else:
             frame["_wc"] = eval_expr(wf.arg, df)
             col = frame.groupby(part_names, dropna=False)["_wc"].transform(
@@ -2044,6 +2078,51 @@ class Engine:
                 result = s.where(cnt > 0)  # all-null / empty window -> NULL
             else:  # AVG
                 result = (s / cnt).where(cnt > 0)
+        elif wf.func in _NEW_STAT_FUNCS:
+            # Statistical + logical aggregates over an arbitrary [lo, hi] frame.
+            # Uniform per-row gather-and-reduce on host (O(n x window) -- accepted
+            # tradeoff; TPC-H has no stat aggs, so the bench is unaffected). One
+            # host round-trip per window column avoids n GPU gather+reduce launches.
+            # NULL rules (match DuckDB -- cuDF/pandas reductions skip nulls):
+            #   empty window (lo > hi) / all-null window   -> NULL
+            #   sample std/var over <2 non-null            -> NULL (ddof=1)
+            #   pop std/var over 1 non-null                -> 0.0 (ddof=0); 0 -> NULL
+            #   median over the non-null set
+            #   bool_and/bool_or = min/max on the bool arg, NA skipped
+            arg_s = eval_expr(wf.arg, work)
+            arg_h = arg_s.to_pandas()
+            lo_h = lo.reset_index(drop=True).to_pandas().to_numpy()
+            hi_h = hi.reset_index(drop=True).to_pandas().to_numpy()
+            ps_h = pstart.reset_index(drop=True).to_pandas().to_numpy()
+            ne_h = nonempty.reset_index(drop=True).to_pandas().to_numpy()
+            is_bool = wf.func in ("BOOL_AND", "BOOL_OR")
+            out: list = [None] * len(arg_h)
+            for i in range(len(arg_h)):
+                if not bool(ne_h[i]):
+                    continue                              # empty window -> NULL
+                a, b = int(ps_h[i] + lo_h[i]), int(ps_h[i] + hi_h[i])
+                vals = arg_h.iloc[a:b + 1].dropna()
+                if len(vals) == 0:
+                    continue                              # all-null window -> NULL
+                if wf.func == "MEDIAN":
+                    r = vals.median()
+                elif wf.func in ("STDDEV", "STDDEV_SAMP"):
+                    r = vals.std(ddof=1)                  # NaN if <2 -> NA via Float64
+                elif wf.func == "VARIANCE":
+                    r = vals.var(ddof=1)
+                elif wf.func == "STDDEV_POP":
+                    r = vals.std(ddof=0)                  # 0.0 if n=1, NaN if n=0
+                elif wf.func == "VAR_POP":
+                    r = vals.var(ddof=0)
+                elif wf.func == "BOOL_AND":
+                    r = vals.min()
+                else:  # BOOL_OR
+                    r = vals.max()
+                out[i] = r
+            # Float64 (pandas nullable) maps both None and float('nan') to <NA>
+            # and keeps pop-n=1 0.0; boolean keeps bool_and/or results boolean.
+            dtype = "boolean" if is_bool else "Float64"
+            result = cudf.Series(pd.Series(out, dtype=dtype), index=work.index)
         else:  # MIN / MAX (cumulative only; parse rejects non-cumulative)
             arg_s = eval_expr(wf.arg, work)
             result = self._window_running_minmax(wf, work, arg_s, pstart, hi)

@@ -244,12 +244,20 @@ def test_logical_alias_matches_bool(lengine):
 # --------------------------------------------------------------------------- #
 
 
-def test_window_bool_and_rejected(lengine):
-    """A logical aggregate as a window function is not supported yet -- the
-    window builder only accepts COUNT/SUM/AVG/MIN/MAX as aggregate windows."""
-    eng, _duck = lengine
-    with pytest.raises(NotImplementedError):
-        eng.sql("SELECT g, bool_and(v>5) OVER (PARTITION BY g) FROM t")
+def test_window_bool_and(lengine):
+    """A logical aggregate as a window function (broadcast bool_and over each
+    partition) -- now supported; matches DuckDB. The all-NULL group -> NULL;
+    the true+NULL group -> true (NULL predicate skipped)."""
+    eng, duck = lengine
+    assert_same(_ryu(eng, "SELECT g, bool_and(v>5) OVER (PARTITION BY g) AS x FROM t"),
+                _duck(duck, "SELECT g, bool_and(v>5) OVER (PARTITION BY g) AS x FROM t"))
+
+
+def test_window_bool_or(lengine):
+    """bool_or as a window function -- now supported; matches DuckDB."""
+    eng, duck = lengine
+    assert_same(_ryu(eng, "SELECT g, bool_or(v>5) OVER (PARTITION BY g) AS x FROM t"),
+                _duck(duck, "SELECT g, bool_or(v>5) OVER (PARTITION BY g) AS x FROM t"))
 
 
 # --------------------------------------------------------------------------- #

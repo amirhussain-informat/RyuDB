@@ -323,19 +323,20 @@ def test_pop_in_having(sengine):
 # --------------------------------------------------------------------------- #
 
 
-def test_window_stddev_rejected(sengine):
-    """A statistical aggregate as a window function (running stddev) is not
-    supported yet -- the window builder raises on the unsupported func."""
-    eng, _duck = sengine
-    with pytest.raises(NotImplementedError):
-        eng.sql("SELECT g, stddev(v) OVER (PARTITION BY g) FROM t")
+def test_window_stddev(sengine):
+    """A statistical aggregate as a window function (broadcast stddev over each
+    partition) -- now supported; matches DuckDB."""
+    eng, duck = sengine
+    assert_same(_ryu(eng, "SELECT g, stddev(v) OVER (PARTITION BY g) AS x FROM t"),
+                _duck(duck, "SELECT g, stddev(v) OVER (PARTITION BY g) AS x FROM t"))
 
 
-def test_window_stddev_pop_rejected(sengine):
-    """The population form is likewise rejected as a window function."""
-    eng, _duck = sengine
-    with pytest.raises(NotImplementedError):
-        eng.sql("SELECT g, stddev_pop(v) OVER (PARTITION BY g) FROM t")
+def test_window_stddev_pop(sengine):
+    """The population form as a window function -- now supported; matches DuckDB.
+    The single-value group c -> pop 0.0 (not NULL)."""
+    eng, duck = sengine
+    assert_same(_ryu(eng, "SELECT g, stddev_pop(v) OVER (PARTITION BY g) AS x FROM t"),
+                _duck(duck, "SELECT g, stddev_pop(v) OVER (PARTITION BY g) AS x FROM t"))
 
 
 # --------------------------------------------------------------------------- #
