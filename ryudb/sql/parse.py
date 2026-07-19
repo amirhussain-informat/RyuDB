@@ -99,6 +99,13 @@ AGG_FUNCS = {
     exp.Avg: "AVG",
     exp.Min: "MIN",
     exp.Max: "MAX",
+    # Statistical aggregates (sample form, ddof=1 -- the SQL standard default;
+    # ``var_samp`` parses to ``exp.Variance`` too, so it's covered). The population
+    # forms ``stddev_pop`` / ``var_pop`` (ddof=0) are deferred -- see ``_expr``.
+    exp.Stddev: "STDDEV",
+    exp.StddevSamp: "STDDEV_SAMP",
+    exp.Variance: "VARIANCE",
+    exp.Median: "MEDIAN",
 }
 
 
@@ -966,7 +973,25 @@ def _expr(node) -> Expr:
         pred = _expr(w.this if isinstance(w, exp.Where) else w)
         return AggFunc(inner.func, inner.arg, filter=pred, distinct=inner.distinct)
     if isinstance(node, exp.AggFunc):
-        if isinstance(node, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)):
+        if isinstance(node, (exp.StddevPop, exp.VariancePop)):
+            raise NotImplementedError(
+                "population standard deviation / variance (stddev_pop, var_pop) "
+                "are not supported yet; use the sample forms stddev / variance"
+            )
+        if isinstance(
+            node,
+            (
+                exp.Count,
+                exp.Sum,
+                exp.Avg,
+                exp.Min,
+                exp.Max,
+                exp.Stddev,
+                exp.StddevSamp,
+                exp.Variance,
+                exp.Median,
+            ),
+        ):
             inner = node.this
             distinct = False
             if isinstance(inner, exp.Distinct):

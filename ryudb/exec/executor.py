@@ -54,7 +54,22 @@ from .fused import (
 )
 from .ops import _literal, eval_expr
 
-_AGG_METHOD = {"SUM": "sum", "AVG": "mean", "MIN": "min", "MAX": "max", "COUNT": "count"}
+_AGG_METHOD = {
+    "SUM": "sum",
+    "AVG": "mean",
+    "MIN": "min",
+    "MAX": "max",
+    "COUNT": "count",
+    # Statistical aggregates (sample form, ddof=1 -- cuDF's .std()/.var() default).
+    # The same string is both the Series method (``_scalar_agg``) and the cuDF
+    # groupby.agg func name (the single-pass ``_fused_agg`` dict-string spec), so
+    # one map serves both the global and grouped paths. The fused C++/CUDA kernel
+    # only handles COUNT/SUM/AVG/MIN/MAX, so these always defer to cuDF.
+    "STDDEV": "std",
+    "STDDEV_SAMP": "std",
+    "VARIANCE": "var",
+    "MEDIAN": "median",
+}
 
 # Insertion-timestamp sentinel for in-txn buffered writes (step 9). The
 # timestamp-aware DELETE anti-join only removes a row when a matching tombstone
