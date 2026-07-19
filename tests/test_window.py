@@ -30,12 +30,14 @@ expression. Three families are supported:
   skipped (SQL): an all-null or empty window yields NULL for ``SUM`` / ``AVG``,
   0 for ``COUNT``; ``MIN`` / ``MAX`` skip nulls via ffill of the cumulative.
 
-Deferred (raise ``NotImplementedError``): ``QUALIFY``, expression ``PARTITION
+Deferred (raise ``NotImplementedError``): expression ``PARTITION
 BY``/``ORDER BY`` keys (only bare columns), rank functions without an ORDER BY,
 window functions mixed with ``GROUP BY``/``HAVING``, ``RANGE`` frames with
 value offsets (``RANGE BETWEEN N PRECEDING``), ``EXCLUDE``, a frame on an
 aggregate with no ORDER BY, and ``MIN``/``MAX`` with a non-cumulative frame
 (trailing ``ROWS N PRECEDING AND CURRENT ROW`` or any FOLLOWING bound).
+``QUALIFY`` (window-function filtering) is supported (Phase G-4) -- see the
+QUALIFY section below.
 
 A window function in arithmetic (``w - LAG(w) OVER (...)``) and a plain
 projection alongside a window output are supported (the ``Window`` node passes
@@ -81,12 +83,28 @@ _B = [
     (2, 200),
     (3, 300),
 ]
+# c: for QUALIFY top-N-with-payload. ``w`` is UNIQUE within each ``k`` partition
+# (no ties), so ROW_NUMBER is deterministic and a payload column ``v`` can be
+# selected alongside rn without non-deterministic tie-breaking making the
+# RyuDB-vs-DuckDB row comparison flaky.
+_C = [
+    (1, 10, 100),
+    (1, 20, 200),
+    (1, 30, 300),
+    (2, 5, 400),
+    (2, 9, 500),
+    (2, 12, 600),
+]
 
 
 @pytest.fixture
 def sdir(tmp_path):
     d = tmp_path
-    for name, cols, rows in [("a", ["k", "w"], _A), ("b", ["k", "v"], _B)]:
+    for name, cols, rows in [
+        ("a", ["k", "w"], _A),
+        ("b", ["k", "v"], _B),
+        ("c", ["k", "w", "v"], _C),
+    ]:
         (d / name).mkdir()
         cudf.DataFrame({c: [row[i] for row in rows] for i, c in enumerate(cols)}) \
             .to_pandas().to_parquet(d / name / "0.parquet")
@@ -96,7 +114,7 @@ def sdir(tmp_path):
 @pytest.fixture
 def sengine(sdir) -> Engine:
     cat = Catalog(str(sdir))
-    for name in ("a", "b"):
+    for name in ("a", "b", "c"):
         cat.register(name, str(sdir / name))
     return Engine(cat)
 
@@ -106,7 +124,7 @@ def sduck(sdir):
     import duckdb
 
     con = duckdb.connect()
-    for name in ("a", "b"):
+    for name in ("a", "b", "c"):
         con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{sdir}/{name}/*.parquet')")
     return con
 
@@ -694,3 +712,229 @@ def test_cli_running_output(sengine, capsys):
     out = capsys.readouterr().out
     assert "run_s" in out
     assert "ma" in out
+
+
+# --------------------------------------------------------------------------- #
+# QUALIFY -- filter on window-function results (Phase G-4)
+#
+# QUALIFY lowers to a Filter directly above the Window node (below the outer
+# Project), mirroring HAVING's Aggregate -> Filter -> Project shape. The
+# predicate references the Window's _wfN/_qfN output columns: a SELECT-list
+# window alias is resolved to its _wfN, and an inline window not in the SELECT
+# list is synthesized as a new _qfN on the Window node. Determinism note: tests
+# that select a payload column (v) use _C, whose order key w is UNIQUE per
+# partition, so ROW_NUMBER assignment (and thus which row survives QUALIFY) is
+# deterministic. Tests on _A (which has tied w) select only (k, w, rn) so tied
+# rows are indistinguishable in the output multiset.
+# --------------------------------------------------------------------------- #
+
+
+def test_qualify_row_number_top1(sengine, sduck):
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) AS rn "
+           "FROM c QUALIFY rn = 1")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_row_number_top2(sengine, sduck):
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) AS rn "
+           "FROM c QUALIFY rn <= 2")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_inline_window_not_in_select(sengine, sduck):
+    # The window function lives only in QUALIFY (not projected) -> synthesized
+    # as a hidden _qfN on the Window node; the output has no rn column.
+    sql = ("SELECT k, w, v FROM c "
+           "QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) = 1")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_inline_window_top2(sengine, sduck):
+    sql = ("SELECT k, w, v FROM c "
+           "QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) <= 2")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_rank_ties_keeps_all_top(sengine, sduck):
+    # RANK is deterministic on ties: both tied-top rows get rk=1 and survive.
+    # _A's k=1 has w=10,10 (ties) -> both kept; k=2 has w=40 (unique min) -> one.
+    sql = ("SELECT k, w, RANK() OVER (PARTITION BY k ORDER BY w) AS rk "
+           "FROM a QUALIFY rk = 1")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_dense_rank_ties(sengine, sduck):
+    sql = ("SELECT k, w, DENSE_RANK() OVER (PARTITION BY k ORDER BY w) AS dr "
+           "FROM a QUALIFY dr = 1")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_row_number_ties_top1(sengine, sduck):
+    # _A has tied w; selecting only (k, w, rn) makes tied rows indistinguishable
+    # in the output multiset, so the result is deterministic despite ROW_NUMBER
+    # tie-breaking being implementation-defined.
+    sql = ("SELECT k, w, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) AS rn "
+           "FROM a QUALIFY rn = 1")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_row_number_ties_top2(sengine, sduck):
+    sql = ("SELECT k, w, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) AS rn "
+           "FROM a QUALIFY rn <= 2")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_lag_first_row_per_partition(sengine, sduck):
+    # LAG of the first row per partition is NULL -> QUALIFY lv IS NULL keeps
+    # exactly the first row of each partition.
+    sql = ("SELECT k, w, v, LAG(v) OVER (PARTITION BY k ORDER BY w) AS lv "
+           "FROM c QUALIFY lv IS NULL")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_broadcast_aggregate(sengine, sduck):
+    # Broadcast aggregate (no ORDER BY) feeds QUALIFY. sum(v) per k:
+    # k=1 -> 600, k=2 -> 1500. QUALIFY s > 1000 keeps only k=2's rows.
+    sql = ("SELECT k, v, SUM(v) OVER (PARTITION BY k) AS s FROM c "
+           "QUALIFY s > 1000 ORDER BY k, v")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_count_star(sengine, sduck):
+    sql = ("SELECT k, v, COUNT(*) OVER (PARTITION BY k) AS n FROM c "
+           "QUALIFY n >= 3 ORDER BY k, v")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_with_base_column(sengine, sduck):
+    # A base column in the QUALIFY predicate must NOT push below the Window
+    # (it would corrupt ROW_NUMBER). k=1 rn=1 is v=100 (fails v>200); k=2 rn=1
+    # is v=400 (passes) -> only (2, 5, 400, 1) survives.
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) AS rn "
+           "FROM c QUALIFY rn = 1 AND v > 200")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_with_order_by(sengine, sduck):
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) AS rn "
+           "FROM c QUALIFY rn = 1 ORDER BY k DESC")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_with_distinct(sengine, sduck):
+    # Each partition has a rn=1 row, so DISTINCT k yields every partition key.
+    sql = "SELECT DISTINCT k FROM c QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) = 1"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_with_limit(sengine, sduck):
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) AS rn "
+           "FROM c QUALIFY rn = 1 ORDER BY k LIMIT 1")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_arithmetic_in_predicate(sengine, sduck):
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) AS rn "
+           "FROM c QUALIFY rn + 1 <= 2")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_same_window_no_duplicate(sengine, sduck):
+    # The window is projected (AS rn) AND referenced inline in QUALIFY with the
+    # same OVER -> matched by sql() to the single _wf1 (not computed twice).
+    sql = ("SELECT k, w, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) AS rn "
+           "FROM c QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) = 1")
+    plan = parse(sql)
+    win = _window_of(plan)
+    assert len(win.funcs) == 1, "inline QUALIFY window must reuse the projected _wf1"
+    assert win.funcs[0][1] == "_wf1"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_two_different_windows(sengine, sduck):
+    # A projected window (rn) and a different inline QUALIFY window (the SUM
+    # broadcast) -> two funcs on the Window node.
+    sql = ("SELECT k, w, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) AS rn "
+           "FROM c QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) = 1 "
+           "AND SUM(v) OVER (PARTITION BY k) > 1000")
+    plan = parse(sql)
+    win = _window_of(plan)
+    funcs = {name: wf.func for wf, name in win.funcs}
+    assert funcs == {"_wf1": "ROW_NUMBER", "_qf1": "SUM"}
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_no_partition(sengine, sduck):
+    # Single partition (no PARTITION BY): rn=1 keeps the single first row.
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER (ORDER BY w) AS rn "
+           "FROM c QUALIFY rn = 1")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_qualify_typed_decimal_date(typed_engine):
+    # DECIMAL + DATE columns flow through the QUALIFY filter. l_orderkey is
+    # unique, so ROW_NUMBER ORDER BY l_orderkey is deterministic; QUALIFY rn=1
+    # keeps the first row per l_discount partition (4 partitions -> 4 rows).
+    import duckdb
+
+    d = typed_engine.catalog.data_dir
+    con = duckdb.connect()
+    con.execute(f"CREATE VIEW lineitem AS SELECT * FROM read_parquet('{d}/lineitem/*.parquet')")
+    sql = ("SELECT l_orderkey, l_quantity, l_shipdate, "
+           "ROW_NUMBER() OVER (PARTITION BY l_discount ORDER BY l_orderkey) AS rn "
+           "FROM lineitem QUALIFY rn = 1 ORDER BY l_orderkey")
+    assert _ryu(typed_engine, sql) == _duck(con, sql)
+
+
+# --- QUALIFY parse shape --- #
+
+
+def test_qualify_lowers_to_filter_above_window():
+    from ryudb.sql.plan import Filter, Project, Window
+
+    plan = parse("SELECT k, w, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) AS rn "
+                 "FROM a QUALIFY rn = 1")
+    assert isinstance(plan, Project)            # outer projection
+    flt = plan.input
+    assert isinstance(flt, Filter)              # QUALIFY -> Filter
+    assert isinstance(flt.input, Window)        # directly above the Window node
+    # The predicate references the Window's _wf1 output (rn alias -> _wf1).
+    assert flt.predicate.columns() == {"_wf1"}
+
+
+def test_qualify_inline_window_appends_qf_to_window():
+    from ryudb.sql.plan import Filter, Project
+
+    plan = parse("SELECT k, w FROM a "
+                 "QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) = 1")
+    assert isinstance(plan, Project)
+    flt = plan.input
+    assert isinstance(flt, Filter)
+    win = flt.input
+    # No projected window -> the only func is the qualify-only _qf1.
+    funcs = {name: wf.func for wf, name in win.funcs}
+    assert funcs == {"_qf1": "ROW_NUMBER"}
+    assert flt.predicate.columns() == {"_qf1"}
+
+
+# --- QUALIFY rejections --- #
+
+
+def test_qualify_without_window_rejected(sengine):
+    # QUALIFY with no window function anywhere (projection or predicate).
+    _rej(sengine, "SELECT k, w FROM a QUALIFY k > 5")
+
+
+def test_qualify_with_group_by_rejected(sengine):
+    # QUALIFY requires a window; window + GROUP BY is unsupported -> rejected.
+    _rej(sengine, "SELECT k, MAX(w) FROM a GROUP BY k "
+                  "QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY w) = 1")
+
+
+def test_qualify_subquery_rejected(sengine):
+    _rej(sengine, "SELECT k, w FROM a QUALIFY k IN (SELECT k FROM a)")
+
+
+def test_qualify_named_window_def_rejected(sengine):
+    # Named window definitions (WINDOW w AS (...)) are still unsupported.
+    _rej(sengine, "SELECT k, ROW_NUMBER() OVER w AS rn FROM a WINDOW w AS (PARTITION BY k ORDER BY w)")
