@@ -30,8 +30,7 @@ expression. Three families are supported:
   skipped (SQL): an all-null or empty window yields NULL for ``SUM`` / ``AVG``,
   0 for ``COUNT``; ``MIN`` / ``MAX`` skip nulls via ffill of the cumulative.
 
-Deferred (raise ``NotImplementedError``): expression ``PARTITION
-BY``/``ORDER BY`` keys (only bare columns), rank functions without an ORDER BY,
+Deferred (raise ``NotImplementedError``): rank functions without an ORDER BY,
 window functions mixed with ``GROUP BY``/``HAVING``, ``RANGE`` frames with
 value offsets (``RANGE BETWEEN N PRECEDING``), ``EXCLUDE``, a frame on an
 aggregate with no ORDER BY, and ``MIN``/``MAX`` with a non-cumulative frame
@@ -41,7 +40,9 @@ window chaining (``WINDOW w2 AS (w1 ...)``) and partial overrides
 ``QUALIFY`` (window-function filtering) is supported (Phase G-4) -- see the
 QUALIFY section below. Named window definitions (``WINDOW w AS (...)``;
 ``OVER w``) are supported (Phase G-5) -- inlined at parse time, see the
-Named-window section below.
+Named-window section below. Expression ``PARTITION BY`` / ``ORDER BY`` keys are
+supported (Phase G-6) -- materialized into synthetic sort columns, see the
+Expression-keys section below.
 
 A window function in arithmetic (``w - LAG(w) OVER (...)``) and a plain
 projection alongside a window output are supported (the ``Window`` node passes
@@ -644,12 +645,20 @@ def test_rank_without_order_rejected(sengine):
     _rej(sengine, "SELECT k, w, ROW_NUMBER() OVER (PARTITION BY k) AS rn FROM a")
 
 
-def test_expr_partition_key_rejected(sengine):
-    _rej(sengine, "SELECT k, w, ROW_NUMBER() OVER (PARTITION BY k + 1 ORDER BY w) AS rn FROM a")
+def test_expr_partition_key(sengine, sduck):
+    # An expression PARTITION BY key (G-6): the executor materializes k+1 into a
+    # synthetic sort column. _A has k in {1,2,None} -> k+1 in {2,3,NULL}.
+    sql = "SELECT k, w, ROW_NUMBER() OVER (PARTITION BY k + 1 ORDER BY w) AS rn FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
 
 
-def test_expr_order_key_rejected(sengine):
-    _rej(sengine, "SELECT k, w, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w + 1) AS rn FROM a")
+def test_expr_order_key(sengine, sduck):
+    # An expression ORDER BY key (G-6): w+1 is materialized into a synthetic sort
+    # column. Ties on w+1 are exactly ties on w, so ROW_NUMBER on _A (tied w) is
+    # only deterministic when selecting (k, w, rn) -- tied rows are then
+    # indistinguishable in the output multiset.
+    sql = "SELECT k, w, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w + 1) AS rn FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
 
 
 def test_window_with_group_by_rejected(sengine):
@@ -1100,3 +1109,138 @@ def test_named_window_unknown_ref_rejected(sengine):
 def test_named_window_duplicate_def_rejected(sengine):
     _rej(sengine, "SELECT ROW_NUMBER() OVER w AS rn FROM a "
                   "WINDOW w AS (PARTITION BY k), w AS (PARTITION BY k ORDER BY w)")
+
+
+# --------------------------------------------------------------------------- #
+# Expression PARTITION BY / ORDER BY keys (Phase G-6)
+# --------------------------------------------------------------------------- #
+#
+# A PARTITION BY / ORDER BY key may be any expression, not just a bare column
+# (G-6). The parser accepts any ``_expr(p)``; the executor materializes a
+# non-column key into a synthetic sort column (``_wpN`` / ``_woN``) on a copy of
+# the frame, sorts/groups by it, and the synthetic column never reaches the
+# output. Bare columns keep their own name (no synthetic column). Composes with
+# every window family (ranking / LAG-LEAD / broadcast / running + frames),
+# QUALIFY, and named windows. Determinism: an expression ORDER BY key with ties
+# (e.g. ``w + 1`` on _A's tied ``w``) is only deterministic when the output
+# selects no payload column that distinguishes the tied rows -- the tests on _A
+# select (k, w, rn) so tied rows are indistinguishable in the multiset; tests
+# that need a payload use _C (unique w per partition).
+
+
+def test_expr_partition_row_number(sengine, sduck):
+    sql = "SELECT k, w, v, ROW_NUMBER() OVER (PARTITION BY k % 2 ORDER BY w) AS rn FROM c"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_order_row_number(sengine, sduck):
+    sql = "SELECT k, w, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w * 2) AS rn FROM c"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_partition_and_order(sengine, sduck):
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER (PARTITION BY k + 1 ORDER BY w - 1) AS rn "
+           "FROM c")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_order_desc(sengine, sduck):
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY w + 10 DESC) AS rn "
+           "FROM c")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_partition_rank_ties(sengine, sduck):
+    # RANK is deterministic on ties; k%2 puts both k=1 and k=... rows together.
+    sql = "SELECT k, w, RANK() OVER (PARTITION BY k % 2 ORDER BY w) AS rk FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_partition_dense_rank(sengine, sduck):
+    sql = "SELECT k, w, DENSE_RANK() OVER (PARTITION BY k % 2 ORDER BY w) AS dr FROM a"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_order_lag(sengine, sduck):
+    sql = "SELECT k, w, v, LAG(v) OVER (PARTITION BY k ORDER BY w + 1) AS lv FROM c"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_partition_broadcast(sengine, sduck):
+    # Broadcast aggregate with an expression partition key (no ORDER BY).
+    sql = "SELECT k, v, SUM(v) OVER (PARTITION BY k % 2) AS s FROM c ORDER BY k, v"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_order_running_default_frame(sengine, sduck):
+    # Running aggregate with an expression ORDER BY key -> default RANGE frame.
+    sql = "SELECT k, w, SUM(v) OVER (PARTITION BY k ORDER BY w * 2) AS s FROM c"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_order_running_rows_frame(sengine, sduck):
+    # Explicit ROWS frame with an expression ORDER BY key.
+    sql = ("SELECT k, w, SUM(v) OVER (PARTITION BY k ORDER BY w + 1 "
+           "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM c")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_order_count_star_running(sengine, sduck):
+    sql = ("SELECT k, w, COUNT(*) OVER (PARTITION BY k ORDER BY w - 1) AS n FROM c")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_order_avg_running(sengine, sduck):
+    sql = "SELECT k, w, AVG(v) OVER (PARTITION BY k ORDER BY w * 2) AS a FROM c"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_order_min_cumulative(sengine, sduck):
+    # Cumulative MIN with an expression ORDER BY key.
+    sql = "SELECT k, w, MIN(v) OVER (PARTITION BY k ORDER BY w + 1) AS mn FROM c"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_key_no_partition(sengine, sduck):
+    # An expression ORDER BY key with no PARTITION BY (single partition).
+    sql = "SELECT k, w, v, ROW_NUMBER() OVER (ORDER BY w * 2) AS rn FROM c"
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_key_with_qualify(sengine, sduck):
+    sql = ("SELECT k, w, v FROM c "
+           "QUALIFY ROW_NUMBER() OVER (PARTITION BY k % 2 ORDER BY w) = 1")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_key_with_named_window(sengine, sduck):
+    sql = ("SELECT k, w, v, ROW_NUMBER() OVER w AS rn FROM c "
+           "WINDOW w AS (PARTITION BY k % 2 ORDER BY w)")
+    assert _ryu(sengine, sql) == _duck(sduck, sql)
+
+
+def test_expr_key_typed_decimal_date(typed_engine):
+    import duckdb
+
+    d = typed_engine.catalog.data_dir
+    con = duckdb.connect()
+    con.execute(f"CREATE VIEW lineitem AS SELECT * FROM read_parquet('{d}/lineitem/*.parquet')")
+    # l_orderkey % 7 has only 7 distinct values (massive ties) -> add l_orderkey
+    # as a deterministic tiebreaker so ROW_NUMBER is well-defined.
+    sql = ("SELECT l_orderkey, l_quantity, "
+           "ROW_NUMBER() OVER (PARTITION BY l_discount ORDER BY l_orderkey % 7, l_orderkey) AS rn "
+           "FROM lineitem QUALIFY rn = 1 ORDER BY l_orderkey")
+    assert _ryu(typed_engine, sql) == _duck(con, sql)
+
+
+def test_expr_key_synthetic_columns_dropped():
+    # The synthetic sort columns (_wpN / _woN) must not appear in the output.
+    from ryudb.sql.plan import Col
+
+    plan = parse("SELECT k, w, ROW_NUMBER() OVER (PARTITION BY k + 1 ORDER BY w * 2) AS rn "
+                 "FROM a")
+    win = _window_of(plan)
+    wf, _name = win.funcs[0]
+    # partition_keys / order_keys hold the expression Exprs (not bare Cols).
+    assert not all(isinstance(p, Col) for p in wf.partition_keys)
+    assert not all(isinstance(e, Col) for e, _ in wf.order_keys)

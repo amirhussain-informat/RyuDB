@@ -1953,10 +1953,11 @@ def _resolve_named_windows(sel, proj_items, qualify):
 # aggregate (with the SQL default frame RANGE UNBOUNDED PRECEDING TO CURRENT ROW,
 # or an explicit ROWS/RANGE frame) when an ORDER BY is present. QUALIFY
 # (window-function filtering) is supported (G-4). Named window definitions
-# (WINDOW w AS (...); OVER w) are inlined at parse time (G-5). Deferred:
-# expression PARTITION BY / ORDER BY keys, window + GROUP BY, RANGE value
-# offsets, EXCLUDE, MIN/MAX with a FOLLOWING bound, named-window chaining
-# (WINDOW w2 AS (w1 ...)), and partial overrides (OVER (w ORDER BY ...)).
+# (WINDOW w AS (...); OVER w) are inlined at parse time (G-5). Expression
+# PARTITION BY / ORDER BY keys are supported (G-6) -- the executor materializes
+# non-column keys into synthetic sort columns. Deferred: window + GROUP BY,
+# RANGE value offsets, EXCLUDE, MIN/MAX with a FOLLOWING bound, named-window
+# chaining (WINDOW w2 AS (w1 ...)), and partial overrides (OVER (w ORDER BY ...)).
 _WINDOW_RANK_FUNCS = {exp.RowNumber: "ROW_NUMBER", exp.Rank: "RANK",
                       exp.DenseRank: "DENSE_RANK"}
 
@@ -2038,25 +2039,16 @@ def _build_one_window(win, schema):
     part = win.args.get("partition_by") or []
     partition_keys = []
     for p in part:
-        e = _expr(p)
-        if not isinstance(e, Col):
-            raise NotImplementedError(
-                "PARTITION BY expressions are not supported yet (only bare columns)"
-            )
-        partition_keys.append(e)
+        # Any expression is allowed (G-6): the executor materializes non-column
+        # keys into synthetic sort columns. Bare columns stay name-only.
+        partition_keys.append(_expr(p))
     order_node = win.args.get("order")
     order_keys: list[tuple[Expr, bool]] = []
     if order_node is not None:
         for o in order_node.expressions:
             if not isinstance(o, exp.Ordered):
                 raise NotImplementedError(f"unsupported ORDER BY term in window: {o}")
-            e = _expr(o.this)
-            if not isinstance(e, Col):
-                raise NotImplementedError(
-                    "ORDER BY expressions in a window are not supported yet "
-                    "(only bare columns)"
-                )
-            order_keys.append((e, not o.args.get("desc", False)))
+            order_keys.append((_expr(o.this), not o.args.get("desc", False)))
     spec = win.args.get("spec")
     frame = None
     offset = None

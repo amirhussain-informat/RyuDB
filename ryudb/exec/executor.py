@@ -1594,21 +1594,50 @@ class Engine:
         return out.reset_index(drop=True)
 
     def _window_column(self, wf: WindowFunc, df: cudf.DataFrame) -> cudf.Series:
-        part_names = [p.name for p in wf.partition_keys]
+        # Materialize PARTITION BY / ORDER BY keys: bare columns keep their own
+        # name; an expression key (G-6) is evaluated into a synthetic sort column
+        # (_wpN / _woN) on a copy so it never leaks into the output frame. The
+        # downstream broadcast/positioned/running paths sort/group by these names
+        # uniformly.
+        work, part_names, order_names = self._window_keys(wf, df)
         is_agg = wf.func in _AGG_METHOD
         if is_agg and not wf.order_keys:
-            col = self._window_broadcast(wf, df, part_names)
+            col = self._window_broadcast(wf, work, part_names)
             return col.astype("int64") if wf.func == "COUNT" else col
         if is_agg:
             # Running/cumulative aggregate (ORDER BY present, frame resolved at
             # parse). Pure cuDF -- no fused kernel is involved in the window node.
-            col = self._window_running(wf, df, part_names)
+            col = self._window_running(wf, work, part_names, order_names)
             return col.astype("int64") if wf.func == "COUNT" else col
         # ranking / lag / lead: positioned path.
-        col = self._window_positioned(wf, df, part_names)
+        col = self._window_positioned(wf, work, part_names, order_names)
         if wf.func in ("ROW_NUMBER", "RANK", "DENSE_RANK"):
             return col.astype("int64")
         return col
+
+    def _window_keys(self, wf, df):
+        """Return ``(df_copy, part_names, order_names)`` where non-column key
+        expressions are evaluated into synthetic columns ``_wpN`` / ``_woN`` on
+        the copy (bare columns use their own name). The copy keeps the caller's
+        frame (the Window node's output) free of synthetic sort columns."""
+        out = df.copy()
+        part_names: list[str] = []
+        for i, p in enumerate(wf.partition_keys):
+            if isinstance(p, Col):
+                part_names.append(p.name)
+            else:
+                name = f"_wp{i}"
+                out[name] = eval_expr(p, out)
+                part_names.append(name)
+        order_names: list[str] = []
+        for i, (e, _a) in enumerate(wf.order_keys):
+            if isinstance(e, Col):
+                order_names.append(e.name)
+            else:
+                name = f"_wo{i}"
+                out[name] = eval_expr(e, out)
+                order_names.append(name)
+        return out, part_names, order_names
 
     def _window_broadcast(self, wf, df, part_names):
         """Aggregate over the (whole) partition -- no ORDER BY. Broadcast the
@@ -1638,13 +1667,14 @@ class Engine:
             )
         return col
 
-    def _window_positioned(self, wf, df, part_names):
+    def _window_positioned(self, wf, df, part_names, order_names):
         """Ranking (ROW_NUMBER/RANK/DENSE_RANK) or offset (LAG/LEAD) funcs that
         need an ORDER BY. Sort by (partition, order), compute via a
         global-position-minus-partition-boundary method (null-safe -- no
         groupby.cumcount, which breaks on NULL-key partitions), then restore the
-        original row order via a position sentinel."""
-        order_names = [e.name for e, _ in wf.order_keys]
+        original row order via a position sentinel. ``order_names`` are the
+        materialized sort-column names (bare or synthetic -- see
+        ``_window_keys``)."""
         asc = [a for _, a in wf.order_keys]
         # DuckDB's default is NULLS LAST for BOTH ascending and descending
         # (NULLs sort after every non-null value). cuDF sort_values takes a single
@@ -1703,11 +1733,12 @@ class Engine:
         restored = work.sort_values("_pos").reset_index(drop=True)
         return restored["_wf"]
 
-    def _window_running(self, wf, df, part_names):
+    def _window_running(self, wf, df, part_names, order_names):
         """Running/cumulative aggregate window function (an aggregate with an
         ORDER BY and a resolved frame). Sort by (partition, order), compute the
         per-row windowed aggregate, then restore the original row order via a
-        position sentinel.
+        position sentinel. ``order_names`` are the materialized sort-column
+        names (bare or synthetic -- see ``_window_keys``).
 
         Frame semantics:
           - RANGE default (UNBOUNDED PRECEDING .. CURRENT ROW): peer-group
@@ -1724,7 +1755,6 @@ class Engine:
         cumulative; COUNT(col) counts non-nulls; COUNT(*) counts rows. Pure cuDF
         -- no fused kernel is involved in the window node.
         """
-        order_names = [e.name for e, _ in wf.order_keys]
         asc = [a for _, a in wf.order_keys]
         na_position = "last"
         work = df.copy()
