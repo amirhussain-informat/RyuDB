@@ -95,6 +95,7 @@ class AggFunc(Expr):
     func: str  # COUNT SUM AVG MIN MAX
     arg: Expr  # Star() for COUNT(*)
     filter: "Expr | None" = None  # SQL ``FILTER (WHERE ...)`` predicate; None = no filter
+    distinct: bool = False  # ``F(DISTINCT x)``: dedupe the arg within each group before reducing
 
     def columns(self) -> set[str]:
         cols = self.arg.columns() if not isinstance(self.arg, Star) else set()

@@ -1449,6 +1449,12 @@ class Engine:
         # kernels (they read only af.func/af.arg) -> force the cuDF fallback paths
         # (_fused_agg / _scalar_global_agg), which apply the per-agg mask.
         _has_filter = _agg_has_filter(aggs)
+        # A DISTINCT-qualified aggregate (F(DISTINCT x)) dedupes its arg within
+        # each group before reducing; the fused kernels aggregate over ALL rows
+        # (they read only af.func/af.arg, not af.distinct), so DISTINCT must also
+        # force the cuDF fallback paths, which honour af.distinct.
+        _has_distinct = _agg_has_distinct(aggs)
+        _force_fallback = _has_filter or _has_distinct
 
         # No-gather optimization: when a Filter sits directly below the Aggregate
         # and every group key is a non-nullable column, fold the predicate into the
@@ -1473,7 +1479,7 @@ class Engine:
                 _skey = (scan_node.table,
                          frozenset(scan_node.columns) if scan_node.columns else None)
                 if _skey not in self._scan_cache:
-                    res = fused_scan_aggregate(node, self) if not _has_filter else None
+                    res = fused_scan_aggregate(node, self) if not _force_fallback else None
                     if res is not None:
                         return res
             child = self._exec(in_node.input)
@@ -1482,7 +1488,7 @@ class Engine:
             # SUM/AVG/MIN/MAX/COUNT(*) kinds. Returns None for unsupported shapes
             # (no Filter match, OR predicate, COUNT(col), nullable AVG/MIN/MAX
             # args, multi-col numeric GROUP BY, ...) -> cuDF fallback below.
-            res = fused_aggregate(node, child, self) if not _has_filter else None
+            res = fused_aggregate(node, child, self) if not _force_fallback else None
             if res is not None:
                 return res
             mask = eval_expr(in_node.predicate, child)
@@ -1506,7 +1512,7 @@ class Engine:
         # materialising the joined frame. It works on the plan (not an executed
         # frame) so the join output is never built; returns None instantly when
         # node.input isn't a Join, leaving the Aggregate -> Scan path unchanged.
-        res = fused_join_aggregate(node, self) if not _has_filter else None
+        res = fused_join_aggregate(node, self) if not _force_fallback else None
         if res is not None:
             return res
         df = self._exec(in_node)
@@ -1531,6 +1537,14 @@ class Engine:
                     # reductions skip nulls, so failing rows drop out of this one
                     # aggregate only (sibling aggs and group membership untouched).
                     col = df_where(col, fmask)
+                if af.distinct:
+                    # F(DISTINCT x): reduce over the set of distinct arg values.
+                    # cuDF drop_duplicates treats NaN as equal (keeps one), and the
+                    # reductions below skip nulls, so a NULL arg still does not count
+                    # toward COUNT / SUM / AVG -- matching SQL (NULLs are not
+                    # distinct values). FILTER composes: it nulls failing rows first,
+                    # so only passing rows' arg values are deduped.
+                    col = col.drop_duplicates()
                 row[n] = [_scalar_agg(af.func, col)]
         if not aggs:
             # No aggregates (a bare global "GROUP BY ()" / no-agg ROLLUP grand
@@ -1590,6 +1604,16 @@ class Engine:
             return (
                 work.groupby(by_names, dropna=dropna).size().reset_index()[by_names]
             )
+        if any(af.distinct for af, _ in aggs):
+            # A DISTINCT-qualified aggregate dedupes its arg within each group
+            # before reducing; the fused single-pass groupby.agg below cannot do
+            # that, so route to the per-agg path (one groupby per aggregate, then
+            # concat along the group-key index -- the same alignment the single
+            # pass uses). Non-distinct aggs in the same query aggregate over all
+            # rows; FILTER composes (nulls failing rows' arg before dedup/reduce).
+            return self._distinct_grouped_agg(
+                work, src, group_keys, aggs, by_names, dropna
+            )
         work["__cnt"] = 1
         spec: dict[str, list[str]] = {}
         out_map: list[tuple[str, str, str]] = []
@@ -1626,6 +1650,60 @@ class Engine:
         grouped = work.groupby(by_names, dropna=dropna)
         res = grouped.agg(spec)
         pieces = [res[(c, f)].rename(n) for c, f, n in out_map]
+        out = cudf.concat(pieces, axis=1).reset_index()
+        return out[by_names + [n for _, n in aggs]]
+
+    def _distinct_grouped_agg(
+        self,
+        work: cudf.DataFrame,
+        src: cudf.DataFrame,
+        group_keys,
+        aggs,
+        by_names: list[str],
+        dropna: bool,
+    ) -> cudf.DataFrame:
+        """Grouped aggregate where at least one aggregate is DISTINCT-qualified.
+
+        The fused single-pass ``groupby.agg({col: [funcs]})`` cannot dedupe per
+        group, so each aggregate is computed by its own groupby and the per-agg
+        Series are concatenated along the group-key index (the same alignment
+        the single-pass path uses -- every group is present in every per-agg
+        ``sub``: non-distinct aggs keep all rows, and DISTINCT dedup keeps >=1
+        row per group, so the group-key index is identical across pieces and
+        ``concat(axis=1)`` aligns without a NaN-key join). DISTINCT aggs dedupe
+        ``(group_keys, arg)`` first; non-distinct aggs (incl. COUNT(*))
+        aggregate over all rows. FILTER composes: it nulls failing rows' arg
+        before the dedup/reduce. NULL args do not count: drop_duplicates treats
+        NaN as equal (keeps one) and the reductions skip nulls."""
+        pieces: list[cudf.Series] = []
+        for af, n in aggs:
+            fmask = eval_expr(af.filter, src) if af.filter is not None else None
+            if af.func == "COUNT" and isinstance(af.arg, Star):
+                # COUNT(*) [FILTER]; distinct+Star is rejected at parse.
+                if fmask is not None:
+                    # count rows where the FILTER predicate is TRUE per group
+                    # (NULL predicate -> False, i.e. the row is excluded).
+                    cnt = fmask.fillna(False).astype("int64")
+                    sub = work[by_names].copy()
+                    sub[n] = cnt
+                    s = sub.groupby(by_names, dropna=dropna)[n].sum()
+                else:
+                    s = work.groupby(by_names, dropna=dropna).size()
+                pieces.append(s.rename(n))
+                continue
+            col = eval_expr(af.arg, src)
+            if fmask is not None:
+                col = df_where(col, fmask)
+            sub = work[by_names].copy()
+            sub[n] = col
+            if af.distinct:
+                # One row per distinct arg value per group; the reduction then
+                # collapses the survivors. work and src share length+index (the
+                # single-pass path relies on the same alignment for work[tmp]=col).
+                sub = sub.drop_duplicates(subset=by_names + [n])
+            func = "count" if af.func == "COUNT" else _AGG_METHOD[af.func]
+            s = sub.groupby(by_names, dropna=dropna)[n].agg(func)
+            pieces.append(s.rename(n))
         out = cudf.concat(pieces, axis=1).reset_index()
         return out[by_names + [n for _, n in aggs]]
 
@@ -2138,3 +2216,13 @@ def _agg_has_filter(aggs) -> bool:
     force the cuDF fallback (which honours the filter via df_where).
     """
     return any(af.filter is not None for af, _ in aggs)
+
+
+def _agg_has_distinct(aggs) -> bool:
+    """True if any aggregate is DISTINCT-qualified (``F(DISTINCT x)``).
+
+    The C++ fused kernels read only ``af.func``/``af.arg`` and would aggregate
+    over ALL rows (ignoring the dedup), so a DISTINCT aggregate MUST force the
+    cuDF fallback (which honours ``af.distinct`` via per-group drop_duplicates).
+    """
+    return any(af.distinct for af, _ in aggs)
