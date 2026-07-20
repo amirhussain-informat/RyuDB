@@ -149,6 +149,25 @@ QUERIES: dict[str, str] = {
          ORDER BY revenue DESC
          LIMIT 10
     """,
+    # Multi-key stride-combine on the fused join path: GROUP BY two keys on the
+    # SAME dim (orders: o_orderdate + o_shippriority). The host factorises each
+    # key off the (filtered) dim frame and stride-combines the per-key dense
+    # codes into ONE int64 group code (g = code_date*3 + code_ship); the kernel
+    # carries the combined code as the chain tail (group_key_col=-1). A real
+    # TPC-H-shaped multi-key query that previously deferred (the path only
+    # supported a single group key); now hits the fused C++ probe kernel (HASH,
+    # ~7k groups at SF=10). Full Q3 (l_orderkey on the fact + these two dim
+    # keys) still defers -- it spans fact + a dim and is composed in PR #37.
+    "Q_join_multi_key_dim": """
+        SELECT o_orderdate, o_shippriority, sum(l_extendedprice) AS revenue,
+               count(*) AS n
+          FROM lineitem
+          JOIN orders ON l_orderkey = o_orderkey
+         WHERE o_orderdate < date '1995-03-15'
+         GROUP BY o_orderdate, o_shippriority
+         ORDER BY revenue DESC
+         LIMIT 10
+    """,
 }
 
 # Q6 uses BETWEEN, which RyuDB doesn't parse yet -> expand it for the GPU run.

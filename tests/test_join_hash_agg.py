@@ -43,14 +43,26 @@ def hcj_dir(tmp_path_factory):
         "l_suppkey": rng.integers(1, 1001, size=n_li).astype(np.int64),
         "l_quantity": rng.integers(1, 100, size=n_li).astype(np.int64),
         "l_extendedprice": (rng.integers(1, 1000, size=n_li) * 100).astype(np.int64),
+        # Low-card string fact keys for the multi-key same-fact (CASE 2 multi)
+        # path -- exercises the host factorise of NON-numeric fact group keys
+        # (bind_fact must NOT bind these; the kernel reads the dense code col).
+        "l_returnflag": rng.choice(["N", "R", "A"], size=n_li),
+        "l_linestatus": rng.choice(["O", "F"], size=n_li),
     })
     orders = pd.DataFrame({
         "o_orderkey": np.arange(1, n_ord + 1, dtype=np.int64),
         "o_custkey": rng.integers(1, n_cust + 1, size=n_ord).astype(np.int64),
+        # A second low-card group key on the orders dim (the Q3 o_shippriority
+        # shape) so multi-key same-dim (CASE 3) is testable on this fixture.
+        "o_shippriority": rng.integers(1, 6, size=n_ord).astype(np.int64),
     })
     customer = pd.DataFrame({
         "c_custkey": np.arange(1, n_cust + 1, dtype=np.int64),
         "c_name": [f"cust_{i}" for i in range(1, n_cust + 1)],
+        # A string group key on the customer dim (the Q3 c_mktsegment shape) for
+        # multi-key same-dim with a string + int pair on the last dim.
+        "c_mktsegment": rng.choice(["BUILDING", "AUTOMOBILE", "MACHINERY",
+                                    "HOUSEHOLD", "FURNITURE"], size=n_cust),
     })
     for name, fr in [("lineitem", lineitem), ("orders", orders), ("customer", customer)]:
         (d / name).mkdir()
@@ -570,3 +582,175 @@ def test_join_fact_key_dispatch_fires(hcj_engine, hcj_duck, monkeypatch):
     got = hcj_engine.sql(FACT_KEY_WHERE_FACT_AND_DIM)
     assert calls["n"] == 1, "a fact-key group-from-join should dispatch once"
     _match(got, hcj_duck.execute(FACT_KEY_WHERE_FACT_AND_DIM).fetchdf())
+
+
+# =========================================================================== #
+# PR #36: multi-key stride-combine on the fused join path. Each GROUP BY key
+# must be a bare Col and ALL keys must live on the SAME table -- either the
+# fact (CASE 2 multi, group_key_col>=0) or a single reached dim (CASE 3,
+# group_key_col=-1). The host factorises each key (off the filtered frame for a
+# dim, off the fact frame for the fact) and stride-combines the per-key dense
+# codes into ONE int64 group code (a lossless perfect hash of the key tuple):
+# g = sum(code_j * stride_j), strides row-major (last key stride 1),
+# n_groups = product(NDVs), decode code_j = (g // stride_j) % size_j. Keys
+# spanning fact + a dim (full Q3) defer to PR #37; multi-key + an outer plan
+# defers (inner-only v1).
+# =========================================================================== #
+
+# CASE 3: multi-key same-dim (orders), low-card int pair -> DENSE.
+MULTI_KEY_DIM = """
+    SELECT o_custkey, o_shippriority, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     GROUP BY o_custkey, o_shippriority
+     ORDER BY o_custkey, o_shippriority
+"""
+
+# CASE 3 + a fact predicate (pass_pred) -> DENSE still.
+MULTI_KEY_DIM_WHERE_FACT = """
+    SELECT o_custkey, o_shippriority, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     WHERE l_quantity < 50
+     GROUP BY o_custkey, o_shippriority
+     ORDER BY o_custkey, o_shippriority
+"""
+
+# CASE 3 + a predicate ON the group-key dim (orders) -> pre-HT-build dim filter
+# + last-dim factorise off the filtered frame (engine.get_codes caches by
+# (table, col) over the full scan -- direct factorize is row-aligned).
+MULTI_KEY_DIM_WHERE_GROUPKEY_DIM = """
+    SELECT o_custkey, o_shippriority, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     WHERE o_custkey < 500
+     GROUP BY o_custkey, o_shippriority
+     ORDER BY o_custkey, o_shippriority
+"""
+
+# CASE 3 high-card: add o_orderkey (15000 NDV) -> n_groups*nagg > MAX_ACC_CELLS
+# -> HASH accumulator at the chain tail.
+MULTI_KEY_DIM_HIGH_CARD = """
+    SELECT o_custkey, o_shippriority, o_orderkey, sum(l_quantity) AS sq,
+           count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     GROUP BY o_custkey, o_shippriority, o_orderkey
+     ORDER BY o_custkey, o_shippriority, o_orderkey
+"""
+
+# CASE 3 over a multi-stage chain (lineitem -> orders -> customer) with the
+# group keys on the LAST dim (customer): int + string pair, predicate on the
+# middle dim (orders) -> the bridging payload reads off the filtered frame.
+MULTI_KEY_DIM_CHAIN = """
+    SELECT c_custkey, c_mktsegment, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders   ON l_orderkey = o_orderkey
+      JOIN customer ON o_custkey = c_custkey
+     WHERE o_custkey < 1000
+     GROUP BY c_custkey, c_mktsegment
+     ORDER BY c_custkey, c_mktsegment
+"""
+
+# CASE 2 multi: multi-key same-FACT, NON-numeric (string) keys -> the host
+# factorises the string keys into dense codes; bind_fact must NOT bind them.
+# Low-card (6 groups) -> DENSE.
+MULTI_KEY_FACT_STRING = """
+    SELECT l_returnflag, l_linestatus, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     GROUP BY l_returnflag, l_linestatus
+     ORDER BY l_returnflag, l_linestatus
+"""
+
+# CASE 2 multi: multi-key same-fact (int keys) + a dim predicate that pares the
+# joined rows so the group count stays well under the HASH capacity (the
+# declared product of NDVs is large, but actual distinct pairs after the join
+# is small -> DENSE or low-load HASH).
+MULTI_KEY_FACT_INT_WHERE_DIM = """
+    SELECT l_orderkey, l_suppkey, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     WHERE o_custkey < 500
+     GROUP BY l_orderkey, l_suppkey
+     ORDER BY l_orderkey, l_suppkey
+"""
+
+# Group keys spanning fact + a dim (full Q3 shape) -> defer (PR #37).
+MULTI_KEY_SPAN_DEFERS = """
+    SELECT l_orderkey, o_shippriority, sum(l_quantity) AS sq
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     GROUP BY l_orderkey, o_shippriority
+     ORDER BY l_orderkey, o_shippriority
+"""
+
+# Multi-key + a LEFT (outer) join -> defer (inner-only v1).
+MULTI_KEY_LEFT_DEFERS = """
+    SELECT o_custkey, o_shippriority, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      LEFT JOIN orders ON l_orderkey = o_orderkey
+     GROUP BY o_custkey, o_shippriority
+     ORDER BY o_custkey, o_shippriority
+"""
+
+
+@pytest.mark.parametrize("sql", [MULTI_KEY_DIM, MULTI_KEY_DIM_WHERE_FACT,
+                                 MULTI_KEY_DIM_WHERE_GROUPKEY_DIM,
+                                 MULTI_KEY_DIM_HIGH_CARD, MULTI_KEY_DIM_CHAIN,
+                                 MULTI_KEY_FACT_STRING,
+                                 MULTI_KEY_FACT_INT_WHERE_DIM])
+def test_join_multi_key_fires_and_matches(hcj_engine, hcj_duck, sql):
+    """A multi-key GROUP BY with all keys on the SAME table fires the fused join
+    path (per-key codes stride-combined into one int64 group code) and matches
+    DuckDB -- same-dim (CASE 3) and same-fact (CASE 2 multi)."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    agg = _agg_node(sql, hcj_engine)
+    assert fused.fused_join_aggregate(agg, hcj_engine) is not None, (
+        f"a same-table multi-key group-from-join should hit the fused join path: {sql!r}")
+    _match(hcj_engine.sql(sql), hcj_duck.execute(sql).fetchdf())
+
+
+def test_join_multi_key_span_defers_and_matches(hcj_engine, hcj_duck):
+    """Group keys spanning fact + a dim (the full Q3 shape) defer to cuDF (PR #37
+    composes them); the fallback matches DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    assert fused.fused_join_aggregate(
+        _agg_node(MULTI_KEY_SPAN_DEFERS, hcj_engine), hcj_engine) is None, (
+        "a fact+dim multi-key group-from-join should defer to cuDF (PR #37)")
+    _match(hcj_engine.sql(MULTI_KEY_SPAN_DEFERS),
+           hcj_duck.execute(MULTI_KEY_SPAN_DEFERS).fetchdf())
+
+
+def test_join_multi_key_left_defers_and_matches(hcj_engine, hcj_duck):
+    """A multi-key GROUP BY on a LEFT (outer) join defers (inner-only v1); the
+    cuDF fallback matches DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    assert fused.fused_join_aggregate(
+        _agg_node(MULTI_KEY_LEFT_DEFERS, hcj_engine), hcj_engine) is None, (
+        "a multi-key group-from-join on an outer plan should defer to cuDF")
+    _match(hcj_engine.sql(MULTI_KEY_LEFT_DEFERS),
+           hcj_duck.execute(MULTI_KEY_LEFT_DEFERS).fetchdf())
+
+
+def test_join_multi_key_dispatch_fires(hcj_engine, hcj_duck, monkeypatch):
+    """engine.sql dispatches a multi-key group-from-join to the fused path (not
+    cuDF): patch ryudb.exec.executor.fused_join_aggregate with a counter, assert
+    one call, and match DuckDB (executor-module-patching gotcha)."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    calls = {"n": 0}
+    orig = ex_mod.fused_join_aggregate
+
+    def wrap(node, engine, _o=orig):
+        r = _o(node, engine)
+        calls["n"] += 1
+        return r
+
+    monkeypatch.setattr(ex_mod, "fused_join_aggregate", wrap)
+    got = hcj_engine.sql(MULTI_KEY_DIM_WHERE_FACT)
+    assert calls["n"] == 1, "a multi-key group-from-join should dispatch once"
+    _match(got, hcj_duck.execute(MULTI_KEY_DIM_WHERE_FACT).fetchdf())
