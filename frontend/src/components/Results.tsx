@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FixedSizeList } from "react-window";
 import type { Table, Vector } from "apache-arrow";
 import type { ResultMeta } from "../lib/types";
@@ -15,6 +15,8 @@ interface Props {
 }
 
 const ROW_HEIGHT = 24;
+const DEF_COL_W = 120; // initial + reset column width
+const MIN_COL_W = 40; // floor a column can be dragged to
 type SortDir = "asc" | "desc";
 
 function formatCell(v: unknown): string {
@@ -97,13 +99,18 @@ export default function Results({ meta, table, onDownload, downloading,
   const [showFilters, setShowFilters] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [copyAllState, setCopyAllState] = useState<"idle" | "ok" | "err">("idle");
+  // Per-column pixel widths; defaults to DEF_COL_W and resets per result.
+  const [colWidths, setColWidths] = useState<number[]>([]);
 
-  // Reset sort + filter whenever a new result lands (new columns identity).
+  // Reset sort + filter + column widths whenever a new result lands (new
+  // columns identity). A different column set would leave colWidths mis-sized,
+  // so it is reset here too.
   useEffect(() => {
     setSortCol(null);
     setSortDir(null);
     setFilters([]);
     setShowFilters(false);
+    setColWidths(columns.map(() => DEF_COL_W));
   }, [columns]);
 
   // `view` is the list of source-row indices after filtering + sorting; the
@@ -179,12 +186,50 @@ export default function Results({ meta, table, onDownload, downloading,
     }
   };
 
-  // Fixed column width + a fixed inner grid width so the header, the optional
-  // filter row, and the virtualized rows lay out with the TRUE column count and
-  // stay aligned. The .grid-scroll wrapper horizontally scrolls them together.
-  const COL_W = 120;
-  const gridTemplate = `repeat(${columns.length}, ${COL_W}px)`;
-  const gridWidth = columns.length * COL_W;
+  // Per-column widths drive the header, the optional filter row, and the
+  // virtualized rows so they stay aligned and scroll together in .grid-scroll.
+  // `widths` falls back to defaults when colWidths has not yet caught up to the
+  // current column set (first render before the reset effect runs, or a result
+  // swap mid-drag).
+  const widths =
+    colWidths.length === columns.length ? colWidths : columns.map(() => DEF_COL_W);
+  const gridTemplate = widths.map((w) => `${w}px`).join(" ");
+  const gridWidth = widths.reduce((a, b) => a + b, 0);
+
+  // Column resize: a drag started on a header border updates colWidths[ci].
+  // The window listeners are installed once (mounted) and are no-ops unless a
+  // drag is in progress (dragRef set); storing the column count at drag start
+  // lets an in-flight resize bail if the result swaps underneath it.
+  const dragRef = useRef<{ ci: number; startX: number; startW: number; wsLen: number } | null>(null);
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const w = Math.max(MIN_COL_W, d.startW + (e.clientX - d.startX));
+      setColWidths((ws) => {
+        if (ws.length !== d.wsLen) return ws;
+        const next = ws.slice();
+        next[d.ci] = w;
+        return next;
+      });
+    };
+    const onUp = () => {
+      dragRef.current = null;
+      document.body.style.cursor = "";
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+  const startResize = (ci: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    dragRef.current = { ci, startX: e.clientX, startW: widths[ci], wsLen: widths.length };
+    document.body.style.cursor = "col-resize";
+  };
   const Row = ({ index, style }: { index: number; style: React.CSSProperties }) => {
     const r = view[index];
     return (
@@ -273,11 +318,17 @@ export default function Results({ meta, table, onDownload, downloading,
               <div
                 className={"grid-cell grid-head" + (active ? " sorted" : "")}
                 key={c.name}
-                title={`${c.type} — click to sort`}
+                title={`${c.type} — click to sort, drag the right edge to resize`}
                 onClick={() => cycleSort(ci)}
               >
                 <span className="col-name-h">{c.name}{arrow}</span>
                 <span className="col-type">{c.type}</span>
+                <span
+                  className="col-resize"
+                  onMouseDown={(e) => startResize(ci, e)}
+                  onClick={(e) => e.stopPropagation()}
+                  title="Drag to resize"
+                />
               </div>
             );
           })}
