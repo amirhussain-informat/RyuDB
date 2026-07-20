@@ -360,7 +360,8 @@ __global__ void build_ht_kernel(const long long *key, const long long *payload, 
 __global__ void probe_agg_kernel(Plan p, const long long **ht_key, const long long **ht_payload,
                                  const int *ht_cap, int n_joins, int first_probe_col,
                                  const int *left_per_stage,
-                                 double *acc, int *seen, int n_groups, int nagg) {
+                                 double *acc, int *seen, int n_groups, int nagg,
+                                 int group_key_col, long long group_stride) {
     extern __shared__ double sh[];
     int t = threadIdx.x;
     int nga = n_groups * nagg;
@@ -396,7 +397,21 @@ __global__ void probe_agg_kernel(Plan p, const long long **ht_key, const long lo
             key = ht_payload[j][found];  // carry payload -> next probe key
         }
         if (dropped) continue;
-        long long g = (key == HASH_EMPTY) ? 0 : key;  // sentinel -> NULL group slot 0
+        // Derive the group code: the dim-part = chain tail (the last dim's payload;
+        // 0 if an outer miss null-padded to HASH_EMPTY). When group_key_col >= 0 the
+        // group key (or its fact part) lives on the fact table -> combine the
+        // fact-row code with the dim-part tail. group_key_col=-1 (chain tail only)
+        // is the existing single-dim-key path, byte-identical. group_stride=1 with
+        // a zero last-dim payload = a fact-only key; group_stride = n_dim_combos =
+        // a multi-key spanning fact + dim (PR #35/#37).
+        long long tail = (key == HASH_EMPTY) ? 0 : key;
+        long long g;
+        if (group_key_col >= 0) {
+            long long fcode = (key == HASH_EMPTY) ? 0 : ((const long long *)p.cols[group_key_col])[i];
+            g = fcode * group_stride + tail;
+        } else {
+            g = tail;
+        }
         if (g < 0 || g >= n_groups) continue;
         for (int a = 0; a < p.nagg; a++) {
             int kind = p.agg_kind[a];
@@ -439,7 +454,8 @@ __global__ void probe_hash_agg_kernel(Plan p, const long long **ht_key, const lo
                                       const int *ht_cap, int n_joins, int first_probe_col,
                                       const int *left_per_stage,
                                       long long *gkey, double *acc, int capacity, int nagg,
-                                      int *distinct, int *overflow) {
+                                      int *distinct, int *overflow,
+                                      int group_key_col, long long group_stride) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < p.n; i += gridDim.x * blockDim.x) {
         if (!pass_pred(p, i)) continue;
         long long key = ((const long long *)p.cols[first_probe_col])[i];
@@ -468,7 +484,17 @@ __global__ void probe_hash_agg_kernel(Plan p, const long long **ht_key, const lo
             key = ht_payload[j][found];  // carry payload -> next probe key
         }
         if (dropped) continue;
-        long long g = (key == HASH_EMPTY) ? 0 : key;  // sentinel -> NULL group code 0
+        // Derive the group code (see probe_agg_kernel): dim-part = chain tail;
+        // combine a fact-row code (group_key_col >= 0) with it. group_key_col=-1 is
+        // the existing single-dim-key path, byte-identical.
+        long long tail = (key == HASH_EMPTY) ? 0 : key;
+        long long g;
+        if (group_key_col >= 0) {
+            long long fcode = (key == HASH_EMPTY) ? 0 : ((const long long *)p.cols[group_key_col])[i];
+            g = fcode * group_stride + tail;
+        } else {
+            g = tail;
+        }
         // ---- HASH insert+accumulate (verbatim copy of hash_kernel) ----
         unsigned long long hh = (unsigned long long)g;
         hh ^= hh >> 33;
@@ -809,6 +835,12 @@ py::tuple fused_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes
 //              reserves slot 0 for the NULL group)   n_rows : int (fact row count)
 //   left_per_stage : int32 (n_joins) -- 1 where stage j preserves the fact side
 //              (LEFT/RIGHT outer with the dim as null-supplying side), 0 for inner
+//   group_key_col  : int -- fact column index holding a pre-factorised int64 group
+//              code (the group key, or its fact part, lives on the fact table), or
+//              -1 to use the chain tail (group key in a reached dim -- the original
+//              single-dim-key path). group_stride multiplies the fact code; the
+//              dim-part chain tail is added: g = fcode*group_stride + tail.
+//              group_key_col=-1 (g = tail) is byte-identical to the pre-#35 kernel.
 //
 // Returns (overflow:int, n_out:int, keys:py::list[int64 arrays (1 col, the codes)],
 //          aggs:py::list[float64 arrays]). overflow!=0 -> caller falls back to cuDF.
@@ -824,7 +856,8 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
                          py::array_t<int> tok_kind, py::array_t<int> tok_col,
                          py::array_t<double> tok_lit, py::array_t<int> tok_op,
                          py::array_t<double> acc_init,
-                         int strategy, int capacity, int n_groups, int n_rows) {
+                         int strategy, int capacity, int n_groups, int n_rows,
+                         int group_key_col, long long group_stride) {
     int ncol = (int)col_ptrs.shape(0);
     int nagg = (int)agg_kind.shape(0);
     int ntok = (int)tok_kind.shape(0);
@@ -939,7 +972,8 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
         size_t shbytes = sizeof(double) * nga;
         probe_agg_kernel<<<blocks, THREADS, shbytes>>>(
             p, (const long long **)d_htkey, (const long long **)d_htpayload, d_htcap,
-            n_joins, first_probe_col, d_left, acc, seen, n_groups, nagg);
+            n_joins, first_probe_col, d_left, acc, seen, n_groups, nagg,
+            group_key_col, group_stride);
         check(cudaGetLastError(), "probe_agg_kernel launch");
         check(cudaDeviceSynchronize(), "probe sync");
 
@@ -985,7 +1019,8 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
 
         probe_hash_agg_kernel<<<blocks, THREADS>>>(
             p, (const long long **)d_htkey, (const long long **)d_htpayload, d_htcap,
-            n_joins, first_probe_col, d_left, gkey, acc, capacity, nagg, distinct, d_ovf);
+            n_joins, first_probe_col, d_left, gkey, acc, capacity, nagg, distinct, d_ovf,
+            group_key_col, group_stride);
         check(cudaGetLastError(), "probe_hash_agg_kernel launch");
         check(cudaDeviceSynchronize(), "probe hash sync");
         check(cudaMemcpy(&overflow, d_ovf, sizeof(int), cudaMemcpyDeviceToHost), "cp join hash ovf");

@@ -40,6 +40,7 @@ def hcj_dir(tmp_path_factory):
 
     lineitem = pd.DataFrame({
         "l_orderkey": rng.integers(1, n_ord + 1, size=n_li).astype(np.int64),
+        "l_suppkey": rng.integers(1, 1001, size=n_li).astype(np.int64),
         "l_quantity": rng.integers(1, 100, size=n_li).astype(np.int64),
         "l_extendedprice": (rng.integers(1, 1000, size=n_li) * 100).astype(np.int64),
     })
@@ -420,3 +421,152 @@ def test_join_where_dispatch_fires(hcj_engine, hcj_duck, monkeypatch):
     got = hcj_engine.sql(WHERE_FACT_AND_DIM_LAST)
     assert calls["n"] == 1, "a WHERE-bearing join should dispatch to the fused path once"
     _match(got, hcj_duck.execute(WHERE_FACT_AND_DIM_LAST).fetchdf())
+
+
+# =========================================================================== #
+# PR #35: group-key-in-fact on the fused join path. The single GROUP BY key
+# lives on the streamed FACT table (not a reached dim). The kernel reads the
+# group code from a fact column (group_key_col) instead of the chain tail: the
+# fact key is factorised on the host into dense 0..n-1 codes, bound as a NEW fact
+# col (NOT the raw key -- the kernel reads cols[group_key_col][i] as the dense
+# code, g = fcode*stride + tail), and the last dim's payload is a ZERO array so
+# tail=0 -> g = fcode (stride=1). This is CASE 2 of the unified group_key_col /
+# group_stride kernel mechanism; the existing chain-tail path (CASE 1,
+# group_key_col=-1) is byte-identical. Outer plans with the group key on the
+# fact still defer (inner-only v1).
+# =========================================================================== #
+
+# Group key on the fact AND it is the join key (l_orderkey), no WHERE. Every
+# lineitem row matches orders, so the join does not filter; the group is the
+# raw l_orderkey factorised on the fact.
+FACT_KEY_NO_WHERE = """
+    SELECT l_orderkey, sum(l_quantity) AS sq, sum(l_extendedprice) AS rev,
+           count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     GROUP BY l_orderkey
+     ORDER BY l_orderkey
+"""
+
+# Group key on the fact, join kept by a DIM predicate (o_custkey < 500 on
+# orders) -- the headline: a fact-key group-by that previously deferred because
+# the group key was not a reached dim.
+FACT_KEY_WHERE_DIM = """
+    SELECT l_orderkey, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     WHERE o_custkey < 500
+     GROUP BY l_orderkey
+     ORDER BY l_orderkey
+"""
+
+# Group key on the fact + a FACT predicate (l_quantity < 50 -> pass_pred).
+FACT_KEY_WHERE_FACT = """
+    SELECT l_orderkey, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     WHERE l_quantity < 50
+     GROUP BY l_orderkey
+     ORDER BY l_orderkey
+"""
+
+# Group key on the fact + both a fact and a dim predicate.
+FACT_KEY_WHERE_FACT_AND_DIM = """
+    SELECT l_orderkey, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     WHERE l_quantity < 50 AND o_custkey < 500
+     GROUP BY l_orderkey
+     ORDER BY l_orderkey
+"""
+
+# Group key on the fact that is NOT the join key (l_suppkey) -- exercises the
+# separate group_key_col binding (the probe key l_orderkey is distinct from
+# the group key l_suppkey). No WHERE.
+FACT_KEY_NON_JOIN_KEY = """
+    SELECT l_suppkey, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     GROUP BY l_suppkey
+     ORDER BY l_suppkey
+"""
+
+# Group key on the fact (non-join key) + a fact and a dim predicate.
+FACT_KEY_NON_JOIN_KEY_WHERE = """
+    SELECT l_suppkey, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     WHERE l_quantity < 50 AND o_custkey < 500
+     GROUP BY l_suppkey
+     ORDER BY l_suppkey
+"""
+
+# Group key on the fact over a MULTI-STAGE chain (lineitem -> orders ->
+# customer); the path is the FULL chain (no group-key dim). A predicate on the
+# middle dim (orders) keeps the join.
+FACT_KEY_CHAIN_WHERE_MIDDLE = """
+    SELECT l_orderkey, sum(l_extendedprice) AS rev, count(*) AS n
+      FROM lineitem
+      JOIN orders   ON l_orderkey = o_orderkey
+      JOIN customer ON o_custkey = c_custkey
+     WHERE o_custkey < 1000
+     GROUP BY l_orderkey
+     ORDER BY l_orderkey
+"""
+
+# LEFT join + group key on the fact -> defer (group-key-on-fact outer is
+# inner-only v1; a LEFT miss should still group by the fact key, subtler).
+FACT_KEY_LEFT_DEFERS = """
+    SELECT l_orderkey, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      LEFT JOIN orders ON l_orderkey = o_orderkey
+     GROUP BY l_orderkey
+     ORDER BY l_orderkey
+"""
+
+
+@pytest.mark.parametrize("sql", [FACT_KEY_NO_WHERE, FACT_KEY_WHERE_DIM,
+                                 FACT_KEY_WHERE_FACT, FACT_KEY_WHERE_FACT_AND_DIM,
+                                 FACT_KEY_NON_JOIN_KEY, FACT_KEY_NON_JOIN_KEY_WHERE,
+                                 FACT_KEY_CHAIN_WHERE_MIDDLE])
+def test_join_fact_key_fires_and_matches(hcj_engine, hcj_duck, sql):
+    """A GROUP BY a fact-table column fires the fused join path (the group code
+    read from a fact column, not the chain tail) and matches DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    agg = _agg_node(sql, hcj_engine)
+    assert fused.fused_join_aggregate(agg, hcj_engine) is not None, (
+        f"a fact-key group-from-join should hit the fused join path: {sql!r}")
+    _match(hcj_engine.sql(sql), hcj_duck.execute(sql).fetchdf())
+
+
+def test_join_fact_key_left_defers_and_matches(hcj_engine, hcj_duck):
+    """A LEFT (outer) join with the group key on the fact defers (inner-only v1);
+    the cuDF fallback matches DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    assert fused.fused_join_aggregate(
+        _agg_node(FACT_KEY_LEFT_DEFERS, hcj_engine), hcj_engine) is None, (
+        "a fact-key group-from-join on an outer plan should defer to cuDF")
+    _match(hcj_engine.sql(FACT_KEY_LEFT_DEFERS),
+           hcj_duck.execute(FACT_KEY_LEFT_DEFERS).fetchdf())
+
+
+def test_join_fact_key_dispatch_fires(hcj_engine, hcj_duck, monkeypatch):
+    """engine.sql dispatches a fact-key group-from-join to the fused path (not
+    cuDF): patch ryudb.exec.executor.fused_join_aggregate with a counter, assert
+    one call, and match DuckDB (executor-module-patching gotcha)."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    calls = {"n": 0}
+    orig = ex_mod.fused_join_aggregate
+
+    def wrap(node, engine, _o=orig):
+        r = _o(node, engine)
+        calls["n"] += 1
+        return r
+
+    monkeypatch.setattr(ex_mod, "fused_join_aggregate", wrap)
+    got = hcj_engine.sql(FACT_KEY_WHERE_FACT_AND_DIM)
+    assert calls["n"] == 1, "a fact-key group-from-join should dispatch once"
+    _match(got, hcj_duck.execute(FACT_KEY_WHERE_FACT_AND_DIM).fetchdf())
