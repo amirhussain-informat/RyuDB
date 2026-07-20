@@ -104,10 +104,11 @@ button.primary:hover:not(:disabled) { background: #6dd1ff; }
 .results-meta .dur { margin-left: auto; }
 .dl-group { display: flex; gap: 4px; }
 button.dl { padding: 2px 8px; font-size: 11px; }
-.grid-header, .grid-row {
-  display: grid; grid-template-columns: repeat(var(--cols, 4), minmax(120px, 1fr));
-}
-.grid-header { grid-template-columns: repeat(var(--n, 4), minmax(120px, 1fr)); }
+/* Header + virtualized rows share this horizontal-scroll wrapper so wide
+ * tables (e.g. SELECT *) scroll in sync; the column template + fixed inner
+ * width are set inline by Results.tsx so the true column count is used. */
+.grid-scroll { overflow-x: auto; overflow-y: hidden; }
+.grid-header, .grid-row { display: grid; }
 .grid-row { border-bottom: 1px solid var(--border); }
 .grid-cell {
   padding: 3px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
