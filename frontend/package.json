@@ -1,0 +1,31 @@
+{
+  "name": "ryudb-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Snowsight-like worksheet UI for ryudb-server (React + TypeScript + Vite + Monaco + Apache Arrow).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "smoke": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "^4.6.0",
+    "apache-arrow": "^17.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-window": "^1.8.11"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@types/react-window": "^1.8.8",
+    "@vitejs/plugin-react": "^4.3.1",
+    "monaco-editor": "^0.50.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0",
+    "ws": "^8.18.0"
+  }
+}
