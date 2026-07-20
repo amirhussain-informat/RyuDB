@@ -42,8 +42,17 @@ export default function Results({ meta, table, onDownload, downloading,
     return columns.map((c) => table.getChild(c.name)?.toArray() ?? []);
   }, [table, columns]);
 
+  // Fixed column width + a fixed inner grid width so the header and the
+  // virtualized rows lay out with the TRUE column count and stay aligned.
+  // The .grid-row CSS rule otherwise falls back to a hardcoded 4 columns via
+  // an unset `--cols` var, which garbles wide results like SELECT *. The
+  // outer .grid-scroll wrapper horizontally scrolls header + rows together
+  // when the table is wider than the pane.
+  const COL_W = 120;
+  const gridTemplate = `repeat(${columns.length}, ${COL_W}px)`;
+  const gridWidth = columns.length * COL_W;
   const Row = ({ index, style }: { index: number; style: React.CSSProperties }) => (
-    <div className="grid-row" style={style}>
+    <div className="grid-row" style={{ ...style, gridTemplateColumns: gridTemplate }}>
       {colArrays.map((arr, ci) => (
         <div className="grid-cell" key={ci} title={formatCell(arr[index])}>
           {formatCell(arr[index])}
@@ -76,26 +85,28 @@ export default function Results({ meta, table, onDownload, downloading,
           </button>
         </span>
       </div>
-      <div className="grid-header" style={{ gridTemplateColumns: `repeat(${columns.length}, minmax(120px, 1fr))` }}>
-        {columns.map((c) => (
-          <div className="grid-cell grid-head" key={c.name} title={c.type}>
-            {c.name}
-            <span className="col-type">{c.type}</span>
-          </div>
-        ))}
+      <div className="grid-scroll">
+        <div className="grid-header" style={{ gridTemplateColumns: gridTemplate, width: gridWidth }}>
+          {columns.map((c) => (
+            <div className="grid-cell grid-head" key={c.name} title={c.type}>
+              {c.name}
+              <span className="col-type">{c.type}</span>
+            </div>
+          ))}
+        </div>
+        {table && meta.returned > 0 ? (
+          <FixedSizeList
+            height={Math.min(600, meta.returned * ROW_HEIGHT)}
+            itemCount={meta.returned}
+            itemSize={ROW_HEIGHT}
+            width={gridWidth}
+          >
+            {Row}
+          </FixedSizeList>
+        ) : (
+          <div className="empty">No rows.</div>
+        )}
       </div>
-      {table && meta.returned > 0 ? (
-        <FixedSizeList
-          height={Math.min(600, meta.returned * ROW_HEIGHT)}
-          itemCount={meta.returned}
-          itemSize={ROW_HEIGHT}
-          width="100%"
-        >
-          {Row}
-        </FixedSizeList>
-      ) : (
-        <div className="empty">No rows.</div>
-      )}
     </div>
   );
 }
