@@ -78,11 +78,21 @@ class Server:
         self._pending.get(id(ws), {}).pop(str(rid), None)
 
     def cancel_pending(self, ws, targets: list[str]) -> tuple[list[str], list[str]]:
-        """Set the cancel flag for each target still pending on this connection.
-        Returns (cancelled, not_found). A target not found has already started
-        (in-flight), already completed, or never existed — all indistinguishable
-        here, which is honest: the original request's own response tells the
-        client whether it was dropped (``cancelled``) or ran to completion."""
+        """Set the cancel flag for each target on this connection. Returns
+        (cancelled, not_found). A request stays registered in ``_pending`` from
+        submit until it completes, so a still-pending request AND an in-flight
+        request are both found here and both get their flag set:
+
+        - pending (not started): the worker drops it on dequeue -> ``cancelled``.
+        - in-flight (running): the engine raises ``CancelledByUser`` at the next
+          plan-node boundary -> ``cancelled`` (unless it already passed its last
+          node and finished, in which case it resolves normally — the inherent
+          race of cooperative cancel).
+
+        A target not found has already completed or never existed —
+        indistinguishable here, which is honest: the original request's own
+        response tells the client whether it was dropped (``cancelled``) or ran
+        to completion."""
         pending = self._pending.get(id(ws), {})
         cancelled, not_found = [], []
         for t in targets:
@@ -115,7 +125,10 @@ class Server:
             self._srv = srv
             log.info("ryudb-server listening on ws://%s:%d (data=%s)",
                      self.host, self.port, self.data_dir)
-            log.info("single logical session; in-flight queries are not cancellable")
+            log.info("single logical session; cancel drops pending requests and "
+                     "raises CancelledByUser at the next node boundary of an "
+                     "in-flight request (a single long cuDF call is not mid-call "
+                     "interruptible)")
             await asyncio.Future()  # run forever
 
     def stop(self) -> None:
@@ -163,9 +176,13 @@ class Server:
         except Exception as exc:  # noqa: BLE001 -- never let a handler fault kill the server
             log.exception("connection handler fault: %s", exc)
         finally:
-            # drop any still-pending requests for this connection, and cancel the
-            # in-flight handler tasks (the engine call itself runs to completion —
-            # v1 has no engine cancel hook — its result is simply discarded).
+            # Set every still-registered cancel event for this connection. This
+            # drops pending requests (worker dequeues them set) AND raises
+            # CancelledByUser at the next node boundary of an in-flight request
+            # (it is still in _pending until it completes). Then cancel the
+            # handler tasks (the await fut) so a disconnect aborts promptly; if
+            # the engine is mid-node it finishes that node first — the one
+            # remaining limit of cooperative cancel.
             for ev in self._pending.pop(conn_id, {}).values():
                 ev.set()
             for task in self._tasks.pop(conn_id, set()):

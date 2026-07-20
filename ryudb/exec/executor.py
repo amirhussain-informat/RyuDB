@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import threading
 
 import cudf
 import pandas as pd
@@ -54,6 +55,23 @@ from .fused import (
     fused_scan_aggregate,
 )
 from .ops import _literal, eval_expr
+
+
+class CancelledByUser(Exception):
+    """Raised mid-query when the running request's cancel event was set.
+
+    Cooperative cancellation: the server's worker sets ``engine.cancel_event``
+    to the in-flight request's ``threading.Event`` before running it, and the
+    executor checks that event at each plan-node boundary (the top of ``_exec``).
+    A request cancelled while still pending in the worker queue is dropped before
+    it starts (the worker checks the same event on dequeue) and never reaches the
+    engine, so this exception is only raised for a request that had already
+    started. A single long cuDF call (a big groupby, a cold parquet read) is NOT
+    interruptible mid-call — cancel fires at the next node boundary. That is the
+    one remaining limit of v1 cooperative cancel; full preemption would need
+    subprocess isolation.
+    """
+
 
 _AGG_METHOD = {
     "SUM": "sum",
@@ -122,6 +140,12 @@ class Engine:
 
     def __init__(self, catalog: Catalog):
         self.catalog = catalog
+        # Cooperative in-flight cancel: set by the server worker to the running
+        # request's threading.Event for the duration of a query, None otherwise.
+        # Checked at each plan-node boundary in _exec -> raises CancelledByUser.
+        # The Engine is single-threaded (only the worker thread calls it), so
+        # this attribute needs no lock; Event.is_set() is itself thread-safe.
+        self.cancel_event: threading.Event | None = None
         # GPU-resident scan cache: (table, frozenset(columns)) -> coerced cuDF
         # frame. Warm (repeated) queries skip the Parquet read + decimal coercion.
         # The cached frame is returned directly (no copy): the fused kernel path
@@ -1485,6 +1509,12 @@ class Engine:
         return self._exec(plan)
 
     def _exec(self, node: PlanNode) -> "cudf.DataFrame | int | None":
+        # Cooperative in-flight cancel: check the running request's event at each
+        # node boundary. is_set() is a cheap bool read; the None check skips the
+        # event lookup entirely for non-server (CLI/in-process) callers.
+        ev = self.cancel_event
+        if ev is not None and ev.is_set():
+            raise CancelledByUser()
         if isinstance(node, Scan):
             return self._scan(node.table, node.columns)
         if isinstance(node, Derived):

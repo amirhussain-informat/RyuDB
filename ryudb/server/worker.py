@@ -8,13 +8,15 @@ dedicated thread owns the ``Engine`` (and the ``Catalog`` — the engine reads i
 mid-query, so catalog mutations must serialize with queries too) and pulls work
 items from a FIFO queue one at a time.
 
-It also implements *pending* request cancellation. ``ThreadPoolExecutor`` does
-not expose its internal queue, so a hand-rolled worker is used instead: each
-submitted item carries a ``threading.Event`` cancel flag; the worker checks it
-*before* starting the call and drops the item if set. A request already in
-flight cannot be interrupted (the engine has no cancel hook) — that is a
-documented Phase 1 limitation; the cancel flag is a no-op for it and the
-request runs to completion, resolving normally.
+It also implements cancellation. ``ThreadPoolExecutor`` does not expose its
+internal queue, so a hand-rolled worker is used instead: each submitted item
+carries a ``threading.Event`` cancel flag. The worker checks it *before*
+starting the call and drops the item if set (pending cancel). For a request
+already in flight, the same event is published to ``engine.cancel_event`` for
+the duration of the call, so the executor raises ``CancelledByUser`` at the
+next plan-node boundary (cooperative in-flight cancel). A single long cuDF
+call (a big groupby, a cold parquet read) is still not interruptible mid-call —
+cancel fires at the next node boundary; that is the one remaining limit.
 
 Results/exceptions are delivered back to the asyncio loop with
 ``loop.call_soon_threadsafe`` (an asyncio.Future may only be resolved on the
@@ -73,12 +75,21 @@ class EngineWorker:
             if cancel.is_set():
                 loop.call_soon_threadsafe(self._resolve_cancelled, fut)
                 continue
+            # Expose this request's cancel event to the engine for the duration
+            # of the call so a cooperative in-flight cancel (set by ``cancel``
+            # while the request runs) raises ``CancelledByUser`` at the next
+            # plan-node boundary. Cleared afterwards so a non-server caller
+            # (CLI / in-process) sees no stale event. The engine is single-thread
+            # (only this thread calls it), so the assignment needs no lock.
+            self.engine.cancel_event = cancel
             try:
                 result = fn(*args)
             except BaseException as exc:  # noqa: BLE001 -- surface every fault
                 loop.call_soon_threadsafe(self._resolve_exc, fut, exc)
             else:
                 loop.call_soon_threadsafe(self._resolve_ok, fut, result)
+            finally:
+                self.engine.cancel_event = None
 
     # --- future resolution (run on the loop thread) ---
     @staticmethod

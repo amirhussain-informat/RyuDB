@@ -77,5 +77,7 @@ parse error with position — the same wire path the browser uses.
   dev/build needs internet at runtime). Bundling `monaco-editor` locally is a
   later option.
 - The server is single-logical-session (transaction state is shared across
-  connections) and `Cancel` drops only pending requests — see the server's
+  connections). `Cancel` drops pending requests and raises `CancelledByUser` at
+  the next plan-node boundary of a running request — a single long cuDF call
+  (a big groupby, a cold read) is not interruptible mid-call. See the server's
   `PROTOCOL.md` limits.
