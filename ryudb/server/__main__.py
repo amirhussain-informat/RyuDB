@@ -47,6 +47,14 @@ def main(argv: list[str] | None = None) -> int:
                     default=int(_env("RYUDB_MAX_ROWS", "200000")),
                     help="max rows returned per SELECT over WebSocket (full result "
                          "available via export); default 200000")
+    ap.add_argument("--workers", type=int,
+                    default=int(_env("RYUDB_WORKERS", "1")),
+                    help="engine worker pool size. 1 (default) preserves the "
+                         "original single-worker semantics; N>1 lets SELECTs run "
+                         "concurrently (writes/admin ops still serialize via the "
+                         "engine's read/write lock). Each concurrent query holds "
+                         "GPU memory, so lower this (toward 1) for very large "
+                         "queries to avoid GPU OOM.")
     ap.add_argument("--log-level", default=_env("RYUDB_LOG_LEVEL", "info"),
                     choices=["debug", "info", "warning", "error"],
                     help="log level; default info")
@@ -57,7 +65,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
-    server = Server(args.data, args.host, args.port, args.max_rows)
+    server = Server(args.data, args.host, args.port, args.max_rows,
+                    n_workers=args.workers)
     coros = [server.serve()]
     if args.pg_port:
         pg = PGServer(server, args.host, args.pg_port, args.pg_max_rows)

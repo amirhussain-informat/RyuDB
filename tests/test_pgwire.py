@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import struct
 import threading
+import time
 from typing import Any
 
 import cudf
@@ -608,13 +609,20 @@ def test_cancel_request_aborts_inflight(pg):
     """A CancelRequest on a SEPARATE connection carries the target's
     (pid, secret) (from the BackendKeyData we emit at startup) and sets the
     target session's in-flight cancel Event. We block the worker INSIDE the
-    first scan of conn A's query, send the CancelRequest on conn B, confirm the
-    Event is set, then release the scan -> the next plan-node boundary (the
-    join's right-input _exec) raises CancelledByUser -> conn A gets an
-    ErrorResponse 57014 + ReadyForQuery (the cooperative cancel from PR #58,
-    now reachable over the PG wire via CancelRequest)."""
+    first scan of conn A's query; the scan self-releases once it observes the
+    cancel Event set (the CancelRequest is sent on conn B), then the next
+    plan-node boundary (the join's right-input _exec) raises CancelledByUser ->
+    conn A gets an ErrorResponse 57014 + ReadyForQuery (the cooperative cancel
+    from PR #58, now reachable over the PG wire via CancelRequest).
+
+    ``engine.cancel_event`` is a per-thread slot (threading.local) under the
+    worker pool, so the cancel-confirmation poll must run on the SAME worker
+    thread that owns conn A's request -- i.e. inside ``blocking_scan`` -- not on
+    the asyncio loop thread (which would see a different, empty slot). The scan
+    reads ``engine.cancel_event`` (its own thread's slot = the request's Event)
+    and returns once ``cancel_backend`` sets it; the next _exec boundary then
+    sees the set Event and raises. No external ``hold`` is needed."""
     port, server, ref = pg
-    hold = threading.Event()
     started = threading.Event()
     orig = server.engine._scan  # bound method (class _scan bound to the instance)
     first = [True]
@@ -625,7 +633,20 @@ def test_cancel_request_aborts_inflight(pg):
         if first[0]:
             first[0] = False
             started.set()
-            hold.wait(5)  # hold the worker mid-query until the test releases it
+            # Hold inside the first scan until the CancelRequest sets this
+            # request's cancel Event. cancel_backend runs on the loop thread;
+            # engine.cancel_event is a per-thread slot and this scan runs on the
+            # SAME worker thread that owns the request, so reading it here sees
+            # the request's Event. Then return -> the next _exec boundary (the
+            # join's right scan) sees the set Event and raises CancelledByUser
+            # -> ErrorResponse 57014.
+            for _ in range(500):  # ~5s
+                ev = server.engine.cancel_event
+                if ev is not None and ev.is_set():
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("cancel Event never set within 5s")
         return orig(table, columns)
 
     server.engine._scan = blocking_scan
@@ -641,8 +662,9 @@ def test_cancel_request_aborts_inflight(pg):
             assert pid is not None and secret is not None, "no BackendKeyData"
 
             # Self-join on lineitem: two scans. Plan Limit -> Project -> Join ->
-            # Scan(a), Scan(b). The first scan blocks; after release the join's
-            # right-input _exec hits the cancel check and raises CancelledByUser.
+            # Scan(a), Scan(b). The first scan blocks (self-releasing on cancel);
+            # after release the join's right-input _exec hits the cancel check and
+            # raises CancelledByUser.
             qsql = (b"SELECT a.l_orderkey FROM lineitem a JOIN lineitem b "
                     b"ON a.l_orderkey = b.l_orderkey LIMIT 5")
             wa.write(_fmsg(b"Q", qsql + b"\x00"))
@@ -650,7 +672,8 @@ def test_cancel_request_aborts_inflight(pg):
             qtask = asyncio.create_task(_drain_until_ready(ra))
 
             # Wait for the worker to reach the blocking scan (conn A's request is
-            # now in flight; engine.cancel_event is the per-request Event).
+            # now in flight; its cancel Event is published to the worker's
+            # per-thread slot).
             for _ in range(500):
                 if started.is_set():
                     break
@@ -659,28 +682,17 @@ def test_cancel_request_aborts_inflight(pg):
 
             # conn B: a short-lived CancelRequest connection. It sends ONLY the
             # CancelRequest startup message (version 80877102 + pid + secret) and
-            # closes; the server sets conn A's cancel Event and closes conn B.
+            # closes; the server sets conn A's cancel Event (cancel_backend) and
+            # closes conn B. blocking_scan on conn A's worker observes the set
+            # Event and returns -> the next node boundary raises CancelledByUser.
             rb, wb = await asyncio.open_connection("127.0.0.1", port)
             body = struct.pack(">I", CANCEL_REQUEST) + struct.pack(">II", pid, secret)
             wb.write(struct.pack(">I", len(body) + 4) + body)
             await wb.drain()
-
-            # Deterministically confirm the CancelRequest reached the target
-            # (cancel_backend set conn A's Event = engine.cancel_event) BEFORE
-            # releasing the blocked scan, so the next node boundary sees it.
-            ev = None
-            for _ in range(500):
-                ev = server.engine.cancel_event
-                if ev is not None and ev.is_set():
-                    break
-                await asyncio.sleep(0.01)
-            assert ev is not None and ev.is_set(), "CancelRequest did not set the cancel Event"
             wb.close()
             await wb.wait_closed()
 
-            # Release the blocked scan -> the join's right-input _exec checks the
-            # (now set) cancel Event and raises CancelledByUser -> 57014.
-            hold.set()
+            # conn A's query resolves with ErrorResponse 57014 + ReadyForQuery.
             status, qmsgs = await asyncio.wait_for(qtask, timeout=5)
             err = None
             for t, p in qmsgs:
@@ -694,7 +706,6 @@ def test_cancel_request_aborts_inflight(pg):
 
         _run(client())
     finally:
-        hold.set()  # never leave the worker blocked if the test errored
         server.engine._scan = orig
 
 

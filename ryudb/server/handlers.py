@@ -190,8 +190,9 @@ async def _op_explain(req, ws, server) -> None:
     sql = _require(req, "sql", str)
 
     def build():
-        plan = build_plan(sql, server.catalog)
-        return plan_tree(plan, server.catalog.stats_dict())
+        with server.engine.read_locked():
+            plan = build_plan(sql, server.catalog)
+            return plan_tree(plan, server.catalog.stats_dict())
 
     ok, tree, _ = await _cancellable(server, ws, rid, build)
     if not ok:
@@ -203,10 +204,11 @@ async def _op_catalog(req, ws, server) -> None:
     rid = req.get("id")
 
     def build():
-        schema = server.catalog.schema_dict()
-        stats = server.catalog.stats_dict()
-        return [{"name": t, "row_count": stats.get(t, 0), "columns": list(schema[t])}
-                for t in schema]
+        with server.engine.read_locked():
+            schema = server.catalog.schema_dict()
+            stats = server.catalog.stats_dict()
+            return [{"name": t, "row_count": stats.get(t, 0), "columns": list(schema[t])}
+                    for t in schema]
 
     ok, tables, _ = await _cancellable(server, ws, rid, build)
     if not ok:
@@ -219,17 +221,18 @@ async def _op_table(req, ws, server) -> None:
     name = _require(req, "name", str)
 
     def build():
-        info = server.catalog.get(name)  # KeyError -> runtime error frame
-        return {
-            "name": info.name,
-            "columns": [{"name": c,
-                         "type": str(info.types.get(c)),
-                         "nullable": c not in info.constraints.not_null}
-                        for c in info.columns],
-            "constraints": info.constraints.to_dict(),
-            "paths": list(info.paths),
-            "row_count": info.row_count,
-        }
+        with server.engine.read_locked():
+            info = server.catalog.get(name)  # KeyError -> runtime error frame
+            return {
+                "name": info.name,
+                "columns": [{"name": c,
+                             "type": str(info.types.get(c)),
+                             "nullable": c not in info.constraints.not_null}
+                            for c in info.columns],
+                "constraints": info.constraints.to_dict(),
+                "paths": list(info.paths),
+                "row_count": info.row_count,
+            }
 
     ok, info, _ = await _cancellable(server, ws, rid, build)
     if not ok:
@@ -283,57 +286,64 @@ async def _op_admin(req, ws, server) -> None:
 
 
 def _run_admin(server, action: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Execute an admin action against the catalog/engine. Runs on the worker
-    thread (serializes with queries). Raises on bad action/args (-> error frame)."""
-    cat = server.catalog
-    eng = server.engine
-    if action == "register":
-        return {"registered": cat.register(_arg(args, "table", str),
-                                           _arg(args, "path", str)).name}
-    if action == "drop":
-        cat.drop_table(_arg(args, "table", str))
-        return {"dropped": True}
-    if action == "rename":
-        cat.rename_table(_arg(args, "old", str), _arg(args, "new", str))
-        return {"renamed": True}
-    if action == "alter":
-        return _run_alter(cat, args)
-    if action == "checkpoint":
-        # Checkpoint folds the committed delta into the base and clears the
-        # delta; base rows are snapshot-agnostic (_ins_ts=0), so a live txn
-        # whose snapshot predates the checkpointed commits would suddenly see
-        # them. Refuse while any connection has an open txn.
-        if server.has_open_txn():
-            raise RuntimeError("cannot checkpoint while a transaction is open "
-                               "(COMMIT/ROLLBACK on all connections first)")
-        return {"tables": eng.checkpoint()}
-    if action == "snapshot":
-        eng.snapshot(_arg(args, "name", str))
-        return {"snapshot": True}
-    if action == "restore":
-        # Restore rewinds the global commit counter and discards delta tail;
-        # a live txn's snapshot would be invalidated. Refuse while any txn is
-        # open (the engine's own _txn check can't see other connections' txns
-        # in the server, where _txn is a transient per-request pointer).
-        if server.has_open_txn():
-            raise RuntimeError("cannot restore while a transaction is open "
-                               "(COMMIT/ROLLBACK on all connections first)")
-        if "name" in args:
-            eng.restore(_arg(args, "name", str))
-            return {"restored": True}
-        ts = args.get("ts")
-        if not isinstance(ts, int):
-            raise ProtocolError("restore requires 'name' or int 'ts'")
-        eng.restore_to(ts)
-        return {"restored_to": ts}
-    if action == "clear_cache":
-        which = args.get("which", "both")
-        if which in ("scan", "both"):
-            eng.clear_scan_cache()
-        if which in ("code", "both"):
-            eng.clear_code_cache()
-        return {"cleared": which}
-    raise ProtocolError(f"unknown admin action {action!r}")
+    """Execute an admin action against the catalog/engine. Runs on a worker
+    thread under the engine's exclusive write lock (every admin op mutates
+    shared state -- catalog register/drop/rename/alter, engine checkpoint/
+    snapshot/restore, or the caches -- so it must serialize against reads and
+    other writes). Raises on bad action/args (-> error frame)."""
+    with server.engine.write_locked():
+        cat = server.catalog
+        eng = server.engine
+        if action == "register":
+            return {"registered": cat.register(_arg(args, "table", str),
+                                               _arg(args, "path", str)).name}
+        if action == "drop":
+            cat.drop_table(_arg(args, "table", str))
+            return {"dropped": True}
+        if action == "rename":
+            cat.rename_table(_arg(args, "old", str), _arg(args, "new", str))
+            return {"renamed": True}
+        if action == "alter":
+            return _run_alter(cat, args)
+        if action == "checkpoint":
+            # Checkpoint folds the committed delta into the base and clears the
+            # delta; base rows are snapshot-agnostic (_ins_ts=0), so a live txn
+            # whose snapshot predates the checkpointed commits would suddenly see
+            # them. Refuse while any connection has an open txn. The write lock
+            # also waits for any in-flight SELECTs to finish before rewriting
+            # the base + clearing the delta, so a concurrent read never sees a
+            # half-checkpointed state.
+            if server.has_open_txn():
+                raise RuntimeError("cannot checkpoint while a transaction is open "
+                                   "(COMMIT/ROLLBACK on all connections first)")
+            return {"tables": eng.checkpoint()}
+        if action == "snapshot":
+            eng.snapshot(_arg(args, "name", str))
+            return {"snapshot": True}
+        if action == "restore":
+            # Restore rewinds the global commit counter and discards delta tail;
+            # a live txn's snapshot would be invalidated. Refuse while any txn is
+            # open (the engine's own _txn check can't see other connections' txns
+            # in the server, where _txn is a per-thread, per-request pointer).
+            if server.has_open_txn():
+                raise RuntimeError("cannot restore while a transaction is open "
+                                   "(COMMIT/ROLLBACK on all connections first)")
+            if "name" in args:
+                eng.restore(_arg(args, "name", str))
+                return {"restored": True}
+            ts = args.get("ts")
+            if not isinstance(ts, int):
+                raise ProtocolError("restore requires 'name' or int 'ts'")
+            eng.restore_to(ts)
+            return {"restored_to": ts}
+        if action == "clear_cache":
+            which = args.get("which", "both")
+            if which in ("scan", "both"):
+                eng.clear_scan_cache()
+            if which in ("code", "both"):
+                eng.clear_code_cache()
+            return {"cleared": which}
+        raise ProtocolError(f"unknown admin action {action!r}")
 
 
 def _run_alter(cat, args: dict[str, Any]) -> dict[str, Any]:
