@@ -179,6 +179,8 @@ export interface HistoryEntry {
   duration_ms: number;
   rows: number;
   kind: string;
+  /** Wall-clock epoch seconds when the entry was recorded (session timestamp). */
+  ts?: number;
 }
 export interface HistoryResp {
   id: RequestId;

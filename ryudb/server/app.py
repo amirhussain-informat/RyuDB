@@ -35,6 +35,7 @@ import asyncio
 import collections
 import logging
 import threading
+import time
 import uuid
 from typing import Any, Callable
 
@@ -232,6 +233,10 @@ class Server:
         self._history.append({
             "id": rid, "sql": sql, "duration_ms": round(duration_ms, 3),
             "rows": rows, "kind": kind,
+            # wall-clock epoch seconds when the entry was recorded, so the UI can
+            # show when each query ran and order/filter by time. The ring buffer
+            # is process-local and not persisted, so this is a session timestamp.
+            "ts": time.time(),
         })
 
     @property

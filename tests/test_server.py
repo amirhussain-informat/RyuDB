@@ -996,6 +996,9 @@ def test_history_records_invocations(srv):
     r = _run(client())
     assert r["op"] == "history"
     assert any(e["sql"].startswith("SELECT count(*)") for e in r["entries"])
+    # every entry carries a wall-clock ts (epoch seconds) for the UI timeline
+    assert all(isinstance(e.get("ts"), (int, float)) for e in r["entries"]), r["entries"]
+    assert any(e["kind"] == "select" for e in r["entries"])
 
 
 # --------------------------------------------------------------------------- #

@@ -228,6 +228,20 @@ button.primary:hover:not(:disabled) { background: #6dd1ff; }
 .history-list li:hover { background: var(--bg-3); }
 .hist-sql { font-family: monospace; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hist-meta { display: flex; gap: 10px; color: var(--fg-dim); font-size: 10px; margin-top: 2px; }
+.hist-ts { font-size: 10px; color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.hist-kind { font-weight: 600; }
+.hist-kind.k-select, .hist-kind.k-export { color: var(--ok); }
+.hist-kind.k-write { color: var(--err); }
+.hist-kind.k-cancelled { color: var(--fg-dim); }
+.hist-controls { display: flex; gap: 4px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.hist-controls select, .hist-controls .hist-filter {
+  background: var(--bg); border: 1px solid var(--border); color: var(--fg);
+  border-radius: 4px; padding: 3px 6px; font-size: 11px;
+}
+.hist-controls .hist-filter { flex: 1; min-width: 0; }
+.hist-controls select { cursor: pointer; }
+.hist-controls select:focus, .hist-controls .hist-filter:focus { border-color: var(--accent); outline: none; }
+.hist-count { padding: 4px 10px; color: var(--fg-dim); font-size: 10px; border-bottom: 1px solid var(--border); }
 
 /* results grid */
 .results-meta { display: flex; gap: 12px; align-items: center; color: var(--fg-dim); margin-bottom: 6px; }
