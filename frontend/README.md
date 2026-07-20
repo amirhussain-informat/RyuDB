@@ -91,6 +91,10 @@ parse error with position — the same wire path the browser uses.
   explain / cancel, connect / disconnect, new / close / switch worksheet,
   toggle theme, open a sidebar, show shortcuts. `?` opens a keyboard-shortcuts
   help modal.
+- A **global object search** (`Ctrl/Cmd+Shift+F`) reaches across the whole
+  catalog + query history in one place: type to fuzzy-filter tables, columns,
+  and past queries; pick a table/column to drop it into the editor at the
+  cursor, or pick a history entry to load its SQL into the active worksheet.
 - Monaco is bundled locally from the `monaco-editor` package (a SQL-only subset:
   the editor API + editor contributions + the SQL tokenizer, wired in
   `src/monaco.ts`), so the worksheet works fully offline — no CDN fetch at
