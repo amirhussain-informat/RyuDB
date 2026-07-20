@@ -152,12 +152,14 @@ governance/masking, billing/budgets, replication.
 - **Mid-call cancel preemption** — a single long cuDF call is not mid-call
   interruptible (would need subprocess isolation).
 - **Fused-join perf tail** — remaining narrower cases beyond landed #53–#55.
-- **WebUI Snowsight-parity roadmap** — Phase 0 (worksheets ✅, theme ✅;
-  remaining: version history, command palette, keyboard shortcuts, global
-  search), Phase 1 (results grid sort/filter + charts + GPU column
-  profiling), Phase 2 (object explorer + data-loading wizard + schema-aware
-  autocomplete), Phase 3 (visual GPU-kernel-aware query profile + filterable
-  history + dashboards), Phase 4 (NL→SQL assistant, notebooks).
+- **WebUI Snowsight-parity roadmap** — Phase 0 COMPLETE (multi-worksheet tabs
+  + localStorage persistence, dark/light theme, command palette Cmd/Ctrl+K,
+  keyboard-shortcuts help, global object search Cmd/Ctrl+Shift+F, per-worksheet
+  version history Cmd/Ctrl+Shift+H). Phase 1 (results grid sort/filter/resize/
+  reorder/copy + chart tab + GPU-instant column profiling + multi-result tabs +
+  JSON/Parquet export), Phase 2 (object explorer + data-loading wizard +
+  schema-aware autocomplete), Phase 3 (visual GPU-kernel-aware query profile +
+  filterable history + dashboards), Phase 4 (NL→SQL assistant, notebooks).
 
 ---
 
