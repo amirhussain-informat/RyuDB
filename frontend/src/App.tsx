@@ -34,9 +34,24 @@ const DL_PAGE = 50_000;
 
 type MainTab = "results" | "chart" | "explain" | "message";
 
+// A past SELECT result kept around so the user can switch back through a
+// worksheet's result history (multi-result tabs). Holds the decoded Arrow
+// result, its server-side cursor id (for load-more / export), the SQL that
+// produced it (so Download re-runs THAT statement, not the editor's current
+// text), and a timestamp for the tab label. Bounded by MAX_RESULTS.
+interface ResultEntry {
+  id: string;
+  res: Result;
+  cursorId: string | null;
+  sql: string;
+  ts: number;
+}
+const MAX_RESULTS = 10;
+
 // The per-worksheet view (results / plan / message / error / active sub-tab /
-// cursor id). Kept in memory keyed by worksheet id so switching tabs restores
-// each tab's last view during a session (not persisted across reloads).
+// cursor id / result history / the active result's own sql+ts). Kept in memory
+// keyed by worksheet id so switching tabs restores each tab's last view during
+// a session (not persisted across reloads).
 interface View {
   result: Result | null;
   plan: PlanNode | null;
@@ -44,11 +59,25 @@ interface View {
   error: ErrorResp | null;
   mainTab: MainTab;
   cursorId: string | null;
+  resultHistory: ResultEntry[];
+  resultSql: string | null;
+  resultTs: number | null;
 }
 
 const EMPTY_VIEW: View = {
-  result: null, plan: null, message: null, error: null, mainTab: "results", cursorId: null,
+  result: null, plan: null, message: null, error: null, mainTab: "results",
+  cursorId: null, resultHistory: [], resultSql: null, resultTs: null,
 };
+
+/** Compact relative time for a result-tab label ("just now", "3m", "2h"). */
+function relTime(ts: number): string {
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 5) return "just now";
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
 
 /** True if keyboard focus is in a text-entry surface (so global letter-key
  * shortcuts like `?` should not fire). Monaco renders a contenteditable-ish
@@ -88,12 +117,47 @@ export default function App() {
   const [error, setError] = useState<ErrorResp | null>(null);
   const [mainTab, setMainTab] = useState<MainTab>("results");
   const [cursorId, setCursorId] = useState<string | null>(null);
+  // The SQL + timestamp of the statement that produced the CURRENT `result`.
+  // Download re-runs `resultSql` (not the editor's text) so exporting a past
+  // result tab re-runs the statement that made it, not whatever is in the
+  // editor now. `resultHistory` is the worksheet's past SELECT results.
+  const [resultSql, setResultSql] = useState<string | null>(null);
+  const [resultTs, setResultTs] = useState<number | null>(null);
+  const [resultHistory, setResultHistory] = useState<ResultEntry[]>([]);
+  const resultIdRef = useRef(0);
   const [sidebar, setSidebar] = useState<"catalog" | "history">("catalog");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [profileName, setProfileName] = useState<string | null>(null);
+
+  // Mint a unique id for a result-history entry (a monotonic counter —
+  // Date.now/Math.random are fine in the browser but a ref counter is stable
+  // and avoids any same-ms collision across rapid runs).
+  const nextResultId = () => `r${++resultIdRef.current}`;
+
+  // Best-effort close of a history entry's server cursor (unknown id is a
+  // server-side no-op). Frees the host-memory table behind a dropped result.
+  const closeEntryCursor = (e: ResultEntry) => {
+    if (e.cursorId) {
+      try { void op({ id: "cc", op: "close", cursor_id: e.cursorId }).catch(() => {}); }
+      catch { /* not connected */ }
+    }
+  };
+
+  // Prepend a result-history entry, trimming to MAX_RESULTS and closing the
+  // cursors of any entries dropped off the tail (so the server frees them).
+  const prependHistory = (e: ResultEntry) => {
+    setResultHistory((h) => {
+      const next = [e, ...h];
+      if (next.length > MAX_RESULTS) {
+        for (const d of next.slice(MAX_RESULTS)) closeEntryCursor(d);
+        return next.slice(0, MAX_RESULTS);
+      }
+      return next;
+    });
+  };
 
   // Apply a stored View to the live state slots.
   const setView = (v: View) => {
@@ -103,25 +167,32 @@ export default function App() {
     setError(v.error);
     setMainTab(v.mainTab);
     setCursorId(v.cursorId);
+    setResultHistory(v.resultHistory);
+    setResultSql(v.resultSql);
+    setResultTs(v.resultTs);
     cursorRef.current = v.cursorId;
   };
 
   // Switch to another worksheet: stash the leaving tab's view, restore the new.
   const switchTab = (id: string) => {
     if (id === activeIdRef.current) return;
-    viewsRef.current.set(activeIdRef.current, { result, plan, message, error, mainTab, cursorId });
+    viewsRef.current.set(activeIdRef.current, {
+      result, plan, message, error, mainTab, cursorId, resultHistory, resultSql, resultTs,
+    });
     editorRef.current?.setParseError(null);
     setActive(id);
     setView(viewsRef.current.get(id) ?? EMPTY_VIEW);
   };
 
-  // Close a worksheet tab: best-effort close its cursor if it had one, drop its
-  // stored view, then remove it (the hook keeps at least one worksheet).
+  // Close a worksheet tab: best-effort close its cursor + every history
+  // entry's cursor, drop its stored view, then remove it (the hook keeps at
+  // least one worksheet).
   const closeTab = (id: string) => {
     const v = viewsRef.current.get(id);
     if (v?.cursorId) {
       try { void op({ id: "cc", op: "close", cursor_id: v.cursorId }).catch(() => {}); } catch { /* disconnected */ }
     }
+    if (v) for (const h of v.resultHistory) closeEntryCursor(h);
     viewsRef.current.delete(id);
     if (id === activeIdRef.current) {
       const idx = worksheets.findIndex((w) => w.id === id);
@@ -206,7 +277,7 @@ export default function App() {
       // cursor: true asks the server to freeze the full result and return the
       // first page + a cursor_id; the rest is paged via loadMore().
       const res = await op({ id: RUN_ID, op: "sql", sql, max_rows: PAGE_SIZE, cursor: true });
-      applyResult(res);
+      applyResult(res, sql);
     } catch (e) {
       setMessage(`network: ${(e as Error).message}`);
       setMainTab("message");
@@ -244,7 +315,7 @@ export default function App() {
     }
   };
 
-  const applyResult = (res: Result) => {
+  const applyResult = (res: Result, runSql: string) => {
     const m = res.meta;
     switch (m.op) {
       case "result": {
@@ -252,9 +323,20 @@ export default function App() {
         // A cursor-backed first page carries cursor_id; a too-large result
         // carries cursor:false + reason:too_large (no cursor -> not pageable).
         const cid = rm.cursor_id ?? null;
+        // Archive the previously-shown SELECT result into this worksheet's
+        // history before replacing it (multi-result tabs). Non-result ops
+        // (write/ok/...) don't get archived.
+        if (result && result.meta.op === "result") {
+          prependHistory({
+            id: nextResultId(), res: result, cursorId: cursorRef.current,
+            sql: resultSql ?? "", ts: resultTs ?? Date.now(),
+          });
+        }
         cursorRef.current = cid;
         setCursorId(cid);
         setResult(res);
+        setResultSql(runSql);
+        setResultTs(Date.now());
         setMainTab("results");
         break;
       }
@@ -313,6 +395,48 @@ export default function App() {
     }
   };
 
+  // Switch the displayed result to a past one (multi-result tabs): the chosen
+  // history entry becomes the current `result`, and the previously-displayed
+  // SELECT result is archived at the front of the history. If the current view
+  // isn't a SELECT result (e.g. a write/message), just load the entry without
+  // archiving. The entry's own cursor/sql/ts come with it (load-more + download
+  // then operate on THAT result's statement).
+  const selectResult = (id: string) => {
+    const entry = resultHistory.find((h) => h.id === id);
+    if (!entry) return;
+    const curIsResult = !!result && result.meta.op === "result";
+    const cur: ResultEntry | null = curIsResult
+      ? { id: nextResultId(), res: result, cursorId: cursorRef.current, sql: resultSql ?? "", ts: resultTs ?? Date.now() }
+      : null;
+    cursorRef.current = entry.cursorId;
+    setCursorId(entry.cursorId);
+    setResult(entry.res);
+    setResultSql(entry.sql);
+    setResultTs(entry.ts);
+    setMainTab("results");
+    setResultHistory((h) => {
+      const next = cur ? [cur, ...h.filter((x) => x.id !== id)] : h.filter((x) => x.id !== id);
+      if (next.length > MAX_RESULTS) {
+        for (const d of next.slice(MAX_RESULTS)) closeEntryCursor(d);
+        return next.slice(0, MAX_RESULTS);
+      }
+      return next;
+    });
+  };
+
+  // Drop one past result from the history and close its server cursor.
+  const closeResult = (id: string) => {
+    const entry = resultHistory.find((h) => h.id === id);
+    if (entry) closeEntryCursor(entry);
+    setResultHistory((h) => h.filter((x) => x.id !== id));
+  };
+
+  // Drop the entire result history for this worksheet (closes every cursor).
+  const clearResults = () => {
+    for (const h of resultHistory) closeEntryCursor(h);
+    setResultHistory([]);
+  };
+
   const showError = (m: ErrorResp) => {
     setError(m);
     setMessage(`[${m.kind}] ${m.message}`);
@@ -330,7 +454,7 @@ export default function App() {
     editorRef.current?.setParseError(null);
     try {
       const res = await op({ id: "sm", op: "sample", name, n: 100 });
-      applyResult(res);
+      applyResult(res, `SELECT * FROM ${name} LIMIT 100`);
     } catch (e) {
       setMessage(`network: ${(e as Error).message}`);
       setMainTab("message");
@@ -343,6 +467,10 @@ export default function App() {
     const cur = result;
     if (!cur || cur.meta.op !== "result") return;
     const m = cur.meta as ResultMeta;
+    // Re-run the statement that produced THIS result (resultSql), not the
+    // editor's current text — the user may be viewing a past result tab whose
+    // SQL differs from what's now in the editor.
+    const runSql = resultSql ?? sql;
     // Guard against an accidental giant download (a cross-join can report
     // billions of rows). The fetch loop below would materialize all of them.
     if (m.row_count > 1_000_000) {
@@ -354,7 +482,7 @@ export default function App() {
       // serializes the full result to Parquet (one export op + binary blob) and
       // we save the raw bytes. No client-side paging needed.
       if (format === "parquet") {
-        const res = await op({ id: "dl", op: "export", sql, format: "parquet" });
+        const res = await op({ id: "dl", op: "export", sql: runSql, format: "parquet" });
         if (res.meta.op !== "export" || !res.bytes) {
           setMessage("download: export failed");
           setMainTab("message");
@@ -385,7 +513,7 @@ export default function App() {
         } else {
           // No cursor (result exceeded --max-cursor-rows): fall back to a
           // single uncapped re-run, as before cursor paging existed.
-          const res = await op({ id: "dl", op: "sql", sql, max_rows: m.row_count });
+          const res = await op({ id: "dl", op: "sql", sql: runSql, max_rows: m.row_count });
           if (res.meta.op !== "result" || !res.table) {
             setMessage("download: could not fetch full result");
             setMainTab("message");
@@ -458,6 +586,10 @@ export default function App() {
     {
       id: "history", label: "Show version history", hint: "Ctrl/Cmd+Shift+H", group: "Worksheets",
       disabled: !active, run: () => setHistoryOpen(true),
+    },
+    {
+      id: "clear-results", label: "Clear result history", group: "Worksheets",
+      disabled: resultHistory.length === 0, run: clearResults,
     },
     ...worksheets.map((w) => ({
       id: "go-" + w.id, label: `Go to ${w.name}`, group: "Worksheets",
@@ -539,6 +671,43 @@ export default function App() {
                 </button>
               )}
             </div>
+            {(result?.meta.op === "result" || resultHistory.length > 0) && (
+              <div className="result-tabs">
+                {result && result.meta.op === "result" && (
+                  <button className="rtab active" title={resultSql ?? ""}>
+                    <span className="rtab-label">
+                      {(result.meta as ResultMeta).row_count.toLocaleString()} rows
+                      {resultTs && <span className="rtab-time"> · {relTime(resultTs)}</span>}
+                    </span>
+                  </button>
+                )}
+                {resultHistory.map((h) => (
+                  <button
+                    key={h.id}
+                    className="rtab"
+                    onClick={() => selectResult(h.id)}
+                    title={h.sql}
+                  >
+                    <span className="rtab-label">
+                      {(h.res.meta as ResultMeta).row_count.toLocaleString()} rows
+                      <span className="rtab-time"> · {relTime(h.ts)}</span>
+                    </span>
+                    <span
+                      className="rtab-close"
+                      role="button"
+                      tabIndex={0}
+                      title="Close this result tab"
+                      onClick={(e) => { e.stopPropagation(); closeResult(h.id); }}
+                    >×</span>
+                  </button>
+                ))}
+                {resultHistory.length > 0 && (
+                  <button className="rtab-clear" title="Clear result history" onClick={clearResults}>
+                    Clear
+                  </button>
+                )}
+              </div>
+            )}
             <div className="output-body">
               {!connected && <div className="empty">Connect to ryudb-server to run queries.</div>}
               {connected && mainTab === "results" && (
