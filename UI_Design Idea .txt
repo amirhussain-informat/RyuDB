@@ -1,0 +1,141 @@
+RyuDB Console — a Snowsight-like frontend: design & development plan
+
+  What "like Snowflake" means here, and what's different
+
+  Snowsight's core is: worksheets (SQL editor + results), an object browser (databases/schemas/tables/columns), query history, dashboards (charts over saved queries), and monitoring
+  (warehouse/resource usage). RyuDB has all the primitives to mirror these — engine.sql(), engine.explain(), engine.catalog (tables, columns, types, constraints, row counts),
+  snapshots/restore, checkpoint — but no HTTP layer, no auth, single-session by design (Engine is explicitly one-thread, executor.py:152). So "like Snowflake" here means the UX
+  shape, not the multi-tenant cloud plumbing.
+
+  Two things make RyuDB's console better than a generic SQL GUI and should drive the design:
+
+  1. It's a GPU HTAP engine. The monitoring panel isn't "warehouse credits" — it's GPU utilization, scan-cache hit rate, cold-vs-warm timing, fused-kernel vs cuDF fallback. The bench
+  script (bench/run_bench.py) is already importable → a one-click "Run TPC-H" panel with live timing vs DuckDB.
+  2. It has a real plan tree. explain() returns a string, but parse()/optimize() give you a structured PlanNode tree → a proper visual explain (cost per node, fused-kernel
+  annotations) instead of Snowsight's flat text.
+
+  Key architectural decisions (with my recommended defaults)
+
+  ┌───────────────┬─────────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │   Decision    │                     Recommendation                      │                                                Why                                                 │
+  ├───────────────┼─────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │               │ Next.js (React + TS) + Tailwind + shadcn/ui, Monaco     │ Snowsight-class editor + grid; Next gives SSR-free SPA + easy API routes if you later collapse     │
+  │ Stack         │ editor, TanStack Table for results, Recharts/Visx for   │ tiers                                                                                              │
+  │               │ charts                                                  │                                                                                                    │
+  ├───────────────┼─────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Backend       │ FastAPI wrapping Engine                                 │ Same Python env as ryudb (cuDF lives there); can import Engine directly, no IPC                    │
+  │ gateway       │                                                         │                                                                                                    │
+  ├───────────────┼─────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Engine        │                                                         │ Engine is single-session/one-thread by design. A lock-based queue keeps it honest. A per-session   │
+  │ concurrency   │ Single Engine + an async request queue (one worker)     │ Engine pool is a later optimization once checkpoint/snapshot semantics are sorted for concurrent   │
+  │               │                                                         │ writers                                                                                            │
+  ├───────────────┼─────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Result        │ Arrow IPC over HTTP (and JSON for small/meta)           │ cuDF → Arrow is zero-copy-ish, and a grid that can consume Arrow (e.g. via DuckDB-WASM or Apache   │
+  │ transport     │                                                         │ Arrow JS) is far snappier than df.to_dict() for the 1.5M-row Q3 result                             │
+  ├───────────────┼─────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Live updates  │ SSE for query progress + GPU stats; reserve WebSocket   │ SSE is simpler, one-directional, enough for streaming results/progress                             │
+  │               │ only if you add multi-tab shared sessions               │                                                                                                    │
+  ├───────────────┼─────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │               │ v1: run in WSL2 next to the engine (uvicorn + Next dev  │                                                                                                    │
+  │ Deployment    │ server), localhost-only. Defer auth/TLS to a later      │ No auth exists yet; don't fake it early                                                            │
+  │               │ phase                                                   │                                                                                                    │
+  └───────────────┴─────────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  I'll proceed on these defaults. If you'd rather (e.g.) use a different stack or collapse the gateway into Next API routes, say so and I'll re-scope.
+
+  Architecture (target)
+
+  Browser (Next.js SPA)
+    ├── Worksheets (Monaco) ── POST /api/sql, GET /api/explain
+    ├── Object browser       ── GET /api/catalog, /api/tables/:t
+    ├── Results grid         ── Arrow IPC reader
+    ├── History              ── GET /api/history (server-side ring buffer)
+    ├── Dashboards           ── charts over saved/saved-query results
+    └── Monitor              ── SSE /api/stats (GPU, cache, bench)
+          │
+     FastAPI gateway  (ryudb-server, single Engine + async queue)
+          ├── imports: Engine, Catalog, bench/run_bench, parse/optimize
+          ├── serializes results: cudf → Arrow IPC
+          └── owns: history ring buffer, saved-worksheets store (SQLite/JSON), GPU sampler
+
+  ---
+  Phased plan (design + development interleaved)
+
+  Phase 0 — Foundations & design language  (~3–4 days, design-heavy)
+
+  Design: Audit Snowsight's IA (left rail: Worksheets / Dashboards / Data / Monitoring / History). Produce a component inventory and a Figma/ASCII wireframe set. Pick a palette +
+  type scale (Snowsight is a clean, neutral, data-dense dark-and-light theme). Define the data contract for the gateway responses before writing UI — this is the highest-leverage doc
+  in the project.
+  Dev: Scaffold Next app, Tailwind, shadcn, Monaco. Build the app shell (left rail, top bar, tabbed worksheet panes) with mocked API responses so frontend and backend can proceed in
+  parallel. Set up the Arrow-JS result reader early (it's a risk item).
+
+  Phase 1 — Gateway v1 + "hello SQL"  (~3–4 days)
+
+  Design: Finalize the REST contract: /api/sql (POST, returns Arrow IPC + a JSON sidecar of column names/types), /api/catalog, /api/tables/:t (cols/types/constraints/row_count),
+  /api/explain (returns structured plan, see Phase 3).
+  Dev: FastAPI app importing ryudb. A single Engine behind an asyncio.Lock/worker queue. /api/sql runs engine.sql(), converts cuDF→Arrow IPC (df.to_arrow()), handles the int/None
+  write/txn cases. /api/catalog wraps catalog.schema_dict() + stats_dict() + per-table get(). End-to-end smoke: type a query in the worksheet, see a real result grid. This is the
+  milestone where the product is "real."
+
+  Phase 2 — Core worksheet UX  (~4–5 days)
+
+  Design: Worksheet interaction model — run-all vs run-selection, multi-tab, autosave, keyboard map, result tabs (Results / Explain / History).
+  Dev: Monaco with RyuDB SQL highlighting (reuse the dialect: SELECT/INSERT/UPDATE/DELETE/MERGE/EXPLAIN/BEGIN...). Run selection, run all, cancel (cooperative cancel via a worker
+  flag — Engine has no cancel hook today, so this is a known gap; long queries can't be interrupted yet — flag it). Results grid: virtualized, sortable, type-aware rendering
+  (decimals→money, dates, NULL→∅), row-count + timing badge, CSV/JSON/Parquet export. DML returns row-count toast; txn control shows session state.
+
+  Phase 3 — Object browser + visual EXPLAIN  (~4–5 days)
+
+  Design: Tree: data-dir → tables → columns with type/nullable/PK/unique/row-count badges. Context actions: Sample Data (SELECT * LIMIT 100), Drop, Alter (rename + constraints —
+  mirrors the :alter CLI). Explain view: a tree visualization (not text) with per-node cards showing operator, estimated rows, and a "⚡ fused-kernel" badge when the node hits the
+  C++ path.
+  Dev: /api/tables/:t/sample, /api/drop, /api/alter. For EXPLAIN, don't use engine.explain()'s string — call parse() + optimize() directly and emit a JSON tree ({op, children,
+  est_rows, fused}) so the UI can render it natively and annotate fused-join/fused-agg nodes. This is your differentiated feature — budget the time.
+
+  Phase 4 — Query history + saved worksheets  (~3 days)
+
+  Design: History = a server-side ring buffer (last N queries: sql, ts, duration, row count, status, engine path: fused vs cuDF). Saved worksheets = persistent (SQLite or JSON files
+  under the data dir), folders optional.
+  Dev: Gateway owns a History ring buffer (in-memory + optional persist). /api/history, /api/saved (CRUD). Wire autosave + a history list panel. Show the fused-vs-cuDF path per query
+  — another RyuDB-specific touch (Snowsight has no equivalent).
+
+  Phase 5 — Dashboards & charts  (~4–5 days)
+
+  Design: A dashboard = N chart widgets, each bound to a saved SQL query (re-run on open or manual refresh). Snowsight-style bar/line/scatter/table tiles. Auto-infer chart type from
+  result shape (1 dim + 1 measure → bar, time + measure → line).
+  Dev: Recharts or Visx. POST /api/sql with save_result=true returning Arrow; widget config stored in the saved-worksheet store. Snapshot-driven (a dashboard runs its queries,
+  doesn't subscribe live unless you add a refresh timer).
+
+  Phase 6 — GPU / HTAP monitoring + TPC-H bench runner  (~4–5 days, the differentiator)
+
+  Design: A "Monitoring" tab: GPU utilization + mem (pynvml or nvidia-smi polled), scan-cache hit ratio, code-cache size, has_pending per table, last checkpoint ts. A "Benchmark"
+  sub-tab: pick scale + queries → stream progress over SSE → show RyuDB cold/warm vs DuckDB timing, correctness ✓/✗ per query (reuse generate_tpch, make_engine, frames_match,
+  QUERIES, RYU_QUERIES from bench/run_bench.py).
+  Dev: /api/stats SSE sampler (separate thread, pynvml). /api/bench SSE that streams per-query {query, ryu_cold, ryu_warm, duck_ms, ok}. This is the panel that makes RyuDB's GPU-HTAP
+  story visible — lean into it.
+
+  Phase 7 — Hardening & deployment  (~3 days)
+
+  Cooperative query cancel (requires a small Engine change — a cancel flag the long-running path polls; out of current backend scope, so either a tiny backend PR or a documented
+  limitation). Error surfacing (parse errors → inline Monaco squiggles via sqlglot error positions). Connection-config screen (data dir). Optional: a single-user passcode gate +
+  HTTPS for non-localhost use. Docker compose (gateway + Next) for a one-command run.
+
+  ---
+  Risks & known gaps (flag now, don't discover later)
+
+  - No query cancellation. Engine runs a query to completion on the calling thread. A "Stop" button needs a backend change (cancel flag) — otherwise it's cosmetic. Decide early
+  whether Phase 7 gets a small backend PR or ships without cancel.
+  - Single-session Engine. Two browser tabs hitting /api/sql concurrently must serialize (the queue). If you want true parallel sessions later, that's a real Engine-architecture
+  discussion (per-session Engine + delta-store coordination), not a frontend task.
+  - Arrow result size. Q3's 1.5M-row group-by result over HTTP is real data. Plan pagination/limit defaults + Parquet export early; don't default to "return everything as JSON."
+  - EXPLAIN richness. The string explain() is a dead end for a visual tree — Phase 3 must use parse()/optimize() directly. Estimating per-node row counts means reusing the
+  optimizer's stats_dict() path; verify it exposes what you need before designing the cards.
+  - Auth is fictional today. Don't build role UI; if non-localhost is a goal, a single passcode + TLS is enough for v1.
+
+  Recommended order to start
+
+  If you want to begin immediately: Phase 0 (shell + mocked API) and Phase 1 (gateway + hello-SQL) are the two that turn this from slides into a working thing. They're also the
+  lowest-risk and unblock everything else.
+
+  Want me to (a) flesh out Phase 0+1 into an executable build plan with the exact REST contract and file layout, (b) start scaffolding the Next app shell, or (c) build the FastAPI
+  gateway first? I'd suggest (a) then (c) — locking the contract before code is what keeps a frontend/backend split from drifting.
