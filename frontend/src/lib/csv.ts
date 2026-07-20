@@ -41,6 +41,83 @@ export function tableToCSV(table: Table): string {
   return parts.join("\n");
 }
 
+/** Convert an Arrow cell to a JSON-ready value: bigint → number when it fits in
+ * a safe integer, else its string (JSON.stringify would throw on bigint);
+ * Date → ISO string; null stays null; nested objects pass through. */
+function cellToJson(v: unknown): unknown {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "bigint") {
+    const n = Number(v);
+    return Number.isSafeInteger(n) ? n : v.toString();
+  }
+  if (v instanceof Date) return v.toISOString();
+  return v;
+}
+
+/** Serialize an Arrow Table as a JSON array of row objects (one field per
+ * column). bigint cells outside the safe-integer range become strings. */
+export function tableToJSON(table: Table): string {
+  const fields = table.schema.fields;
+  const cols = fields.map((f) => table.getChild(f.name));
+  const rows: Record<string, unknown>[] = [];
+  for (let i = 0; i < table.numRows; i++) {
+    const obj: Record<string, unknown> = {};
+    for (let f = 0; f < fields.length; f++) {
+      const c = cols[f];
+      obj[fields[f].name] = cellToJson(c ? c.get(i) : null);
+    }
+    rows.push(obj);
+  }
+  return JSON.stringify(rows, null, 2);
+}
+
+/** A TSV (tab-separated) serialization for clipboard copy — pastes cleanly
+ * into Excel / Google Sheets. Uses the same null-aware cell rendering as CSV
+ * but tabs as separators and no quoting (TSV trad. doesn't quote; embedded
+ * tabs/newlines are replaced with a space so a cell never spans columns/rows). */
+function cellToTsv(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  let s: string;
+  if (typeof v === "bigint") s = v.toString();
+  else if (v instanceof Date) s = v.toISOString();
+  else if (typeof v === "object") {
+    try { s = JSON.stringify(v); } catch { s = String(v); }
+  } else s = String(v);
+  return s.replace(/[\t\r\n]/g, " ");
+}
+
+export function tableToTSV(table: Table): string {
+  const fields = table.schema.fields;
+  const cols = fields.map((f) => table.getChild(f.name));
+  const parts: string[] = [fields.map((f) => f.name.replace(/[\t\r\n]/g, " ")).join("\t")];
+  for (let i = 0; i < table.numRows; i++) {
+    parts.push(cols.map((c) => cellToTsv(c ? c.get(i) : null)).join("\t"));
+  }
+  return parts.join("\n");
+}
+
+/** Write text to the clipboard, falling back to a hidden textarea +
+ * execCommand when the async Clipboard API is unavailable (older browsers /
+ * non-secure contexts). Returns whether it succeeded. */
+export async function copyText(text: string): Promise<boolean> {
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(text); return true; } catch { /* fall through */ }
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 /** Trigger a browser download of `data` as `filename`. */
 export function downloadBlob(filename: string, mime: string, data: Uint8Array | string): void {
   // Copy bytes into a fresh ArrayBuffer-backed Uint8Array: the TS 5.5 lib.dom

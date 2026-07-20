@@ -15,7 +15,7 @@ import Results from "./components/Results";
 import Explain from "./components/Explain";
 import Catalog from "./components/Catalog";
 import History from "./components/History";
-import { tableToCSV, downloadBlob } from "./lib/csv";
+import { tableToCSV, tableToJSON, downloadBlob } from "./lib/csv";
 import type {
   CatalogResp, CatalogTable, ErrorResp, HistoryEntry, PlanNode,
   ResultMeta, Result, TableResp,
@@ -335,7 +335,7 @@ export default function App() {
     }
   };
 
-  const download = async (format: "csv" | "arrow") => {
+  const download = async (format: "csv" | "json" | "arrow") => {
     const cur = result;
     if (!cur || cur.meta.op !== "result") return;
     const m = cur.meta as ResultMeta;
@@ -380,6 +380,8 @@ export default function App() {
       if (!table) return;
       if (format === "arrow") {
         downloadBlob("result.arrow", "application/vnd.apache.arrow.stream", tableToIPC(table));
+      } else if (format === "json") {
+        downloadBlob("result.json", "application/json", tableToJSON(table));
       } else {
         downloadBlob("result.csv", "text/csv", tableToCSV(table));
       }

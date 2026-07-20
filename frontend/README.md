@@ -29,10 +29,11 @@ does the GPU work; this is its client.
   `cursor: true`) that freezes the full result; the first page is shown and a
   **Load more** button pages the rest via the `fetch` op (growing the grid) up to
   `--max-cursor-rows` (default 1M) — above that the result is served truncated
-  and not pageable. **Download CSV / Arrow** serializes the full set: a
+  and not pageable. **Download CSV / JSON / Arrow** serializes the full set: a
   cursor-backed result is paged from the cursor; a non-cursor (too-large) result
   re-runs with `max_rows = row_count`. A result above 1M rows asks for
-  confirmation first.
+  confirmation first. **Copy** writes the displayed rows as TSV to the
+  clipboard (pastes into Excel / Sheets); **click a cell** to copy its value.
 - **Explain** — the structured plan tree with a `fused` badge on an
   `Aggregate` over a `Join` (the star-join+aggregate shape eligible for the
   fused C++ kernel — eligibility, not a guarantee).
