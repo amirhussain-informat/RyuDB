@@ -160,8 +160,13 @@ governance/masking, billing/budgets, replication.
 
 ## 8. Open Horizons
 
-- **Mid-call cancel preemption** — a single long cuDF call is not mid-call
-  interruptible (would need subprocess isolation).
+- **Mid-call cancel preemption** — cancel checks at every plan-node boundary
+  AND at the inner loops of long nodes (multi-aggregate, multi-window-function,
+  the per-row window-running host loop, per-table checkpoint), so a cancel
+  during those loops is honored within one cuDF call. A *single* long cuDF/CUDA
+  kernel (cold parquet read, one `groupby.agg`, `sort_values`, a join `merge`,
+  a fused C-extension call) is the one remaining un-interruptible case — full
+  preemption of a single kernel would need subprocess isolation.
 - **Fused-join perf tail** — remaining narrower cases beyond landed #53–#55.
 - **WebUI Snowsight-parity roadmap** — Phase 0 COMPLETE (multi-worksheet tabs
   + localStorage persistence, dark/light theme, command palette Cmd/Ctrl+K,

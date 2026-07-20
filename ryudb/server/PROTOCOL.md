@@ -461,12 +461,17 @@ the head of.
   `restore`/`restore_to` are refused while *any* connection has an open txn —
   they rewrite history globally and would invalidate live snapshots.
 - **Cooperative in-flight cancel.** `cancel` drops pending requests and raises
-  `CancelledByUser` at the next plan-node boundary of an in-flight request. A
-  single long cuDF call (a big groupby, a cold parquet read) is *not*
-  interruptible mid-call — cancel fires after the current node finishes. A
-  `py` cell with a long pure-Python loop is likewise not interruptible mid-call
-  (cancel fires after the cell — and any `sql()` it makes — returns). Full
-  preemption would need subprocess isolation.
+  `CancelledByUser` at the next plan-node boundary of an in-flight request,
+  and at the top of the inner loops of long nodes — multi-aggregate, multi-
+  window-function, the per-row window-running host loop, and per-table
+  checkpoint — so a cancel during those loops is honored within one cuDF call
+  (the loop-level check fires each iteration). A *single* long cuDF/CUDA kernel
+  (a cold parquet read, one big `groupby.agg`, `sort_values`, a join `merge`,
+  or a fused C-extension call) is the one remaining un-interruptible case —
+  cancel fires after the current kernel returns. A `py` cell with a long
+  pure-Python loop is likewise not interruptible mid-call (cancel fires after
+  the cell — and any `sql()` it makes — returns). Full preemption of a single
+  kernel would need subprocess isolation.
 - **Local single-user.** Binds to `127.0.0.1` by default; no auth. The `sample`
   op interpolates a validated identifier into SQL; `sql`/`admin` trust the
   client, and `py` runs arbitrary Python (filesystem/subprocess access) in the
@@ -545,7 +550,8 @@ psql "host=127.0.0.1 port=5432 user=ryudb dbname=ryudb"
   `CancelRequest` with that `(pid, secret)`; the server looks up the target
   session and sets its in-flight cancel `Event` — the cooperative cancel (the
   same mechanism as the WS `cancel` op) then drops a pending request or raises
-  `CancelledByUser` at the next plan-node boundary of an in-flight one,
+  `CancelledByUser` at the next plan-node boundary of an in-flight one (and
+  at the inner loops of long nodes — see the cooperative-cancel note above),
   surfaced to the target as an `ErrorResponse` (`57014`) + `ReadyForQuery`.
   Cancelling an idle backend is a no-op. A `CancelRequest` gets **no response**
   (the client just closes the cancel connection); an unknown `(pid, secret)` is

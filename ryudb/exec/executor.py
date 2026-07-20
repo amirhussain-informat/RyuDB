@@ -63,14 +63,25 @@ class CancelledByUser(Exception):
 
     Cooperative cancellation: the server's worker sets ``engine.cancel_event``
     to the in-flight request's ``threading.Event`` before running it, and the
-    executor checks that event at each plan-node boundary (the top of ``_exec``).
-    A request cancelled while still pending in the worker queue is dropped before
-    it starts (the worker checks the same event on dequeue) and never reaches the
-    engine, so this exception is only raised for a request that had already
-    started. A single long cuDF call (a big groupby, a cold parquet read) is NOT
-    interruptible mid-call — cancel fires at the next node boundary. That is the
-    one remaining limit of v1 cooperative cancel; full preemption would need
-    subprocess isolation.
+    executor checks that event (``_check_cancel``) at each plan-node boundary
+    (the top of ``_exec``) AND, for finer granularity, at the top of the inner
+    loops of long nodes whose work is a *sequence* of cuDF/host calls rather
+    than one giant kernel — multi-aggregate (``_scalar_global_agg``,
+    ``_distinct_grouped_agg``), multi-window-function (``_window``), the per-row
+    window-running host loop (``_window_running``), per-column Project, the
+    delta-merge batch loops, and per-table checkpoint. This narrows the
+    un-interruptible window from a whole node down to a single cuDF call for
+    those cases. A request cancelled while still pending in the worker queue is
+    dropped before it starts (the worker checks the same event on dequeue) and
+    never reaches the engine, so this exception is only raised for a request
+    that had already started.
+
+    The one remaining limit: a *single* long cuDF/CUDA call (a cold
+    ``cudf.read_parquet``, one big ``groupby.agg``, ``sort_values``, a join
+    ``merge``, or a fused C-extension kernel) is NOT interruptible mid-call —
+    cancel fires after the current kernel returns (the next loop iteration or
+    node boundary). Full preemption of a single kernel would need process
+    isolation.
     """
 
 
@@ -307,6 +318,25 @@ class Engine:
     @cancel_event.setter
     def cancel_event(self, value: "threading.Event | None") -> None:
         self._cancel_local.value = value
+
+    def _check_cancel(self) -> None:
+        """Raise ``CancelledByUser`` if the running request's cancel event is
+        set. Called at every plan-node boundary (``_exec``) AND, for finer-
+        grained cooperative cancel, at the top of the inner loops of long
+        nodes whose work is a *sequence* of cuDF / host calls rather than one
+        giant kernel — multi-aggregate, multi-window-function, the per-row
+        window-running host loop, and per-table checkpoint. This narrows the
+        un-interruptible window from a whole node down to a single cuDF call
+        for those cases. The genuinely single-kernel paths (a cold parquet
+        read, one ``groupby.agg``, ``sort_values``, a join ``merge``, a fused
+        C-extension call) remain uninterruptible mid-call and are documented
+        as the remaining limit (full preemption would need process
+        isolation). ``is_set()`` is a cheap bool read; the ``None`` check
+        skips the event lookup entirely for non-server (CLI/in-process)
+        callers."""
+        ev = self.cancel_event
+        if ev is not None and ev.is_set():
+            raise CancelledByUser()
 
     def read_locked(self):
         """Context manager: the shared read lock (concurrent SELECTs allowed)."""
@@ -597,6 +627,7 @@ class Engine:
         checkpoint_ts = self._commit_ts  # the tip; all committed work is <= this
         written: dict[str, int] = {}
         for table in targets:
+            self._check_cancel()  # per-table: a checkpoint over many tables is a sequence of heavy scan+write calls
             if not self.delta.has_unflushed(table):
                 continue
             info = self.catalog.get(table)
@@ -805,6 +836,7 @@ class Engine:
         # cached base is never mutated; batch slices are copies (see _insert).
         parts: list[cudf.DataFrame] = [base.assign(_ins_ts=0)]
         for ts, b in ins_batches:
+            self._check_cancel()  # per delta batch: astype/assign is a sequence of small cuDF calls
             sub = b[cols]
             for c in cols:
                 if sub[c].dtype != base[c].dtype:
@@ -812,6 +844,7 @@ class Engine:
             sub["_ins_ts"] = ts
             parts.append(sub)
         for b in buf_inserts:
+            self._check_cancel()
             sub = b[cols]
             for c in cols:
                 if sub[c].dtype != base[c].dtype:
@@ -1652,11 +1685,9 @@ class Engine:
 
     def _exec(self, node: PlanNode) -> "cudf.DataFrame | int | None":
         # Cooperative in-flight cancel: check the running request's event at each
-        # node boundary. is_set() is a cheap bool read; the None check skips the
-        # event lookup entirely for non-server (CLI/in-process) callers.
-        ev = self.cancel_event
-        if ev is not None and ev.is_set():
-            raise CancelledByUser()
+        # node boundary. See ``_check_cancel`` for the finer-grained checks
+        # inside long nodes' inner loops.
+        self._check_cancel()
         if isinstance(node, Scan):
             return self._scan(node.table, node.columns)
         if isinstance(node, Derived):
@@ -2077,6 +2108,7 @@ class Engine:
         (and for `Aggregate -> Scan` shapes with no Filter)."""
         row: dict[str, list] = {}
         for af, n in aggs:
+            self._check_cancel()  # per aggregate: each iteration is a cuDF reduction over the full frame
             fmask = eval_expr(af.filter, df) if af.filter is not None else None
             if af.func == "COUNT" and isinstance(af.arg, Star):
                 # COUNT(*) FILTER (WHERE p) = count of rows where p is TRUE.
@@ -2173,6 +2205,7 @@ class Engine:
         spec: dict[str, list[str]] = {}
         out_map: list[tuple[str, str, str]] = []
         for af, n in aggs:
+            self._check_cancel()  # per aggregate: setup issues a cuDF filter eval per agg
             fmask = eval_expr(af.filter, src) if af.filter is not None else None
             if af.func == "COUNT" and isinstance(af.arg, Star):
                 if fmask is not None:
@@ -2232,6 +2265,7 @@ class Engine:
         NaN as equal (keeps one) and the reductions skip nulls."""
         pieces: list[cudf.Series] = []
         for af, n in aggs:
+            self._check_cancel()  # per aggregate: each iteration runs a full cuDF groupby.agg over the frame
             fmask = eval_expr(af.filter, src) if af.filter is not None else None
             if af.func == "COUNT" and isinstance(af.arg, Star):
                 # COUNT(*) [FILTER]; distinct+Star is rejected at parse.
@@ -2292,6 +2326,7 @@ class Engine:
         df = self._exec(node.input)
         out = df.reset_index(drop=True).copy()
         for wf, name in node.funcs:
+            self._check_cancel()  # per window function: each is a full sort+groupby+cumulate pipeline
             out[name] = self._window_column(wf, out)
         return out.reset_index(drop=True)
 
@@ -2563,6 +2598,7 @@ class Engine:
             is_bool = wf.func in ("BOOL_AND", "BOOL_OR")
             out: list = [None] * len(arg_h)
             for i in range(len(arg_h)):
+                self._check_cancel()  # per row: an O(n x window) host pandas loop — the longest Python-level loop in the executor
                 if not bool(ne_h[i]):
                     continue                              # empty window -> NULL
                 a, b = int(ps_h[i] + lo_h[i]), int(ps_h[i] + hi_h[i])
@@ -2699,6 +2735,7 @@ class Engine:
         # broadcast without materializing a Python list of len(df) elements.
         out = cudf.DataFrame(index=df.index)
         for e, name in node.items:
+            self._check_cancel()  # per projected column: a wide project is a sequence of eval_expr cuDF calls
             v = eval_expr(e, df)
             out[name] = v  # Series aligns by index; scalar broadcasts to all rows
         return out
