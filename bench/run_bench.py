@@ -133,6 +133,22 @@ QUERIES: dict[str, str] = {
          ORDER BY revenue DESC
          LIMIT 10
     """,
+    # Group-key-in-fact on the fused join path: GROUP BY a FACT-table column
+    # (l_orderkey) reached by the chain, with the join kept by a DIM predicate
+    # (o_orderdate < date '...'). The kernel reads the group code from a fact
+    # column (group_key_col), not the chain tail; the last dim's payload is a
+    # zero array (tail=0 -> g = fcode). Previously deferred (the group key was
+    # not a reached dim); now hits the fused C++ probe kernel (HASH, ~1.5M
+    # distinct orderkeys at SF=10).
+    "Q_join_fact_key": """
+        SELECT l_orderkey, sum(l_extendedprice) AS revenue, count(*) AS n
+          FROM lineitem
+          JOIN orders ON l_orderkey = o_orderkey
+         WHERE o_orderdate < date '1995-03-15'
+         GROUP BY l_orderkey
+         ORDER BY revenue DESC
+         LIMIT 10
+    """,
 }
 
 # Q6 uses BETWEEN, which RyuDB doesn't parse yet -> expand it for the GPU run.
