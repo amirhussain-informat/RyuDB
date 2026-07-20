@@ -306,12 +306,21 @@ psql "host=127.0.0.1 port=5432 user=ryudb dbname=ryudb"
   matching real Postgres). `BEGIN`/`COMMIT`/`ROLLBACK` map to the engine's
   transaction control; a disconnect rolls back the open txn (buffered writes
   were never flushed).
+- **`CancelRequest`** (the v3 startup message with version `80877102`). At
+  startup the server emits `BackendKeyData` (`K`) carrying the session's
+  `(pid, secret)`. A *separate, short-lived* connection may send a
+  `CancelRequest` with that `(pid, secret)`; the server looks up the target
+  session and sets its in-flight cancel `Event` — the cooperative cancel (the
+  same mechanism as the WS `cancel` op) then drops a pending request or raises
+  `CancelledByUser` at the next plan-node boundary of an in-flight one,
+  surfaced to the target as an `ErrorResponse` (`57014`) + `ReadyForQuery`.
+  Cancelling an idle backend is a no-op. A `CancelRequest` gets **no response**
+  (the client just closes the cancel connection); an unknown `(pid, secret)` is
+  silently ignored.
 
 ### Not supported (documented limits)
 
-- **SSL/TLS, GSSAPI, SCRAM/password auth** (no auth). `CancelRequest` is
-  parsed but not wired to the cooperative cancel (`cancel` op) yet — a future
-  PR can map `(pid, secret)` to the connection's pending cancel event.
+- **SSL/TLS, GSSAPI, SCRAM/password auth** (no auth).
 - **`COPY`, `LISTEN`/`NOTIFY`, portal scroll, binary result format (text
   only), binary parameter format (text only).** A client requesting binary
   results/params gets an error.

@@ -28,7 +28,7 @@ import pytest
 
 from ryudb import Catalog, Engine
 from ryudb.server import Server
-from ryudb.server.pgwire import PGServer
+from ryudb.server.pgwire import CANCEL_REQUEST, PGServer
 
 
 # --------------------------------------------------------------------------- #
@@ -597,6 +597,140 @@ def test_terminate_closes_connection(pg):
         with pytest.raises(asyncio.IncompleteReadError):
             await reader.readexactly(1)
         writer.close()
+    _run(client())
+
+
+# --------------------------------------------------------------------------- #
+# CancelRequest (pid, secret) -> cooperative cancel of an in-flight statement
+# --------------------------------------------------------------------------- #
+
+def test_cancel_request_aborts_inflight(pg):
+    """A CancelRequest on a SEPARATE connection carries the target's
+    (pid, secret) (from the BackendKeyData we emit at startup) and sets the
+    target session's in-flight cancel Event. We block the worker INSIDE the
+    first scan of conn A's query, send the CancelRequest on conn B, confirm the
+    Event is set, then release the scan -> the next plan-node boundary (the
+    join's right-input _exec) raises CancelledByUser -> conn A gets an
+    ErrorResponse 57014 + ReadyForQuery (the cooperative cancel from PR #58,
+    now reachable over the PG wire via CancelRequest)."""
+    port, server, ref = pg
+    hold = threading.Event()
+    started = threading.Event()
+    orig = server.engine._scan  # bound method (class _scan bound to the instance)
+    first = [True]
+
+    def blocking_scan(table, columns):
+        # Patched onto the instance dict, so self._scan(a, b) calls this with no
+        # bound self -> signature is (table, columns); orig is the bound original.
+        if first[0]:
+            first[0] = False
+            started.set()
+            hold.wait(5)  # hold the worker mid-query until the test releases it
+        return orig(table, columns)
+
+    server.engine._scan = blocking_scan
+    try:
+        async def client():
+            # conn A: a real session. Capture its (pid, secret) from BackendKeyData.
+            ra, wa = await asyncio.open_connection("127.0.0.1", port)
+            _status, msgs = await _startup(ra, wa)
+            pid = secret = None
+            for t, p in msgs:
+                if t == b"K":
+                    pid, secret = struct.unpack(">II", p)
+            assert pid is not None and secret is not None, "no BackendKeyData"
+
+            # Self-join on lineitem: two scans. Plan Limit -> Project -> Join ->
+            # Scan(a), Scan(b). The first scan blocks; after release the join's
+            # right-input _exec hits the cancel check and raises CancelledByUser.
+            qsql = (b"SELECT a.l_orderkey FROM lineitem a JOIN lineitem b "
+                    b"ON a.l_orderkey = b.l_orderkey LIMIT 5")
+            wa.write(_fmsg(b"Q", qsql + b"\x00"))
+            await wa.drain()
+            qtask = asyncio.create_task(_drain_until_ready(ra))
+
+            # Wait for the worker to reach the blocking scan (conn A's request is
+            # now in flight; engine.cancel_event is the per-request Event).
+            for _ in range(500):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set(), "conn A query did not reach the blocking scan"
+
+            # conn B: a short-lived CancelRequest connection. It sends ONLY the
+            # CancelRequest startup message (version 80877102 + pid + secret) and
+            # closes; the server sets conn A's cancel Event and closes conn B.
+            rb, wb = await asyncio.open_connection("127.0.0.1", port)
+            body = struct.pack(">I", CANCEL_REQUEST) + struct.pack(">II", pid, secret)
+            wb.write(struct.pack(">I", len(body) + 4) + body)
+            await wb.drain()
+
+            # Deterministically confirm the CancelRequest reached the target
+            # (cancel_backend set conn A's Event = engine.cancel_event) BEFORE
+            # releasing the blocked scan, so the next node boundary sees it.
+            ev = None
+            for _ in range(500):
+                ev = server.engine.cancel_event
+                if ev is not None and ev.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert ev is not None and ev.is_set(), "CancelRequest did not set the cancel Event"
+            wb.close()
+            await wb.wait_closed()
+
+            # Release the blocked scan -> the join's right-input _exec checks the
+            # (now set) cancel Event and raises CancelledByUser -> 57014.
+            hold.set()
+            status, qmsgs = await asyncio.wait_for(qtask, timeout=5)
+            err = None
+            for t, p in qmsgs:
+                if t == b"E":
+                    err = _parse_error(p)
+            assert err is not None, "expected an ErrorResponse (cancel)"
+            assert err.get("C") == "57014", f"expected SQLSTATE 57014, got {err.get('C')}"
+            assert status == "I"  # autocommit SELECT, not in a txn
+            wa.close()
+            await wa.wait_closed()
+
+        _run(client())
+    finally:
+        hold.set()  # never leave the worker blocked if the test errored
+        server.engine._scan = orig
+
+
+def test_cancel_request_unknown_backend_is_noop(pg):
+    """A CancelRequest for a (pid, secret) that matches no live session is a
+    no-op: the cancel connection just closes, and a concurrent real query on a
+    DIFFERENT connection runs to completion (not cancelled)."""
+    port, *_ = pg
+
+    async def client():
+        # conn A: a real session running a normal query to completion.
+        ra, wa = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(ra, wa)
+        wa.write(_fmsg(b"Q", b"SELECT count(*) FROM lineitem\x00"))
+        await wa.drain()
+        qtask = asyncio.create_task(_drain_until_ready(ra))
+
+        # conn B: CancelRequest with a bogus (pid, secret) that matches nobody.
+        rb, wb = await asyncio.open_connection("127.0.0.1", port)
+        body = struct.pack(">I", CANCEL_REQUEST) + struct.pack(">II", 1, 999999)
+        wb.write(struct.pack(">I", len(body) + 4) + body)
+        await wb.drain()
+        wb.close()
+        await wb.wait_closed()
+
+        # conn A's query must complete normally (a count), NOT be cancelled.
+        status, qmsgs = await asyncio.wait_for(qtask, timeout=5)
+        tag = None
+        for t, p in qmsgs:
+            if t == b"C":
+                tag = _parse_command_complete(p)
+        assert tag is not None, "conn A query did not complete normally"
+        assert not any(t == b"E" for t, _ in qmsgs), "conn A was unexpectedly cancelled"
+        wa.close()
+        await wa.wait_closed()
+
     _run(client())
 
 
