@@ -163,8 +163,20 @@ button.dl { padding: 2px 8px; font-size: 11px; }
 .grid-row .grid-cell { cursor: pointer; }
 .grid-row .grid-cell:hover { background: var(--bg-3); }
 .grid-row .grid-cell.copied { background: var(--ok); color: #0b0b0b; }
-.grid-head { background: var(--bg-3); color: var(--fg); font-weight: 600; position: sticky; top: 0; }
+.grid-head { background: var(--bg-3); color: var(--fg); font-weight: 600; position: sticky; top: 0; cursor: pointer; user-select: none; }
+.grid-head:hover { background: var(--bg-2); }
+.grid-head.sorted { color: var(--accent); border-bottom: 2px solid var(--accent); }
+.col-name-h { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .col-type { color: var(--fg-dim); font-weight: 400; font-size: 10px; margin-left: 6px; }
+/* per-column substring filter row (toggled by the Filter button) */
+.grid-filter { display: grid; }
+.filter-input {
+  background: var(--bg); color: var(--fg); border: none;
+  border-right: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  padding: 3px 6px; font-family: monospace; font-size: 11px; width: 100%;
+  outline: none;
+}
+.filter-input:focus { background: var(--bg-2); box-shadow: inset 0 0 0 1px var(--accent); }
 
 /* explain */
 .plan-tree, .plan-tree ul { list-style: none; margin: 0; padding-left: 18px; }
