@@ -24,11 +24,16 @@ Supported
   - Per-connection transactions; ``ReadyForQuery`` status ``I``/``T``/``E``
     (idle / in-txn / aborted-txn — the latter gates further statements on
     ``ROLLBACK``, matching real Postgres).
+  - ``CancelRequest`` (the v3 startup message with version 80877102): a separate
+    short-lived connection sends ``(pid, secret)`` (from the ``BackendKeyData``
+    we emit at startup) and we set the target session's in-flight cancel
+    ``Event`` — the cooperative cancel (PR #58) then drops a pending request or
+    raises ``CancelledByUser`` at the next plan-node boundary of an in-flight
+    one, surfaced as ErrorResponse 57014. Cancel of an idle backend is a no-op.
+    A CancelRequest gets no response (the client just closes).
 
 Not supported (documented limits)
-  - SSL/TLS, GSSAPI, SCRAM/password auth (no auth). ``CancelRequest`` is not
-    wired to the cooperative cancel (PR #58) yet — a future PR can map
-    ``(pid, secret)`` to the connection's pending cancel event.
+  - SSL/TLS, GSSAPI, SCRAM/password auth (no auth).
   - ``COPY``, ``LISTEN``/``NOTIFY``, portal scroll, binary result format
     (text only), binary param format (text only). A client requesting binary
     results/params gets an error.
@@ -376,11 +381,16 @@ class PGConn:
                 await self._send(b"N")  # no SSL/GSS; client retries plain
                 continue
             if version == CANCEL_REQUEST:
-                # int32 pid, int32 secret. Find the target connection and set its
-                # cancel event (cooperative cancel, PR #58). Not wired yet: we
-                # only parse and close. (A future PR maps pid+secret -> event.)
+                # int32 pid, int32 secret. Cancel the target backend's running
+                # statement (cooperative cancel, PR #58): look up the session by
+                # (pid, secret) and set its in-flight request's cancel Event. A
+                # CancelRequest gets NO response — the client closes this
+                # connection immediately after sending, so we just return False
+                # (the _handler closes the socket) regardless of whether a target
+                # was found.
                 if len(body) >= 12:
-                    _pid, _secret = struct.unpack(">II", body[4:12])
+                    pid, secret = struct.unpack(">II", body[4:12])
+                    self.pg.cancel_backend(pid, secret)
                 return False
             if version == PROTOCOL_V3:
                 # key-value cstring pairs (user, database, ...); we ignore them
@@ -702,6 +712,35 @@ class PGServer:
         self.port = port
         self.max_rows = max_rows
         self._srv: Any = None
+        # (pid, secret) -> PGConn, so a CancelRequest on a SEPARATE connection
+        # can find the target backend. asyncio is single-threaded (one loop), so
+        # this dict needs no lock; all access is on the loop thread. The 32-bit
+        # secret is per-connection random (pid is the constant os.getpid()), so
+        # the pair uniquely identifies a live session.
+        self._by_key: dict[tuple[int, int], PGConn] = {}
+
+    def cancel_backend(self, pid: int, secret: int) -> bool:
+        """Cancel the currently-running statement on the backend identified by
+        ``(pid, secret)``, if one is in flight. Returns True if a target session
+        was found (a cancel of an idle backend is a no-op — ``_cancel`` is None
+        between statements, so we just don't set anything; that matches real
+        Postgres, where cancelling an idle connection does nothing).
+
+        Called from a CancelRequest arriving on a SEPARATE, short-lived
+        connection. Setting the target's per-request ``Event`` reaches the
+        worker two ways (PR #58): if the request is still PENDING in the queue,
+        the worker drops it on dequeue (``worker.py`` cancel.is_set() check); if
+        it is IN FLIGHT, the executor raises ``CancelledByUser`` at the next
+        plan-node boundary (``executor._exec`` checks ``engine.cancel_event``,
+        which is the SAME ``Event`` the worker publishes). The target's ``loop``
+        then surfaces it as an ErrorResponse 57014 + ReadyForQuery."""
+        conn = self._by_key.get((pid, secret))
+        if conn is None:
+            return False
+        ev = conn._cancel
+        if ev is not None:
+            ev.set()
+        return True
 
     async def _handler(self, reader, writer) -> None:
         conn = PGConn(self.server, self, reader, writer)
@@ -711,6 +750,11 @@ class PGServer:
         try:
             if not await conn.startup():
                 return
+            # Register the session by its (pid, secret) so a CancelRequest on
+            # another connection can find it. Only real sessions register — a
+            # CancelRequest connection returns False from startup() and never
+            # reaches here.
+            self._by_key[(conn.pid, conn.secret)] = conn
             await conn.loop()
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             pass
@@ -720,6 +764,7 @@ class PGServer:
             # Drop the session: an open txn is rolled back by dropping the
             # reference (buffered writes were never flushed). Mirrors the WS
             # disconnect path (PR #61).
+            self._by_key.pop((conn.pid, conn.secret), None)
             self.server._conns.pop(id(conn), None)
             try:
                 writer.close()
