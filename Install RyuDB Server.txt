@@ -1,0 +1,34 @@
+ Prerequisites — the conda env (provides cuDF + nvcc)
+
+    The ryudb conda env must exist first (CUDA 13.3, cuDF 26.06, libnvcomp, pybind11, etc.). It's reproduced from docker/env.yml if you're
+    starting fresh:
+
+    mamba env create -f docker/env.yml
+
+    Install RyuDB into the env
+
+    conda activate ryudb
+    pip install .                    # editable: pip install -e .
+    ryudb build                      # compile the C++/CUDA fused kernel (nvcc + pybind11)
+
+    Notes from the project:
+    - pip install . uses --no-deps semantics in the Docker flow because deps are satisfied by conda (cudf is not on PyPI under that name).
+    For a local install into the already-correct conda env, plain pip install . (or -e .) works.
+    - ryudb build (a.k.a. python -m ryudb.kernels.build) compiles fused.cu + pqpages.cpp → fused.so, linking libnvcomp with an rpath to
+    $CONDA_PREFIX/lib. It needs CONDA_PREFIX set (i.e., the env activated) so it finds nvcc, the conda host compiler, and libnvcomp.
+    - The fused kernel is optional — if absent/stale, the executor falls back to Numba/cuDF, so ryudb build is never required for
+    correctness (only for the fused star-join+aggregate hot path).
+    - RYUDB_CUDA_ARCH selects the target GPU (default sm_86 for RTX 3090; comma-list like sm_80,sm_86,sm_89,sm_90 builds a fat binary).
+
+    Run
+
+    ryudb                           # start the REPL
+    ryudb-server --data ./data --host 127.0.0.1 --port 5430 --pg-port 5432
+
+    Docker alternative (single artifact)
+
+    docker build -t ryudb -f docker/Dockerfile .
+    docker run --gpus all -p 5430:5430 -p 5432:5432 -v ryudb-data:/data ryudb
+
+    (The Docker image was not built in the dev environment — no Docker in the WSL distro — so docker/smoke.sh is the validation step on a
+    Docker-equipped host.)
