@@ -95,6 +95,12 @@ parse error with position — the same wire path the browser uses.
   catalog + query history in one place: type to fuzzy-filter tables, columns,
   and past queries; pick a table/column to drop it into the editor at the
   cursor, or pick a history entry to load its SQL into the active worksheet.
+- **Worksheet version history** (`Ctrl/Cmd+Shift+H`) keeps a per-worksheet ring
+  of saved SQL snapshots (newest first, capped at 30) in `localStorage`,
+  independent of the server-side query history. A snapshot is captured each
+  time you run a query (deduped against the latest) or on demand via “Save
+  version”; restore loads a snapshot back into the editor, delete/clear prune
+  the ring, and rings for closed worksheets are garbage-collected.
 - Monaco is bundled locally from the `monaco-editor` package (a SQL-only subset:
   the editor API + editor contributions + the SQL tokenizer, wired in
   `src/monaco.ts`), so the worksheet works fully offline — no CDN fetch at

@@ -207,6 +207,18 @@ button.dl { padding: 2px 8px; font-size: 11px; }
 .palette-item.static { cursor: default; }
 .palette-item.static:hover { background: none; }
 .palette-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* version history */
+.vhist-head { display: flex; justify-content: space-between; align-items: center; }
+.vhist-actions { display: flex; gap: 6px; flex: none; }
+.vhist-actions button { padding: 2px 8px; font-size: 11px; }
+.vhist-row { align-items: center; }
+.vhist-sql { display: flex; flex-direction: column; gap: 1px; overflow: hidden; }
+.vhist-preview { font-family: monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vhist-time { color: var(--fg-dim); font-size: 10px; }
+.vhist-row-actions { display: flex; gap: 4px; flex: none; }
+.vhist-row-actions button { padding: 2px 7px; font-size: 11px; }
+.vhist-del { color: var(--err); }
 .palette-meta { display: flex; align-items: center; gap: 8px; flex: none; }
 .palette-group { color: var(--fg-dim); font-size: 11px; }
 .palette-hint {
