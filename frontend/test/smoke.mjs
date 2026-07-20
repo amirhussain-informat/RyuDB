@@ -160,6 +160,21 @@ check("export bytes present", exRes.bytes instanceof Uint8Array && exRes.bytes.l
 check("export parquet magic", exRes.bytes && exRes.bytes[0] === 0x50 && exRes.bytes[1] === 0x41 && exRes.bytes[2] === 0x52 && exRes.bytes[3] === 0x31, "PAR1 head");
 check("export bad format errors", (await call(ws, { id: "x2", op: "export", sql: "SELECT l_orderkey FROM lineitem LIMIT 1", format: "csv" })).meta.op === "error");
 
+// 10. admin register/drop (the wire path the data-load wizard + drop button use)
+const loadOk = await call(ws, { id: "ld", op: "admin", action: "register", args: { table: "li_copy", path: LIPATH } });
+check("admin register ok", loadOk.meta.op === "ok" && loadOk.meta.detail?.registered === "li_copy", JSON.stringify(loadOk.meta));
+const catAfter = await call(ws, { id: "cat1", op: "catalog" });
+check("catalog lists new table", catAfter.meta.op === "catalog" && catAfter.meta.tables.some((t) => t.name === "li_copy"), JSON.stringify(catAfter.meta.tables?.map((t) => t.name)));
+const copyCnt = await call(ws, { id: "cc", op: "sql", sql: "SELECT count(*) AS c FROM li_copy" });
+check("new table queryable", copyCnt.meta.op === "result" && copyCnt.table && Number(cells(copyCnt.table, 0).c) === N, JSON.stringify(copyCnt.meta));
+const dropOk = await call(ws, { id: "dr", op: "admin", action: "drop", args: { table: "li_copy" } });
+check("admin drop ok", dropOk.meta.op === "ok" && dropOk.meta.detail?.dropped === true, JSON.stringify(dropOk.meta));
+const catAfterDrop = await call(ws, { id: "cat2", op: "catalog" });
+check("catalog no longer lists dropped table", !catAfterDrop.meta.tables.some((t) => t.name === "li_copy"), JSON.stringify(catAfterDrop.meta.tables?.map((t) => t.name)));
+// (A SELECT on the dropped name may still hit the engine's scan cache — a
+// pre-existing server behavior, out of scope for the UI's drop contract, which
+// is "the catalog no longer lists it" — asserted above.)
+
 ws.close();
 if (failures === 0) {
   console.log("SMOKE OK");

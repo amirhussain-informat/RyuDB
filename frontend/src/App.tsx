@@ -12,6 +12,7 @@ import ShortcutsHelp from "./components/ShortcutsHelp";
 import SearchModal from "./components/SearchModal";
 import VersionHistory from "./components/VersionHistory";
 import ProfileModal from "./components/ProfileModal";
+import LoadDataModal from "./components/LoadDataModal";
 import Results from "./components/Results";
 import Chart from "./components/Chart";
 import Explain from "./components/Explain";
@@ -130,6 +131,9 @@ export default function App() {
   // applyResult). Passed down to SqlEditor; a SELECT does not bump the nonce.
   const [schema, setSchema] = useState<Schema>(new Map());
   const [schemaNonce, setSchemaNonce] = useState(0);
+  // Data-load wizard open state + a catalog refresh signal bumped after DDL.
+  const [loadOpen, setLoadOpen] = useState(false);
+  const [catalogNonce, setCatalogNonce] = useState(0);
   const [sidebar, setSidebar] = useState<"catalog" | "history">("catalog");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -584,6 +588,40 @@ export default function App() {
     const res = await op({ id: "prof", op: "profile", name, top_k: 10 });
     return res.meta.op === "profile" ? (res.meta as ProfileResp) : null;
   };
+  // DDL via the `admin` op (register/drop/rename/alter — the engine has no
+  // SQL-level DDL parser, so all table management goes through admin). Throws
+  // with the server's message on an error frame so callers can surface it.
+  const fetchAdmin = async (
+    action: string,
+    args: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown>> => {
+    const res = await op({ id: "adm", op: "admin", action, args });
+    const m = res.meta;
+    if (m.op === "ok") return (m as { detail?: Record<string, unknown> }).detail ?? {};
+    if (m.op === "error") throw new Error((m as ErrorResp).message ?? "admin error");
+    throw new Error(`unexpected admin response: ${m.op}`);
+  };
+  // After any DDL, re-fetch the catalog list + the autocomplete schema.
+  const refreshAfterDdl = () => {
+    setCatalogNonce((n) => n + 1);
+    setSchemaNonce((n) => n + 1);
+  };
+  const handleLoad = async (name: string, path: string) => {
+    await fetchAdmin("register", { table: name, path });
+    refreshAfterDdl();
+  };
+  const handleDrop = async (name: string) => {
+    if (!window.confirm(`Drop table "${name}"?\n\nThis unregisters it from the catalog. Source files are kept.`)) {
+      return;
+    }
+    try {
+      await fetchAdmin("drop", { table: name });
+      refreshAfterDdl();
+    } catch (e) {
+      setMessage(`drop failed: ${(e as Error).message}`);
+      setMainTab("message");
+    }
+  };
 
   const connected = status === "open";
   const activeMeta = result?.meta as ResultMeta | undefined;
@@ -627,6 +665,7 @@ export default function App() {
     })),
     { id: "theme", label: "Toggle dark / light theme", group: "View", run: toggleTheme },
     { id: "sidebar-catalog", label: "Open Catalog sidebar", group: "View", disabled: sidebar === "catalog", run: () => setSidebar("catalog") },
+    { id: "load-data", label: "Load data from parquet path", group: "Data", disabled: status !== "open", run: () => setLoadOpen(true) },
     { id: "sidebar-history", label: "Open History sidebar", group: "View", disabled: sidebar === "history", run: () => setSidebar("history") },
     { id: "shortcuts", label: "Show keyboard shortcuts", hint: "?", group: "Help", run: () => setShortcutsOpen(true) },
   ];
@@ -658,7 +697,10 @@ export default function App() {
               onInsert={(t) => editorRef.current?.insert(t)}
               onSample={sample}
               onProfile={(name) => setProfileName(name)}
+              onLoad={() => setLoadOpen(true)}
+              onDrop={handleDrop}
               status={status}
+              nonce={catalogNonce}
             />
           ) : (
             <History
@@ -793,6 +835,11 @@ export default function App() {
         name={profileName}
         fetchProfile={fetchProfile}
         onClose={() => setProfileName(null)}
+      />
+      <LoadDataModal
+        open={loadOpen}
+        onSubmit={handleLoad}
+        onClose={() => setLoadOpen(false)}
       />
     </div>
   );
