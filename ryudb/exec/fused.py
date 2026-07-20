@@ -1111,22 +1111,46 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     stats = engine.catalog.stats_dict()
     fact_scan = max(scans, key=lambda s: stats.get(s.table, 0))
     fact_table = fact_scan.table
-    target_dim = None
+    # Classify the group keys by table. The fused join path supports group keys
+    # on the FACT and/or the LAST dim (the chain terminus): the host factorises
+    # the fact keys (one side) and the dim keys (the other side) and the kernel
+    # combines g = fact_code*n_dim_combos + dim_code (PR #37). Split accordingly:
+    #   fact_keys  -- group keys on the fact table
+    #   dim_keys   -- group keys on a single dim (must all be on the SAME dim,
+    #                 and -- when there are fact keys -- on the chain terminus;
+    #                 a key on a middle dim would need a payload the chain does
+    #                 not carry -> defer).
+    fact_keys: list[str] = []
+    dim_keys: list[str] = []
+    dim_key_table: str | None = None
     for c in gkey_cols:
         t = col_to_table.get(c)
         if t is None:
             return None  # unknown group-key column -> defer
-        if target_dim is None:
-            target_dim = t
-        elif t != target_dim:
-            return None  # group keys span >1 table (fact + a dim) -> defer (PR #37)
-    # group_key_on_fact: the group key(s) live on the fact table, not a reached
-    # dim. The kernel then reads the group code from a fact column
-    # (group_key_col) instead of the chain tail. The path is the FULL chain (all
-    # dims are joined for the WHERE / for their own sake -- none is the "group-key
-    # dim"). Outer plans defer for this case (a fact row always carries its own
-    # group key, but the spanning/outer interaction is subtle); inner-only v1.
-    group_key_on_fact = (target_dim == fact_table)
+        if t == fact_table:
+            fact_keys.append(c)
+        else:
+            if dim_key_table is None:
+                dim_key_table = t
+            elif t != dim_key_table:
+                return None  # dim group keys span >1 dim -> defer
+            dim_keys.append(c)
+    # group_key_on_fact: at least one group key lives on the fact -> the kernel
+    # reads the fact-part code from a fact column (group_key_col) and the path
+    # walks the FULL chain (every dim joined for the WHERE / for its own sake;
+    # none is the "group-key dim"). Outer plans defer for this case (a fact row
+    # always carries its own group key, but the spanning/outer interaction is
+    # subtle); inner-only v1.
+    group_key_on_fact = bool(fact_keys)
+    # group_spans: the Q3 shape -- fact keys AND dim keys both present -> the
+    # kernel combines a fact-part code (group_key_col) with a dim-part tail
+    # (the stride-combined dim codes) via group_stride = n_dim_combos. Pure
+    # CASE 2 (fact keys only) and CASE 3 (dim keys only) do not span.
+    group_spans = group_key_on_fact and bool(dim_keys)
+    # The single-table target_dim (the dim the chain walks to) is dim_key_table
+    # when every key is on one dim (CASE 1/3); the full-chain terminus is set
+    # after the BFS when group_key_on_fact (CASE 2 / spanning).
+    target_dim = dim_key_table
 
     # Undirected adjacency over the join tree. Each entry is (neigh, col_here,
     # col_neigh, how, here_is_left): here_is_left marks whether the table we're
@@ -1160,6 +1184,11 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
         return None  # a dim is disconnected from fact -> not a single chain -> defer
     if group_key_on_fact:
         target_dim = order[-1]  # the far-end dim (terminus of the full chain)
+        # Spanning (fact keys + dim keys): the dim keys must live on the terminus
+        # (the chain only carries the LAST dim's payload, so a middle-dim group
+        # key is unreachable -> defer). Pure CASE 2 (no dim keys) skips this.
+        if group_spans and dim_key_table != target_dim:
+            return None  # dim group keys on a non-terminus dim -> defer
     elif target_dim not in parent:
         return None  # group-key dim not reachable from fact -> defer
 
@@ -1353,10 +1382,20 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     for c in fact_cols_needed:
         if c not in fact_frame.columns:
             return None
-    if group_key_on_fact:
-        for c in gkey_cols:
-            if c not in fact_frame.columns:
+    # Group-key cols are factorised on the HOST (any dtype), never bind_fact'd.
+    # The fact keys must survive projection pushdown on the fact; the dim keys
+    # on the last dim. (For pure CASE 2 dim_keys is empty; for CASE 1/3 fact_keys
+    # is empty and dim_keys == gkey_cols.)
+    for c in fact_keys:
+        if c not in fact_frame.columns:
+            return None
+    if dim_keys:
+        last_dim = path_dims[-1][0]
+        for c in dim_keys:
+            if c not in dim_frames[-1].columns:
                 return None
+        if any(c not in schema.get(last_dim, []) for c in dim_keys):
+            return None
     for j in range(n_joins):
         if path_dims[j][1] not in dim_frames[j].columns or payloads[j] not in dim_frames[j].columns:
             return None
@@ -1428,6 +1467,19 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     gkey_uniques: list = []
     gkey_sizes: list[int] = []      # multi-key: per-key NDV (decode decomposition)
     gkey_strides: list[int] = []   # multi-key: per-key stride (row-major, last=1)
+    # Spanning (PR #37): the dim-part of the combined group code. Built in the
+    # dim loop (factorising the dim keys off the last dim), consumed in the
+    # post-loop fact-part derivation (group_stride = n_dim_combos) and the
+    # two-level decode. Pure CASE 2 leaves n_dim_combos = 1 (no dim keys).
+    n_dim_combos = 1
+    dim_part_uniques: list = []     # per-dim-key factorise uniques (dim side)
+    dim_part_sizes: list[int] = []  # per-dim-key NDV (dim side)
+    dim_part_strides: list[int] = []  # per-dim-key stride, row-major (dim side)
+    # fact_part_* mirror the dim side for the fact keys (set in the post-loop
+    # spanning branch; pure CASE 2 reuses gkey_uniques/gkey_sizes/gkey_strides).
+    fact_part_uniques: list = []
+    fact_part_sizes: list[int] = []
+    fact_part_strides: list[int] = []
 
     def _as_int64(series):
         if np.issubdtype(series.dtype, np.int64):
@@ -1455,16 +1507,47 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
         else:
             # Last dim.
             if group_key_on_fact:
-                # The group key lives on the FACT (CASE 2: single key on the fact,
-                # e.g. GROUP BY l_orderkey with the join kept by a WHERE on a dim).
-                # The chain tail is a dummy: the kernel forms g = fcode*stride + tail
-                # with stride=1, so tail must be 0 -> g = fcode (the fact-row code).
-                # A zero payload (one 0 per dim row) makes tail=0 on every hit; a
-                # miss drops the row before g is formed. n_groups / gkey_uniques come
-                # from the fact-key factorise after the loop, not here.
-                zero = cuda.to_device(np.zeros(len(dframe), dtype=np.int64))
-                _kept.append(zero)
-                dim_payload_ptrs.append(_dev_ptr(zero))
+                if group_spans:
+                    # PR #37 spanning: dim keys live on this last dim. Factorise each
+                    # off the (possibly filtered) dframe and stride-combine into one
+                    # int64 dim-part code (a lossless perfect hash of the dim-key
+                    # tuple) -> the chain tail. The kernel then forms g = fcode *
+                    # n_dim_combos + tail, where fcode is the fact-part code (bound
+                    # after the loop) and n_dim_combos = product(dim NDVs). Each col
+                    # is factorised DIRECTLY off dframe (NOT engine.get_codes -- that
+                    # caches by (table,col) over the full scan and returns stale
+                    # codes for a filtered dim). Multi-key outer defers above.
+                    per_uniq: list = []
+                    sizes: list[int] = []
+                    per_codes: list = []
+                    for c in dim_keys:
+                        cc, cu = dframe[c].factorize()
+                        per_codes.append(cc)
+                        per_uniq.append(list(cu.to_pandas()))
+                        sizes.append(len(per_uniq[-1]))
+                    strides = [int(np.prod(sizes[j + 1:], dtype=np.int64))
+                               for j in range(len(dim_keys))]
+                    combined = _as_int64(per_codes[0]) * strides[0]
+                    for jj in range(1, len(dim_keys)):
+                        combined = combined + _as_int64(per_codes[jj]) * strides[jj]
+                    _kept.append(combined)
+                    dim_payload_ptrs.append(_dev_ptr(combined))
+                    n_dim_combos = int(np.prod(sizes, dtype=np.int64))
+                    dim_part_uniques = per_uniq
+                    dim_part_sizes = sizes
+                    dim_part_strides = strides
+                else:
+                    # The group key lives on the FACT (CASE 2: single/multi key on
+                    # the fact, e.g. GROUP BY l_orderkey with the join kept by a WHERE
+                    # on a dim). The chain tail is a dummy: the kernel forms g =
+                    # fcode*stride + tail with stride=1, so tail must be 0 -> g = fcode
+                    # (the fact-row code). A zero payload (one 0 per dim row) makes
+                    # tail=0 on every hit; a miss drops the row before g is formed.
+                    # n_groups / gkey_uniques come from the fact-key factorise after
+                    # the loop, not here.
+                    zero = cuda.to_device(np.zeros(len(dframe), dtype=np.int64))
+                    _kept.append(zero)
+                    dim_payload_ptrs.append(_dev_ptr(zero))
             else:
                 # Last dim, group key(s) on this dim (group_key_on_fact is False --
                 # the fact-key path appends the zero payload in the branch above).
@@ -1540,33 +1623,66 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     # the fact-key factorise (the output decodes code c -> f_uniq[c]).
     if group_key_on_fact:
         if multi_key:
-            # CASE 2 generalization (multi-key on the fact): stride-combine the
-            # factorised fact key cols into one dense int64 code, bind it as a NEW
-            # fact col (group_key_col). stride=1 + a zero last-dim payload -> tail=0
-            # -> g = combined. n_groups = product(NDVs); the output decomposes code
-            # c -> per-key sub-codes -> f_uniques[j].
-            per_uniq: list = []
-            sizes: list[int] = []
-            per_codes: list = []
-            for c in gkey_cols:
-                cc, cu = fact_frame[c].factorize()
-                per_codes.append(cc)
-                per_uniq.append(list(cu.to_pandas()))
-                sizes.append(len(per_uniq[-1]))
-            strides = [int(np.prod(sizes[j + 1:], dtype=np.int64))
-                       for j in range(len(gkey_cols))]
-            combined = _as_int64(per_codes[0]) * strides[0]
-            for jj in range(1, len(gkey_cols)):
-                combined = combined + _as_int64(per_codes[jj]) * strides[jj]
-            _kept.append(combined)
-            group_key_col = len(col_ptrs)
-            col_ptrs.append(_dev_ptr(_as_int64(combined)))
-            col_dtypes.append(_DT_INT64)
-            group_stride = 1
-            n_groups = int(np.prod(sizes, dtype=np.int64))
-            gkey_uniques = per_uniq
-            gkey_sizes = sizes
-            gkey_strides = strides
+            if group_spans:
+                # PR #37 spanning (fact keys + dim keys): stride-combine the fact
+                # keys into one dense int64 fact-part code (f_combined), bind it as
+                # a NEW fact col (group_key_col). group_stride = n_dim_combos (set
+                # in the dim loop) and the last-dim payload = the dim-part code ->
+                # the kernel forms g = fcode*n_dim_combos + dim_part. n_groups =
+                # n_fact_combos * n_dim_combos; the read-out decomposes the fact-
+                # part (g // n_dim_combos) and dim-part (g % n_dim_combos) separately
+                # into per-key sub-codes. Multi-key outer defers above.
+                per_uniq: list = []
+                sizes: list[int] = []
+                per_codes: list = []
+                for c in fact_keys:
+                    cc, cu = fact_frame[c].factorize()
+                    per_codes.append(cc)
+                    per_uniq.append(list(cu.to_pandas()))
+                    sizes.append(len(per_uniq[-1]))
+                strides = [int(np.prod(sizes[j + 1:], dtype=np.int64))
+                           for j in range(len(fact_keys))]
+                combined = _as_int64(per_codes[0]) * strides[0]
+                for jj in range(1, len(fact_keys)):
+                    combined = combined + _as_int64(per_codes[jj]) * strides[jj]
+                _kept.append(combined)
+                group_key_col = len(col_ptrs)
+                col_ptrs.append(_dev_ptr(_as_int64(combined)))
+                col_dtypes.append(_DT_INT64)
+                group_stride = n_dim_combos
+                n_groups = int(np.prod(sizes, dtype=np.int64)) * n_dim_combos
+                fact_part_uniques = per_uniq
+                fact_part_sizes = sizes
+                fact_part_strides = strides
+            else:
+                # CASE 2 generalization (multi-key on the fact, no dim keys):
+                # stride-combine the factorised fact key cols into one dense int64
+                # code, bind it as a NEW fact col (group_key_col). stride=1 + a zero
+                # last-dim payload -> tail=0 -> g = combined. n_groups = product
+                # (NDVs); the output decomposes code c -> per-key sub-codes ->
+                # f_uniques[j].
+                per_uniq: list = []
+                sizes: list[int] = []
+                per_codes: list = []
+                for c in gkey_cols:
+                    cc, cu = fact_frame[c].factorize()
+                    per_codes.append(cc)
+                    per_uniq.append(list(cu.to_pandas()))
+                    sizes.append(len(per_uniq[-1]))
+                strides = [int(np.prod(sizes[j + 1:], dtype=np.int64))
+                           for j in range(len(gkey_cols))]
+                combined = _as_int64(per_codes[0]) * strides[0]
+                for jj in range(1, len(gkey_cols)):
+                    combined = combined + _as_int64(per_codes[jj]) * strides[jj]
+                _kept.append(combined)
+                group_key_col = len(col_ptrs)
+                col_ptrs.append(_dev_ptr(_as_int64(combined)))
+                col_dtypes.append(_DT_INT64)
+                group_stride = 1
+                n_groups = int(np.prod(sizes, dtype=np.int64))
+                gkey_uniques = per_uniq
+                gkey_sizes = sizes
+                gkey_strides = strides
         else:
             f_codes, f_uniq = fact_frame[ge.name].factorize()
             f_uniq = list(f_uniq.to_pandas())
@@ -1690,6 +1806,51 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
             agg_vals.append([int(x) for x in vals.astype(np.int64)])
         else:  # SUM
             agg_vals.append([float(x) for x in vals])
+
+    if group_spans:
+        # PR #37 two-level decode: g = fcode * n_dim_combos + dim_part, where fcode
+        # is the fact-part stride-combined code and dim_part the dim-part stride-
+        # combined code. Decompose the fact-part (g // n_dim_combos) and dim-part
+        # (g % n_dim_combos) separately, then each side into its per-key sub-codes
+        # (row-major strides). gkey_names may interleave fact and dim keys, so build
+        # per-name side info aligned to the gkey_cols order (fact_keys / dim_keys
+        # were appended in gkey order, so fact_part_*[i] is the i-th fact key in
+        # gkey order, dim_part_*[i] the i-th dim key). multi_key outer defers above,
+        # so g is a plain combined code in 0..n_groups-1.
+        fact_set = set(fact_keys)
+        is_fact_key: list[bool] = []
+        sub_stride: list[int] = []
+        sub_size: list[int] = []
+        sub_uniq: list = []
+        fi = 0  # index into fact_part_* (advances per fact key in gkey order)
+        di = 0  # index into dim_part_*  (advances per dim key in gkey order)
+        for c in gkey_cols:
+            if c in fact_set:
+                is_fact_key.append(True)
+                sub_stride.append(fact_part_strides[fi])
+                sub_size.append(fact_part_sizes[fi])
+                sub_uniq.append(fact_part_uniques[fi])
+                fi += 1
+            else:
+                is_fact_key.append(False)
+                sub_stride.append(dim_part_strides[di])
+                sub_size.append(dim_part_sizes[di])
+                sub_uniq.append(dim_part_uniques[di])
+                di += 1
+        key_vals_per: list[list] = [[] for _ in gkey_names]
+        for c in codes:
+            ci = int(c)
+            fpart = ci // n_dim_combos
+            dpart = ci % n_dim_combos
+            for j in range(len(gkey_names)):
+                base = fpart if is_fact_key[j] else dpart
+                sub = (base // sub_stride[j]) % sub_size[j]
+                key_vals_per[j].append(sub_uniq[j][sub])
+        data: dict = {gn: cudf.Series(kv) for gn, kv in zip(gkey_names, key_vals_per)}
+        for a, (af, n_) in enumerate(aggs):
+            data[n_] = cudf.Series(agg_vals[a])
+        out = cudf.DataFrame(data)
+        return out[[*gkey_names] + [n_ for _, n_ in aggs]]
 
     if multi_key:
         # Decompose the stride-combined code into per-key sub-codes and map each

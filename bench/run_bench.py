@@ -71,6 +71,17 @@ QUERIES: dict[str, str] = {
            AND l_discount BETWEEN 0.05 AND 0.07
            AND l_quantity < 24
     """,
+    # Full Q3 (shipping priority): a group key on the FACT (l_orderkey) plus two
+    # group keys on a reached DIM (o_orderdate, o_shippriority on orders), with a
+    # cross-table WHERE (c_mktsegment='BUILDING' on customer, o_orderdate on
+    # orders, l_shipdate on lineitem). This spans fact + a dim -- PR #37 composes
+    # it: the host factorises the fact key and the dim keys into two stride-
+    # combined codes, the kernel forms g = fcode*n_dim_combos + dim_part, and the
+    # read-out two-level decodes each side. Previously deferred to cuDF (the path
+    # only handled single group keys, then same-table multi-key); now hits the
+    # fused C++ probe kernel (HASH, ~10k groups at SF=10) -- the headline TPC-H
+    # query the three prior fused-join PRs (#52 fold-WHERE, #35 group-in-fact,
+    # #36 multi-key) were staged to unblock.
     "Q3_shipping_priority": """
         SELECT l_orderkey, sum(l_extendedprice * (1 - l_discount)) AS revenue,
                o_orderdate, o_shippriority
