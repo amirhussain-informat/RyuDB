@@ -3,12 +3,14 @@ import { tableToIPC, Table } from "apache-arrow";
 import { useServer } from "./hooks/useServer";
 import { useWorksheets } from "./hooks/useWorksheets";
 import { useTheme } from "./hooks/useTheme";
+import { useVersions, type Snapshot } from "./hooks/useVersions";
 import Toolbar from "./components/Toolbar";
 import SqlEditor, { type EditorHandle } from "./components/Editor";
 import WorksheetTabs from "./components/WorksheetTabs";
 import CommandPalette, { type Command } from "./components/CommandPalette";
 import ShortcutsHelp from "./components/ShortcutsHelp";
 import SearchModal from "./components/SearchModal";
+import VersionHistory from "./components/VersionHistory";
 import Results from "./components/Results";
 import Explain from "./components/Explain";
 import Catalog from "./components/Catalog";
@@ -67,6 +69,7 @@ export default function App() {
   const cursorRef = useRef<string | null>(null);
   const { worksheets, activeId, active, setActive, create, rename, close, updateSql } = useWorksheets();
   const { theme, toggle: toggleTheme } = useTheme();
+  const { versions, capture, remove, clear, gc } = useVersions();
 
   // Per-worksheet view state (in-memory). Switching a tab saves the view of the
   // tab being left and restores (or initializes) the view of the new tab.
@@ -87,6 +90,7 @@ export default function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   // Apply a stored View to the live state slots.
   const setView = (v: View) => {
@@ -144,9 +148,16 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Drop version-history rings for worksheets that no longer exist (closed),
+  // so localStorage doesn't accrue orphaned snapshot rings.
+  useEffect(() => {
+    gc(worksheets.map((w) => w.id));
+  }, [worksheets, gc]);
+
   // Global keyboard shortcuts: Cmd/Ctrl+K toggles the command palette;
-  // Cmd/Ctrl+Shift+F opens global object search; `?` (when not typing) opens
-  // the shortcuts help; Escape closes any open overlay.
+  // Cmd/Ctrl+Shift+F opens global object search; Cmd/Ctrl+Shift+H opens the
+  // active worksheet's version history; `?` (when not typing) opens the
+  // shortcuts help; Escape closes any open overlay.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
@@ -156,6 +167,9 @@ export default function App() {
       } else if (mod && e.shiftKey && (e.key === "f" || e.key === "F")) {
         e.preventDefault();
         setSearchOpen(true);
+      } else if (mod && e.shiftKey && (e.key === "h" || e.key === "H")) {
+        e.preventDefault();
+        setHistoryOpen(true);
       } else if (e.key === "?" && !isTypingTarget(e.target)) {
         e.preventDefault();
         setShortcutsOpen(true);
@@ -163,6 +177,7 @@ export default function App() {
         setPaletteOpen(false);
         setShortcutsOpen(false);
         setSearchOpen(false);
+        setHistoryOpen(false);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -173,6 +188,9 @@ export default function App() {
 
   const run = async () => {
     if (running) return;
+    // Snapshot the SQL being run into this worksheet's version history (a
+    // meaningful, recoverable point — deduped against the latest snapshot).
+    if (active) capture(active.id, sql);
     setRunning(true);
     setError(null);
     setPlan(null);
@@ -410,6 +428,14 @@ export default function App() {
       id: "close-ws", label: "Close current worksheet", group: "Worksheets",
       disabled: worksheets.length <= 1, run: () => closeTab(activeId),
     },
+    {
+      id: "save-version", label: "Save version of current SQL", group: "Worksheets",
+      disabled: !active, run: () => active && capture(active.id, active.sql),
+    },
+    {
+      id: "history", label: "Show version history", hint: "Ctrl/Cmd+Shift+H", group: "Worksheets",
+      disabled: !active, run: () => setHistoryOpen(true),
+    },
     ...worksheets.map((w) => ({
       id: "go-" + w.id, label: `Go to ${w.name}`, group: "Worksheets",
       disabled: w.id === activeId, run: () => switchTab(w.id),
@@ -516,6 +542,19 @@ export default function App() {
         onPickTable={(name) => editorRef.current?.insert(name)}
         onPickColumn={(_table, col) => editorRef.current?.insert(col)}
         onPickHistory={(s) => active && updateSql(active.id, s)}
+      />
+      <VersionHistory
+        open={historyOpen}
+        worksheetName={active?.name ?? ""}
+        snapshots={active ? versions(active.id) : []}
+        onClose={() => setHistoryOpen(false)}
+        onSaveNow={() => active && capture(active.id, active.sql)}
+        onRestore={(snap: Snapshot) => {
+          if (active) updateSql(active.id, snap.sql);
+          setHistoryOpen(false);
+        }}
+        onDelete={(snap) => active && remove(active.id, snap.id)}
+        onClear={() => active && clear(active.id)}
       />
     </div>
   );
