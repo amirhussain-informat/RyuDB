@@ -20,6 +20,7 @@ import Explain from "./components/Explain";
 import Catalog from "./components/Catalog";
 import History from "./components/History";
 import { tableToCSV, tableToJSON, downloadBlob } from "./lib/csv";
+import { serializeBundle, serializeOne, parseImportFile, worksheetFileName } from "./lib/worksheetTransfer";
 import type {
   CatalogResp, CatalogTable, ErrorResp, HistoryEntry, PlanNode,
   ProfileResp, ResultMeta, Result, TableResp,
@@ -100,7 +101,7 @@ export default function App() {
   // not opened as a cursor, or exceeded --max-cursor-rows and fell back). Held
   // in a ref so the unmount/disconnect cleanup can close it without stale state.
   const cursorRef = useRef<string | null>(null);
-  const { worksheets, activeId, active, setActive, create, rename, close, updateSql } = useWorksheets();
+  const { worksheets, activeId, active, setActive, create, rename, close, updateSql, importWorksheets } = useWorksheets();
   const { theme, toggle: toggleTheme } = useTheme();
   const { versions, capture, remove, clear, gc } = useVersions();
 
@@ -214,6 +215,43 @@ export default function App() {
       }
     }
     close(id);
+  };
+
+  // --- Git-backed worksheet export/import --------------------------------- //
+  // Export worksheets as plain .sql text (single = raw SQL; all = a bundle with
+  // `-- @@worksheet: <name>` separators) so they are git-diffable. Import reads
+  // .sql files (a bundle splits into sections; a plain file is one worksheet).
+  const importInputRef = useRef<HTMLInputElement | null>(null);
+
+  const exportActive = () => {
+    if (!active) return;
+    downloadBlob(worksheetFileName(active.name), "text/sql;charset=utf-8", serializeOne(active.sql));
+  };
+  const exportAll = () => {
+    if (worksheets.length === 0) return;
+    downloadBlob("ryudb-worksheets.sql", "text/sql;charset=utf-8",
+      serializeBundle(worksheets.map((w) => ({ name: w.name, sql: w.sql }))));
+  };
+  const pickImport = () => importInputRef.current?.click();
+  const onImportFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    const docs: { name: string; sql: string }[] = [];
+    for (const f of Array.from(files)) {
+      try {
+        const text = await f.text();
+        docs.push(...parseImportFile(f.name, text));
+      } catch {
+        /* skip an unreadable file */
+      }
+    }
+    e.target.value = ""; // allow re-picking the same file
+    if (docs.length === 0) {
+      setError({ op: "error", kind: "runtime", message: "No worksheets found in the selected file(s)." } as ErrorResp);
+      setMainTab("message");
+      return;
+    }
+    importWorksheets(docs);
   };
 
   // Close the current cursor best-effort (unknown id is a server-side no-op).
@@ -680,6 +718,18 @@ export default function App() {
       id: "clear-results", label: "Clear result history", group: "Worksheets",
       disabled: resultHistory.length === 0, run: clearResults,
     },
+    {
+      id: "export-ws", label: "Export active worksheet as .sql", group: "Worksheets",
+      disabled: !active, run: exportActive,
+    },
+    {
+      id: "export-all-ws", label: "Export all worksheets (.sql bundle)", group: "Worksheets",
+      disabled: worksheets.length === 0, run: exportAll,
+    },
+    {
+      id: "import-ws", label: "Import worksheets from .sql", group: "Worksheets",
+      run: pickImport,
+    },
     ...worksheets.map((w) => ({
       id: "go-" + w.id, label: `Go to ${w.name}`, group: "Worksheets",
       disabled: w.id === activeId, run: () => switchTab(w.id),
@@ -741,6 +791,9 @@ export default function App() {
               onCreate={create}
               onClose={closeTab}
               onRename={rename}
+              onExportActive={exportActive}
+              onExportAll={exportAll}
+              onImport={pickImport}
             />
             <div className="editor-host">
               <SqlEditor
@@ -828,6 +881,14 @@ export default function App() {
         </main>
       </div>
       <CommandPalette open={paletteOpen} commands={commands} onClose={() => setPaletteOpen(false)} />
+      <input
+        ref={importInputRef}
+        type="file"
+        accept=".sql,text/sql,application/octet-stream"
+        multiple
+        style={{ display: "none" }}
+        onChange={onImportFiles}
+      />
       <ShortcutsHelp open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
       <SearchModal
         open={searchOpen}

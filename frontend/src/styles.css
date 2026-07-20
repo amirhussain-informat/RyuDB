@@ -110,6 +110,23 @@ button.primary:hover:not(:disabled) { background: #6dd1ff; }
   font-size: 15px; line-height: 1; border-bottom: none;
 }
 .ws-tab-add:hover { color: var(--accent); border-color: var(--accent); }
+.ws-actions { position: relative; margin-left: auto; display: flex; align-items: stretch; flex: none; }
+.ws-actions-btn {
+  background: none; border: none; color: var(--fg-dim); cursor: pointer;
+  padding: 2px 8px; font-size: 13px; line-height: 1;
+}
+.ws-actions-btn:hover { color: var(--accent); }
+.ws-actions-menu {
+  position: absolute; top: 100%; right: 0; z-index: 20; min-width: 200px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 5px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); display: flex; flex-direction: column;
+  padding: 4px;
+}
+.ws-actions-menu button {
+  background: none; border: none; color: var(--fg); cursor: pointer;
+  text-align: left; padding: 6px 10px; font-size: 12px; border-radius: 3px;
+}
+.ws-actions-menu button:hover { background: var(--bg-3); color: var(--accent); }
 .output { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .output-tabs { display: flex; gap: 2px; padding: 0 8px; background: var(--bg-2); border-bottom: 1px solid var(--border); }
 .output-tabs button {
