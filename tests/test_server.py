@@ -1621,3 +1621,78 @@ def test_py_can_use_cudf_directly(srv):
     assert meta["op"] == "py", meta
     assert meta["error"] is None, meta
     assert meta["result"].endswith("(6)"), meta  # cudf sum -> np.int64(6)
+
+
+# --------------------------------------------------------------------------- #
+# admin drop / rename: engine scan-cache invalidation
+# --------------------------------------------------------------------------- #
+
+def test_drop_invalidates_scan_cache(srv):
+    """Dropping a table must make it unqueryable. The engine caches a base-only
+    scan frame keyed by table name; the catalog drop alone does NOT clear it, so
+    without the engine invalidation in `_run_admin` a SELECT on the dropped name
+    would still hit `_scan_cache` and return the stale frame. Warm the cache with
+    a real SELECT, drop, then assert a SELECT on the dropped name errors."""
+    port, server, _ref, _ = srv
+    data_path = os.path.join(server.catalog.data_dir, "lineitem")
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            # register a fresh copy (don't touch the shared `lineitem` fixture)
+            reg, _ = await _call(ws, {"id": "r", "op": "admin", "action": "register",
+                                      "args": {"table": "li_drop", "path": data_path}})
+            # warm the scan cache with a real SELECT
+            warm, warm_bins = await _call(
+                ws, {"id": "w", "op": "sql",
+                     "sql": "SELECT count(*) AS c FROM li_drop"}, want_bin=True)
+            # drop it
+            drop, _ = await _call(ws, {"id": "d", "op": "admin", "action": "drop",
+                                       "args": {"table": "li_drop"}})
+            # a SELECT on the dropped name must now error, not return cached rows
+            after, _ = await _call(
+                ws, {"id": "a", "op": "sql",
+                     "sql": "SELECT count(*) AS c FROM li_drop"}, want_bin=True)
+        return reg, warm, warm_bins, drop, after
+    reg, warm, warm_bins, drop, after = _run(client())
+
+    assert reg["op"] == "ok", reg
+    assert warm["op"] == "result" and int(_ipc_table(warm_bins).iloc[0]["c"]) == 500
+    assert drop["op"] == "ok" and drop["detail"]["dropped"] is True, drop
+    assert after["op"] == "error", f"dropped table should be unqueryable, got {after}"
+
+
+def test_rename_invalidates_old_name_scan_cache(srv):
+    """Renaming a table must drop the OLD name's cached scan frame, so a SELECT
+    on the old name errors (it re-reads the catalog) instead of serving stale
+    rows. The new name re-scans fresh."""
+    port, server, _ref, _ = srv
+    data_path = os.path.join(server.catalog.data_dir, "lineitem")
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            await _call(ws, {"id": "r", "op": "admin", "action": "register",
+                             "args": {"table": "li_ren", "path": data_path}})
+            # warm the cache under the old name
+            warm, warm_bins = await _call(
+                ws, {"id": "w", "op": "sql",
+                     "sql": "SELECT count(*) AS c FROM li_ren"}, want_bin=True)
+            rn, _ = await _call(ws, {"id": "rn", "op": "admin", "action": "rename",
+                                     "args": {"old": "li_ren", "new": "li_ren2"}})
+            # old name must now error
+            old_after, _ = await _call(
+                ws, {"id": "o", "op": "sql",
+                     "sql": "SELECT count(*) AS c FROM li_ren"}, want_bin=True)
+            # new name still queryable (re-scans fresh)
+            new_after, new_bins = await _call(
+                ws, {"id": "n", "op": "sql",
+                     "sql": "SELECT count(*) AS c FROM li_ren2"}, want_bin=True)
+            # cleanup
+            await _call(ws, {"id": "d", "op": "admin", "action": "drop",
+                             "args": {"table": "li_ren2"}})
+        return warm, warm_bins, rn, old_after, new_after, new_bins
+    warm, warm_bins, rn, old_after, new_after, new_bins = _run(client())
+
+    assert warm["op"] == "result" and int(_ipc_table(warm_bins).iloc[0]["c"]) == 500
+    assert rn["op"] == "ok" and rn["detail"]["renamed"] is True, rn
+    assert old_after["op"] == "error", f"old name should be unqueryable, got {old_after}"
+    assert new_after["op"] == "result" and int(_ipc_table(new_bins).iloc[0]["c"]) == 500
