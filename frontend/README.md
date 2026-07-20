@@ -12,7 +12,7 @@ does the GPU work; this is its client.
 │  Catalog       │  Monaco SQL editor  (Ctrl/Cmd+Enter = Run)      │
 │  / History     ├─────────────────────────────────────────────────┤
 │                │  Results  Explain  Message                      │
-│                │  (Arrow grid | plan tree | error)               │
+│                │  (Arrow grid | profile graph | error)           │
 └────────────────┴─────────────────────────────────────────────────┘
 ```
 
@@ -63,9 +63,22 @@ does the GPU work; this is its client.
   bar plots one bar per row (capped at 60, ideal for an aggregated GROUP BY
   result), line/scatter need numeric X and Y. v1 charts the displayed page;
   GPU-accelerated inline aggregations are a later piece.
-- **Explain** — the structured plan tree with a `fused` badge on an
-  `Aggregate` over a `Join` (the star-join+aggregate shape eligible for the
-  fused C++ kernel — eligibility, not a guarantee).
+- **Explain** — the optimized plan, with two views (toggle in the panel header):
+  - **Graph** (default) — a Snowsight-style **query-profile graph**: a
+    left-to-right box-and-arrow tree where each node is a colored box (op label,
+    `~rows` estimate on `Scan`, `fused` badge on an `Aggregate` over a `Join`) and
+    edges connect parents to children. Nodes are colored by category — `Scan`
+    (green), `Join` (blue), `Aggregate` (purple), `Filter` (orange), `Sort`/
+    `Limit`/`Distinct` (teal), writes (red). Compact detail sits under the op
+    label; the full per-node detail (table, join keys, group keys, …) is in the
+    hover tooltip. **Wheel zooms toward the cursor; pointer-drag pans; the
+    toolbar +/−/⟲ buttons zoom and reset.** Layout is computed by the pure
+    `lib/planLayout.ts` (tidy leaf-counting tree) — unit-tested by
+    `test/planLayout_check.mjs`.
+  - **Tree** — the classic indented text tree (op + `fused`/`~rows` badges +
+    full detail inline), for compact plans and reading detail without hovering.
+  The `fused` badge marks the star-join+aggregate shape eligible for the fused
+  C++ kernel — eligibility, not a guarantee it fired.
 - **Catalog** — tables + row counts; expand a table for its columns; click a
   name to drop it into the editor; the `⤵` button runs `SELECT * … LIMIT 100`;
   the `▮` button opens the **column profile** panel for that table. The **+
@@ -131,6 +144,7 @@ npm run build      # tsc -b + vite build (type-checks + bundles to dist/)
 npm run smoke      # node test/smoke.mjs — Arrow IPC round-trip vs a running server
 node test/csv_check.mjs   # src/lib/csv.ts serializer (null-aware CSV) — no server needed
 node test/autocomplete_check.mjs  # src/lib/autocomplete.ts suggestion logic — no server needed
+node test/planLayout_check.mjs  # src/lib/planLayout.ts graph geometry — no server needed
 ```
 
 `npm run smoke` needs a running `ryudb-server` with a registered `lineitem`; set
