@@ -13,6 +13,7 @@ dependencies = [
     "cudf>=26.06",
     "sqlglot>=23",
     "pyarrow>=14",
+    "websockets>=13",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +22,7 @@ dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
 ryudb = "ryudb.cli:main"
+ryudb-server = "ryudb.server.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["ryudb*"]
