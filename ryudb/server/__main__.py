@@ -1,10 +1,14 @@
-"""``ryudb-server`` entrypoint — start the RyuDB WebSocket server.
+"""``ryudb-server`` entrypoint — start the RyuDB server.
 
-    ryudb-server --data ./data --host 127.0.0.1 --port 5430
+    ryudb-server --data ./data --host 127.0.0.1 --port 5430 --pg-port 5432
 
-Binds a WebSocket server fronting a single ``Engine`` over ``data_dir``. All
-flags are overridable by the matching ``RYUDB_*`` env var. Run with ``--help``
-for the full surface. See ``ryudb/server/PROTOCOL.md`` for the wire format.
+Binds a WebSocket server (custom JSON + Arrow IPC protocol) fronting a single
+``Engine`` over ``data_dir``. With ``--pg-port`` set, also binds a Postgres
+v3 wire-protocol front on that port (shared engine + per-connection
+transactions) so real drivers (``psql``, ``psycopg``, ``pg8000``, ``asyncpg``)
+can connect. All flags are overridable by the matching ``RYUDB_*`` env var. Run
+with ``--help`` for the full surface. See ``ryudb/server/PROTOCOL.md`` for the
+wire formats.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ import os
 import sys
 
 from .app import Server
+from .pgwire import PGServer
 
 
 def _env(name: str, default: str) -> str:
@@ -25,18 +30,23 @@ def _env(name: str, default: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="ryudb-server",
-        description="Run the RyuDB engine as a WebSocket server (custom JSON + Arrow IPC protocol).",
+        description="Run the RyuDB engine as a server (WebSocket + optional Postgres wire).",
     )
     ap.add_argument("--data", default=_env("RYUDB_DATA", "./data"),
                     help="data directory (catalog + parquet); default ./data")
     ap.add_argument("--host", default=_env("RYUDB_HOST", "127.0.0.1"),
                     help="bind host; default 127.0.0.1")
     ap.add_argument("--port", type=int, default=int(_env("RYUDB_PORT", "5430")),
-                    help="bind port; default 5430")
+                    help="WebSocket port; default 5430")
+    ap.add_argument("--pg-port", type=int, default=int(_env("RYUDB_PG_PORT", "0")),
+                    help="Postgres wire-protocol port (0 = disabled); default 0")
+    ap.add_argument("--pg-max-rows", type=int,
+                    default=int(_env("RYUDB_PG_MAX_ROWS", "200000")),
+                    help="max rows returned per SELECT over the PG wire; default 200000")
     ap.add_argument("--max-rows", type=int,
                     default=int(_env("RYUDB_MAX_ROWS", "200000")),
-                    help="max rows returned per SELECT (full result available via "
-                         "export); default 200000")
+                    help="max rows returned per SELECT over WebSocket (full result "
+                         "available via export); default 200000")
     ap.add_argument("--log-level", default=_env("RYUDB_LOG_LEVEL", "info"),
                     choices=["debug", "info", "warning", "error"],
                     help="log level; default info")
@@ -48,8 +58,12 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     server = Server(args.data, args.host, args.port, args.max_rows)
+    coros = [server.serve()]
+    if args.pg_port:
+        pg = PGServer(server, args.host, args.pg_port, args.pg_max_rows)
+        coros.append(pg.serve())
     try:
-        asyncio.run(server.serve())
+        asyncio.run(asyncio.gather(*coros))
     except KeyboardInterrupt:
         log = logging.getLogger("ryudb.server")
         log.info("interrupted, shutting down")
