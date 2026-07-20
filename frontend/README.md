@@ -141,6 +141,23 @@ does the GPU work; this is its client.
   pure `lib/chartRender.ts` (unit-tested by `test/chartRender_check.mjs`).
   Command-palette entries: Open Dashboards sidebar, New dashboard, Pin current
   chart (jumps to the Chart tab), and one per saved dashboard.
+- **Ask (NL → SQL)** — `Ctrl/Cmd+I` (or the command palette) opens an offline
+  natural-language assistant. Type a question and a **schema-aware recognizer**
+  (the pure `lib/nlSql.ts`, unit-tested by `test/nlSql_check.mjs`) resolves it
+  against the live catalog to a best-effort `SELECT` in real time, showing which
+  template matched + which table. Accept loads the SQL into the editor (the user
+  runs/refines it — it is never auto-run). Recognized patterns: row count
+  (`how many rows in <table>`), top/bottom N by a column (`top 10 lineitem by
+  extendedprice`), avg/sum/min/max of a column (`average extendedprice in
+  lineitem`), group-by (`group lineitem by l_returnflag`), and sample
+  (`show me orders`). Table + column names match **fuzzily** (case-insensitive,
+  substring, then a small edit distance, plus a dotted-name tail match so
+  `extendedprice` finds `l_extendedprice`), so you don't need the exact
+  identifier. An unrecognized question that still names a table falls back to a
+  sample; one that names nothing shows a hint. **No network call** — the
+  recognizer is a local heuristic, honest about its limits (it is not a general
+  NL→SQL model); it covers the common analytical asks over a known schema with
+  no CDN/hosted-LLM dependency, matching the offline ethos.
 
 ## Develop
 
@@ -179,6 +196,7 @@ node test/autocomplete_check.mjs  # src/lib/autocomplete.ts suggestion logic —
 node test/planLayout_check.mjs  # src/lib/planLayout.ts graph geometry — no server needed
 node test/worksheetTransfer_check.mjs  # src/lib/worksheetTransfer.ts .sql bundle round-trip — no server needed
 node test/chartRender_check.mjs  # src/lib/chartRender.ts bar/point geometry — no server needed
+node test/nlSql_check.mjs  # src/lib/nlSql.ts NL->SQL recognizer — no server needed
 ```
 
 `npm run smoke` needs a running `ryudb-server` with a registered `lineitem`; set
