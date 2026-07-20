@@ -5,6 +5,8 @@
 // (except server-initiated protocol errors on an unparseable request, which
 // carry no `id`).
 
+import type { ChartKind } from "./chartRender";
+
 export type RequestId = string | number | null;
 
 export interface ColumnMeta {
@@ -261,4 +263,25 @@ export interface Result {
   meta: Response;
   table: import("apache-arrow").Table | null;
   bytes?: Uint8Array;
+}
+
+// ---- dashboards (client-only, persisted to localStorage) ----
+// A saved chart visualization. The geometry/axis choices a user made on the
+// Chart tab, captured by name so they survive a result changing shape. Reused
+// by `useDashboards` and the headless `ChartView`.
+export interface ChartSpec {
+  kind: ChartKind;
+  xCol: string;
+  yCol: string;
+}
+export interface DashboardWidget {
+  id: string;
+  title: string;
+  sql: string;
+  chart: ChartSpec;
+}
+export interface Dashboard {
+  id: string;
+  name: string;
+  widgets: DashboardWidget[];
 }
