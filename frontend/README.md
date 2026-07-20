@@ -44,7 +44,15 @@ does the GPU work; this is its client.
   `Aggregate` over a `Join` (the star-join+aggregate shape eligible for the
   fused C++ kernel — eligibility, not a guarantee).
 - **Catalog** — tables + row counts; expand a table for its columns; click a
-  name to drop it into the editor; the `⤵` button runs `SELECT * … LIMIT 100`.
+  name to drop it into the editor; the `⤵` button runs `SELECT * … LIMIT 100`;
+  the `▮` button opens the **column profile** panel for that table.
+- **Column profile** — the `▮` button (per table in the Catalog sidebar) opens
+  a panel of per-column statistics computed on the **GPU** by the server's
+  `profile` op (one full scan; cuDF reductions + value_counts). Each column
+  shows null count/%, distinct count, min/max, and (for numeric columns) mean,
+  stddev, a 10-bucket equal-width histogram, and the top-K most frequent
+  values for low-NDV columns. The headline GPU differentiator — the stats come
+  back in milliseconds, not by scanning in the browser.
 - **History** — the server-side query ring buffer; click an entry to reload
   its SQL.
 

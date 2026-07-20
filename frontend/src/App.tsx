@@ -11,6 +11,7 @@ import CommandPalette, { type Command } from "./components/CommandPalette";
 import ShortcutsHelp from "./components/ShortcutsHelp";
 import SearchModal from "./components/SearchModal";
 import VersionHistory from "./components/VersionHistory";
+import ProfileModal from "./components/ProfileModal";
 import Results from "./components/Results";
 import Chart from "./components/Chart";
 import Explain from "./components/Explain";
@@ -19,7 +20,7 @@ import History from "./components/History";
 import { tableToCSV, tableToJSON, downloadBlob } from "./lib/csv";
 import type {
   CatalogResp, CatalogTable, ErrorResp, HistoryEntry, PlanNode,
-  ResultMeta, Result, TableResp,
+  ProfileResp, ResultMeta, Result, TableResp,
 } from "./lib/types";
 
 const DEFAULT_URL = "ws://127.0.0.1:5430";
@@ -92,6 +93,7 @@ export default function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [profileName, setProfileName] = useState<string | null>(null);
 
   // Apply a stored View to the live state slots.
   const setView = (v: View) => {
@@ -179,6 +181,7 @@ export default function App() {
         setShortcutsOpen(false);
         setSearchOpen(false);
         setHistoryOpen(false);
+        setProfileName(null);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -406,6 +409,10 @@ export default function App() {
     const res = await op({ id: "hist", op: "history" });
     return res.meta.op === "history" ? res.meta.entries : [];
   };
+  const fetchProfile = async (name: string): Promise<ProfileResp | null> => {
+    const res = await op({ id: "prof", op: "profile", name, top_k: 10 });
+    return res.meta.op === "profile" ? (res.meta as ProfileResp) : null;
+  };
 
   const connected = status === "open";
   const activeMeta = result?.meta as ResultMeta | undefined;
@@ -475,6 +482,7 @@ export default function App() {
               fetchTable={fetchTable}
               onInsert={(t) => editorRef.current?.insert(t)}
               onSample={sample}
+              onProfile={(name) => setProfileName(name)}
               status={status}
             />
           ) : (
@@ -566,6 +574,12 @@ export default function App() {
         }}
         onDelete={(snap) => active && remove(active.id, snap.id)}
         onClear={() => active && clear(active.id)}
+      />
+      <ProfileModal
+        open={profileName !== null}
+        name={profileName}
+        fetchProfile={fetchProfile}
+        onClose={() => setProfileName(null)}
       />
     </div>
   );

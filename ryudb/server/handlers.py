@@ -176,6 +176,8 @@ async def handle_request(req: dict[str, Any], ws, server) -> None:
             await _op_catalog(req, ws, server)
         elif op == "table":
             await _op_table(req, ws, server)
+        elif op == "profile":
+            await _op_profile(req, ws, server)
         elif op == "sample":
             await _op_sample(req, ws, server)
         elif op == "admin":
@@ -336,6 +338,131 @@ async def _op_table(req, ws, server) -> None:
     if not ok:
         return
     await _send_json(ws, {"id": rid, "op": "table", **info})
+
+
+def _prof_scalar(v):
+    """Coerce a cuDF/numpy/pandas scalar to a JSON-safe Python value (the
+    response goes through ``dumps_json``, but interval bounds and value_counts
+    entries arrive as numpy/cuDF scalars that are not all auto-coerced)."""
+    if v is None:
+        return None
+    try:
+        if hasattr(v, "item"):
+            v = v.item()
+    except Exception:  # noqa: BLE001 -- some scalars raise on .item()
+        pass
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float, str)):
+        return v
+    try:
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+    except Exception:  # noqa: BLE001
+        pass
+    return str(v)
+
+
+def _profile_column(s, row_count: int, top_k: int) -> dict:
+    """Per-column statistics for a cuDF Series ``s`` computed on the GPU.
+    Returns a JSON-ready dict. Each potentially-failing reduction is guarded so
+    a dtype that doesn't support it (e.g. mean on a string column) just yields
+    ``None`` rather than aborting the whole profile."""
+    null_count = int(s.isnull().sum())
+    distinct = int(s.nunique(dropna=True))
+    null_pct = (null_count / row_count) if row_count else 0.0
+    out: dict = {
+        "type": str(s.dtype),
+        "row_count": row_count,
+        "null_count": null_count,
+        "null_pct": round(null_pct, 6),
+        "distinct": distinct,
+    }
+    # min/max work for numeric and string/categorical columns in cuDF.
+    try:
+        out["min"] = _prof_scalar(s.min())
+        out["max"] = _prof_scalar(s.max())
+    except Exception:  # noqa: BLE001
+        out["min"] = None
+        out["max"] = None
+    # Numeric-only reductions + a 10-bucket equal-width histogram. These raise
+    # on non-numeric dtypes -> caught -> omitted.
+    if row_count and distinct:
+        try:
+            out["mean"] = float(s.mean())
+        except Exception:  # noqa: BLE001
+            out["mean"] = None
+        try:
+            out["stddev"] = float(s.std(ddof=0))
+        except Exception:  # noqa: BLE001
+            out["stddev"] = None
+        # 10-bucket equal-width histogram, computed on the GPU via an arithmetic
+        # bucket id + value_counts (NOT cudf.cut — this cuDF build's interval
+        # categories raise NotImplementedError when iterated/converted).
+        try:
+            snn = s.dropna()
+            mn = float(snn.min())
+            mx = float(snn.max())
+            width = (mx - mn) or 1.0
+            # Values are >= mn so the division is non-negative; int64 truncation
+            # is floor here. clip handles the max value landing exactly on the
+            # top edge (bucket 10 -> 9).
+            bid = ((snn - mn) / width).astype("int64").clip(0, 9)
+            vc = bid.value_counts()
+            counts = {int(k): int(v) for k, v in
+                      zip(vc.index.to_pandas().tolist(), vc.to_pandas().tolist())}
+            out["histogram"] = [
+                {"lo": mn + i * width, "hi": mn + (i + 1) * width,
+                 "count": counts.get(i, 0)}
+                for i in range(10)
+            ]
+        except Exception:  # noqa: BLE001 -- non-numeric / empty -> skip
+            out["histogram"] = None
+    else:
+        out["mean"] = None
+        out["stddev"] = None
+        out["histogram"] = None
+    # Top-K most frequent values. Only for low-NDV columns: a full value_counts
+    # groupby on a continuous column is wasteful and the histogram already
+    # covers its distribution.
+    if distinct and distinct <= 1000 and top_k > 0:
+        try:
+            vc = s.value_counts(dropna=True).head(top_k)
+            vals = vc.index.to_pandas().tolist()
+            cnts = vc.to_pandas().tolist()
+            out["top"] = [{"value": _prof_scalar(v), "count": int(c)}
+                          for v, c in zip(vals, cnts)]
+        except Exception:  # noqa: BLE001
+            out["top"] = None
+    else:
+        out["top"] = None
+    return out
+
+
+async def _op_profile(req, ws, server) -> None:
+    rid = req.get("id")
+    name = _require(req, "name", str)
+    top_k = req.get("top_k", 10)
+    if not isinstance(top_k, int) or top_k <= 0:
+        raise ProtocolError("top_k must be a positive int")
+
+    def build():
+        with server.engine.read_locked():
+            info = server.catalog.get(name)  # KeyError -> runtime error frame
+            # One full scan (profiling is inherently a full-column read); index
+            # each column off the resulting cuDF DataFrame for the GPU stats.
+            df = server.engine._scan(name, None)
+            row_count = len(df)
+            cols = []
+            for c in info.columns:
+                s = df[c] if c in df.columns else df.iloc[:, 0][:0]
+                cols.append({"name": c, **_profile_column(s, row_count, top_k)})
+            return {"name": info.name, "row_count": row_count, "columns": cols}
+
+    ok, profile, _ = await _cancellable(server, ws, rid, build)
+    if not ok:
+        return
+    await _send_json(ws, {"id": rid, "op": "profile", **profile})
 
 
 async def _op_sample(req, ws, server) -> None:

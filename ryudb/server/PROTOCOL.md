@@ -58,6 +58,7 @@ The response `op` tells the client what to expect next:
 | `plan`      | nothing          | EXPLAIN tree (`tree`) |
 | `catalog`   | nothing          | `tables` list |
 | `table`     | nothing          | one table's schema (`columns`, `constraints`, ...) |
+| `profile`   | nothing          | per-column GPU statistics (`columns` with null%/distinct/min/max/mean/stddev/histogram/top) |
 | `history`   | nothing          | `entries` ring buffer |
 | `cancelled` | nothing          | dropped while pending, or `CancelledByUser` at a node boundary |
 | `error`     | nothing          | something failed; `kind` + `message` (+ `position`) |
@@ -223,6 +224,31 @@ Returns `plan` with a `tree` — a recursive node:
 Runs `SELECT * FROM <name> LIMIT <n>`. The table name is validated
 (`str.isidentifier()` and present in the catalog) before it is ever interpolated
 into SQL. Returns `result`+binary.
+
+### `profile`
+
+```json
+{"id": "...", "op": "profile", "name": "lineitem", "top_k": 10}
+```
+Computes per-column statistics on the **GPU** (one full scan; cuDF reductions +
+a value_counts) and returns them as a single JSON frame — no binary. `top_k`
+(default 10) caps the most-frequent-values list, emitted only for low-NDV
+columns (`distinct <= 1000`); continuous columns get a 10-bucket equal-width
+histogram instead. Unknown table → `error` (runtime). `top_k` must be a
+positive int → else `error` (protocol).
+
+```json
+{"op": "profile", "name": "lineitem", "row_count": 500,
+ "columns": [{"name": "l_quantity", "type": "int64", "row_count": 500,
+  "null_count": 0, "null_pct": 0.0, "distinct": 49, "min": 1, "max": 49,
+  "mean": 25.1, "stddev": 14.2,
+  "histogram": [{"lo": 1.0, "hi": 5.8, "count": 51}, ...],
+  "top": [{"value": 7, "count": 14}, ...]}]}
+```
+`min`/`max` are numbers for numeric columns and strings for categorical ones;
+`mean`/`stddev`/`histogram` are present only for numeric columns; `top` only
+for low-NDV columns. Runs under the shared read lock (excludes concurrent
+admin writes).
 
 ### `admin`
 

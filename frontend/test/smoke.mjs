@@ -134,6 +134,19 @@ check("close idempotent", cl2.meta.op === "ok", JSON.stringify(cl2.meta));
 const afErr = await call(ws, { id: "afe", op: "fetch", cursor_id: cid, offset: 0, limit: 10 });
 check("fetch after close errors", afErr.meta.op === "error" && /unknown cursor/.test(afErr.meta.message ?? ""), JSON.stringify(afErr.meta));
 
+// 8. profile op: GPU per-column statistics (JSON only, no binary)
+const prof = await call(ws, { id: "pr", op: "profile", name: "lineitem", top_k: 5 });
+check("profile op", prof.meta.op === "profile" && prof.meta.name === "lineitem", JSON.stringify(prof.meta));
+check("profile row_count", prof.meta.row_count === N, String(prof.meta.row_count));
+const pcols = new Map((prof.meta.columns ?? []).map((c) => [c.name, c]));
+check("profile columns", ["l_orderkey", "l_quantity", "l_extendedprice", "l_returnflag"].every((n) => pcols.has(n)), JSON.stringify([...pcols.keys()]));
+const qty = pcols.get("l_quantity");
+check("profile numeric stats", qty && qty.mean != null && qty.stddev != null && qty.histogram && qty.histogram.length === 10, JSON.stringify(qty));
+check("profile histogram sums to rows", qty && qty.histogram.reduce((a, b) => a + b.count, 0) === N, String(qty?.histogram?.reduce((a, b) => a + b.count, 0)));
+const flag = pcols.get("l_returnflag");
+check("profile categorical top", flag && flag.top && flag.top.length > 0 && flag.top.reduce((a, t) => a + t.count, 0) === N, JSON.stringify(flag?.top));
+check("profile unknown table errors", (await call(ws, { id: "pr2", op: "profile", name: "nope" })).meta.op === "error");
+
 ws.close();
 if (failures === 0) {
   console.log("SMOKE OK");
