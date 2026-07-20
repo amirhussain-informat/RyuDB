@@ -34,6 +34,11 @@ does the GPU work; this is its client.
   re-runs with `max_rows = row_count`. A result above 1M rows asks for
   confirmation first. **Copy** writes the displayed rows as TSV to the
   clipboard (pastes into Excel / Sheets); **click a cell** to copy its value.
+  **Sort + filter** run in-browser on the loaded page (no server round-trip):
+  click a column header to cycle ascending → descending → clear (a `▲`/`▼`
+  marks the active sort; NULLs sort last); toggle the **Filter** button for a
+  per-column case-insensitive substring filter row. The grid and Copy reflect
+  the sorted/filtered view; Download still pulls the full server result.
 - **Chart** — a **Chart** output tab (shown when a result is present) renders
   the loaded result rows as **bar / line / scatter** over hand-rolled SVG (no
   charting library — keeps the offline/no-CDN ethos). Pick the X and Y columns;

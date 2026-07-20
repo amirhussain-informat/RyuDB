@@ -20,7 +20,7 @@ await build({
   outfile: out,
   logLevel: "silent",
 });
-const { tableToCSV, tableToJSON, tableToTSV } = await import(out);
+const { tableToCSV, tableToJSON, tableToTSV, viewToTSV } = await import(out);
 
 const t = tableFromArrays({
   id: [1, 2, 3, null],
@@ -56,6 +56,25 @@ check("tsv header", tlines[0] === "id\tname\tbig", tlines[0]);
 check("tsv row", tlines[1] === "1\talice\t10", tlines[1]);
 check("tsv null -> empty", tlines[4] === "\t\t40", tlines[4]);
 check("tsv no embedded tab in values", !tsv.slice(tsv.indexOf("\n") + 1).includes("\t\t\t"), "triple-tab");
+
+// viewToTSV: TSV of a filtered+sorted view (a list of source-row indices into
+// the column VECTORS), so clipboard copy respects the grid's sort/filter.
+// Uses vector.get(r) so a NULL int (validity bitmap) renders as empty, not 0.
+const vecId = t.getChild("id");
+const vecName = t.getChild("name");
+const vecBig = t.getChild("big");
+const vecs = [vecId, vecName, vecBig];
+// reverse row order (rows 3,2,1,0) — exercises non-contiguous reordering +
+// the null-int case: row 3 has id=null, which must serialize to empty (not 0).
+const reversed = viewToTSV(["id", "name", "big"], vecs, [3, 2, 1, 0]);
+const rlines = reversed.split("\n");
+check("view header", rlines[0] === "id\tname\tbig", rlines[0]);
+check("view reordered row0 null->empty", rlines[1] === "\t\t40", rlines[1]);
+check("view reordered row3", rlines[4] === "1\talice\t10", rlines[4]);
+// a filtered view (only row index 1) — header + one row, value from row 1.
+const filtered = viewToTSV(["id", "name", "big"], vecs, [1]);
+const flines = filtered.split("\n");
+check("view filtered one row", flines.length === 2 && flines[1] === "2\tb,ob\t20", flines);
 
 console.log(fail === 0 ? "CSV OK" : `CSV FAILED: ${fail}`);
 process.exit(fail === 0 ? 0 : 1);

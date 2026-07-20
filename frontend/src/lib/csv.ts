@@ -96,6 +96,23 @@ export function tableToTSV(table: Table): string {
   return parts.join("\n");
 }
 
+/** TSV serialization of a *view* — an explicit list of source-row indices into
+ * the column VECTORS (already filtered + sorted by the caller), so clipboard
+ * copy respects the grid's current sort/filter rather than always copying the
+ * raw server order. Uses `vector.get(r)` (not `.toArray()`) so SQL NULLs are
+ * preserved as empty fields instead of being coerced to 0/NaN. */
+export function viewToTSV(
+  names: string[],
+  vectors: { get(i: number): unknown }[],
+  view: number[],
+): string {
+  const parts: string[] = [names.map((n) => n.replace(/[\t\r\n]/g, " ")).join("\t")];
+  for (const r of view) {
+    parts.push(vectors.map((v) => cellToTsv(v.get(r))).join("\t"));
+  }
+  return parts.join("\n");
+}
+
 /** Write text to the clipboard, falling back to a hidden textarea +
  * execCommand when the async Clipboard API is unavailable (older browsers /
  * non-secure contexts). Returns whether it succeeded. */
