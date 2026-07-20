@@ -576,3 +576,175 @@ def test_history_records_invocations(srv):
     r = _run(client())
     assert r["op"] == "history"
     assert any(e["sql"].startswith("SELECT count(*)") for e in r["entries"])
+
+
+# --------------------------------------------------------------------------- #
+# multi-session isolation (per-connection transactions / MVCC)
+# --------------------------------------------------------------------------- #
+
+def _register_iso(port, tmp_path, name, n_base=3):
+    """Register a throwaway table ``name`` (k int64, v float64) with ``n_base``
+    base rows on the shared server, over the wire. Returns the parquet dir."""
+    wdir = tmp_path / name
+    wdir.mkdir()
+    cudf.DataFrame({
+        "k": np.arange(1, n_base + 1, dtype=np.int64),
+        "v": np.arange(1.0, n_base + 1, dtype="float64"),
+    }).to_pandas().to_parquet(wdir / "0.parquet")
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            r, _ = await _call(ws, {"id": "reg", "op": "admin", "action": "register",
+                                    "args": {"table": name, "path": str(wdir)}})
+        return r
+    r = _run(client())
+    assert r["op"] == "ok" and r["detail"]["registered"] == name
+    return wdir
+
+
+def test_two_connections_can_each_hold_open_txn(srv):
+    """Per-connection transactions: BEGIN on conn B no longer fails while conn
+    A has an open txn (the old single-``_txn``-slot limit is gone)."""
+    port, *_ = srv
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as a, \
+                   websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as b:
+            ba, _ = await _call(a, {"id": "ba", "op": "sql", "sql": "BEGIN"})
+            bb, _ = await _call(b, {"id": "bb", "op": "sql", "sql": "BEGIN"})
+            ca, _ = await _call(a, {"id": "ca", "op": "sql", "sql": "COMMIT"})
+            cb, _ = await _call(b, {"id": "cb", "op": "sql", "sql": "COMMIT"})
+        return ba, bb, ca, cb
+    ba, bb, ca, cb = _run(client())
+    assert ba["op"] == "ok" and bb["op"] == "ok"   # both BEGINs succeed
+    assert ca["op"] == "ok" and cb["op"] == "ok"
+
+
+def test_snapshot_isolation_across_connections(srv, tmp_path):
+    """A txn on conn A (BEGIN at S0) does not see conn B's commit (at S0+1):
+    real cross-session MVCC via the timestamp-versioned delta store. After A
+    commits, a fresh read sees B's commit."""
+    port, *_ = srv
+    _register_iso(port, tmp_path, "iso_snap", n_base=3)
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as a, \
+                   websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as b:
+            # A opens a txn (snapshot S0 = current commit counter).
+            await _call(a, {"id": "ba", "op": "sql", "sql": "BEGIN"})
+            # B inserts + commits (autocommit, new commit_ts > S0).
+            ib, _ = await _call(b, {"id": "ib", "op": "sql",
+                "sql": "INSERT INTO iso_snap (k, v) VALUES (999, 99.0)"})
+            # A's txn read: snapshot S0 excludes B's commit -> 3 rows.
+            ca, bins = await _call(a, {"id": "ca", "op": "sql",
+                "sql": "SELECT count(*) AS c FROM iso_snap"}, want_bin=True)
+            # A commits; a fresh autocommit read sees B's commit -> 4 rows.
+            await _call(a, {"id": "xa", "op": "sql", "sql": "COMMIT"})
+            da, bins2 = await _call(a, {"id": "da", "op": "sql",
+                "sql": "SELECT count(*) AS c FROM iso_snap"}, want_bin=True)
+        return ib, ca, bins, da, bins2
+    ib, ca, bins, da, bins2 = _run(client())
+    assert ib["op"] == "write" and ib["rows_affected"] == 1
+    assert ca["op"] == "result"
+    assert _ipc_table(bins)["c"].iloc[0] == 3       # A's snapshot excludes B's commit
+    assert da["op"] == "result"
+    assert _ipc_table(bins2)["c"].iloc[0] == 4      # after COMMIT, sees B's commit
+
+
+def test_read_your_writes_then_rollback(srv, tmp_path):
+    """A txn sees its own buffered INSERT (read-your-writes); ROLLBACK discards
+    the buffer and the row is no longer visible."""
+    port, *_ = srv
+    _register_iso(port, tmp_path, "iso_ryw", n_base=3)
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as a:
+            await _call(a, {"id": "b", "op": "sql", "sql": "BEGIN"})
+            await _call(a, {"id": "i", "op": "sql",
+                "sql": "INSERT INTO iso_ryw (k, v) VALUES (999, 99.0)"})
+            c1, bins1 = await _call(a, {"id": "c1", "op": "sql",
+                "sql": "SELECT count(*) AS c FROM iso_ryw"}, want_bin=True)
+            await _call(a, {"id": "rb", "op": "sql", "sql": "ROLLBACK"})
+            c2, bins2 = await _call(a, {"id": "c2", "op": "sql",
+                "sql": "SELECT count(*) AS c FROM iso_ryw"}, want_bin=True)
+        return c1, bins1, c2, bins2
+    c1, bins1, c2, bins2 = _run(client())
+    assert c1["op"] == "result"
+    assert _ipc_table(bins1)["c"].iloc[0] == 4      # read-your-writes: 3 base + 1 buffered
+    assert c2["op"] == "result"
+    assert _ipc_table(bins2)["c"].iloc[0] == 3      # rollback discarded the buffer
+
+
+def test_disconnect_rolls_back_open_txn(srv, tmp_path):
+    """A connection that disconnects with an open txn has its buffered writes
+    rolled back (they were never flushed to the delta) -- invisible to a later
+    connection."""
+    port, *_ = srv
+    _register_iso(port, tmp_path, "iso_disc", n_base=3)
+
+    async def client():
+        # Conn A: BEGIN, INSERT (buffered), then disconnect WITHOUT COMMIT.
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as a:
+            await _call(a, {"id": "b", "op": "sql", "sql": "BEGIN"})
+            await _call(a, {"id": "i", "op": "sql",
+                "sql": "INSERT INTO iso_disc (k, v) VALUES (999, 99.0)"})
+        # `a` is now closed; its txn is abandoned (buffer discarded, never
+        # flushed). Conn B: a fresh read sees only the 3 base rows.
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as b:
+            c, bins = await _call(b, {"id": "c", "op": "sql",
+                "sql": "SELECT count(*) AS c FROM iso_disc"}, want_bin=True)
+        return c, bins
+    c, bins = _run(client())
+    assert c["op"] == "result"
+    assert _ipc_table(bins)["c"].iloc[0] == 3       # A's buffered insert rolled back
+
+
+def test_checkpoint_refused_during_open_txn(srv, tmp_path):
+    """Checkpoint folds the committed delta into the base (snapshot-agnostic
+    rows); it is refused while any connection has an open txn, then succeeds
+    once the txn commits."""
+    port, *_ = srv
+    _register_iso(port, tmp_path, "iso_ckpt", n_base=3)
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as a, \
+                   websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as b:
+            await _call(a, {"id": "b", "op": "sql", "sql": "BEGIN"})
+            # B tries to checkpoint while A has an open txn -> error.
+            bad, _ = await _call(b, {"id": "cp1", "op": "admin", "action": "checkpoint"})
+            # A commits, then B's checkpoint succeeds.
+            await _call(a, {"id": "c", "op": "sql", "sql": "COMMIT"})
+            good, _ = await _call(b, {"id": "cp2", "op": "admin", "action": "checkpoint"})
+        return bad, good
+    bad, good = _run(client())
+    assert bad["op"] == "error" and bad["kind"] == "runtime"
+    assert "transaction" in bad["message"].lower()
+    assert good["op"] == "ok" and "tables" in good["detail"]
+
+
+def test_restore_refused_during_open_txn(srv, tmp_path):
+    """Restore rewinds the global commit counter and discards delta tail; it is
+    refused while any connection has an open txn, then succeeds once it commits."""
+    port, *_ = srv
+    _register_iso(port, tmp_path, "iso_rst", n_base=3)
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as a, \
+                   websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as b:
+            # Capture a named snapshot at the base state, then advance past it.
+            await _call(b, {"id": "s", "op": "sql", "sql": "CREATE SNAPSHOT base"})
+            await _call(b, {"id": "i", "op": "sql",
+                "sql": "INSERT INTO iso_rst (k, v) VALUES (999, 99.0)"})
+            # A opens a txn (snapshot past `base`); B's restore is refused.
+            await _call(a, {"id": "b", "op": "sql", "sql": "BEGIN"})
+            bad, _ = await _call(b, {"id": "r1", "op": "admin", "action": "restore",
+                                     "args": {"name": "base"}})
+            # A commits; B's restore now succeeds.
+            await _call(a, {"id": "c", "op": "sql", "sql": "COMMIT"})
+            good, _ = await _call(b, {"id": "r2", "op": "admin", "action": "restore",
+                                      "args": {"name": "base"}})
+        return bad, good
+    bad, good = _run(client())
+    assert bad["op"] == "error" and bad["kind"] == "runtime"
+    assert "transaction" in bad["message"].lower()
+    assert good["op"] == "ok" and good["detail"].get("restored") is True

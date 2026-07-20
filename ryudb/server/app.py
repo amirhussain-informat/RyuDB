@@ -10,11 +10,23 @@ requests; binary frames are rejected (clients send no binary). Each connection
 tracks its pending cancellable requests so a ``cancel`` op (or a disconnect)
 can drop the ones that have not started yet.
 
-Single logical session (documented v1 limitation): there is one ``Engine``, so
-transaction state (``_txn`` / ``_commit_ts`` / ``_snapshots``) is shared across
-*all* connections — ``BEGIN`` on one connection and ``COMMIT`` on another
-interleave. Fine for a local single-user console; multi-session isolation is a
-later phase.
+Per-connection transactions (MVCC isolation): there is one ``Engine`` (one
+worker thread, so all engine access serializes), but each connection owns its
+own in-flight transaction. The engine's ``_txn`` is a *transient per-request*
+pointer, not a global: ``run_sql`` loads the connection's txn (or ``None``)
+into ``engine._txn`` before the call and reads it back after (``BEGIN`` leaves
+a new ``Transaction`` there; ``COMMIT``/``ROLLBACK`` leave ``None``; any other
+statement leaves it unchanged). So ``BEGIN`` on connection B no longer fails
+while connection A has an open txn, and a txn's frozen ``snapshot_ts`` gives
+real cross-session snapshot isolation — the delta store is already
+timestamp-versioned (``batches_at(snapshot_ts)``), so B's commit after A's
+``BEGIN`` is invisible to A. The engine internals are unchanged; in-process
+callers (CLI/tests) keep the old persistent-``_txn`` behaviour on their own
+instances. A disconnect drops the connection's open txn (its buffered writes
+were never flushed to the delta/WAL, so dropping the reference *is* the
+rollback). Global admin ops that rewrite history (``checkpoint``,
+``restore``/``restore_to``) are refused while any connection has an open txn —
+they would invalidate live snapshots.
 """
 
 from __future__ import annotations
@@ -56,6 +68,11 @@ class Server:
         self._pending: dict[int, dict[str, threading.Event]] = {}
         # per-connection in-flight request tasks (so cancel/disconnect can drop them)
         self._tasks: dict[int, set] = {}
+        # live connections (id(ws) -> ws) so has_open_txn can enumerate the
+        # per-connection txns stored on each ws (see run_sql). A disconnect
+        # removes its entry; an in-flight request may still hold the ws, but
+        # that txn is then being rolled back and is dropped when the ws is GC'd.
+        self._conns: dict[int, Any] = {}
         self._history: collections.deque[dict[str, Any]] = collections.deque(
             maxlen=history_size
         )
@@ -65,6 +82,38 @@ class Server:
     def submit(self, fn: Callable[..., Any], *args: Any):
         loop = asyncio.get_running_loop()
         return self.worker.submit(loop, fn, *args)
+
+    # -- per-connection transaction context (called on the worker thread) --
+    def run_sql(self, ws, sql: str):
+        """Run ``engine.sql(sql)`` with THIS connection's transaction loaded as
+        the engine's current txn, then read it back. The worker serializes all
+        engine access, so only one request touches ``engine._txn`` at a time;
+        the txn is held on the ws (``_ryudb_txn``) between requests and dropped
+        with the ws on disconnect (its buffered writes were never flushed, so
+        dropping the reference is the rollback).
+
+        ``BEGIN`` leaves a new ``Transaction`` in ``engine._txn`` -> stored on
+        the ws. ``COMMIT``/``ROLLBACK`` leave ``None`` -> the ws txn is cleared.
+        Any other statement leaves ``engine._txn`` untouched -> the ws txn is
+        unchanged. The engine's own ``_begin``/``_commit``/``_rollback`` raise
+        on misuse (BEGIN inside a txn, COMMIT without one) exactly as before."""
+        self.engine._txn = getattr(ws, "_ryudb_txn", None)
+        try:
+            return self.engine.sql(sql)
+        finally:
+            ws._ryudb_txn = self.engine._txn
+            self.engine._txn = None
+
+    def has_open_txn(self) -> bool:
+        """True if any live connection has an open transaction. Used to refuse
+        the global history-rewriting admin ops (``checkpoint``, ``restore``)
+        while a snapshot is live — they would invalidate it. Read on the worker
+        thread; a briefly-stale view of a disconnecting connection is safe (it
+        only makes the guard refuse for a moment, never incorrectly allow)."""
+        return any(
+            getattr(w, "_ryudb_txn", None) is not None
+            for w in list(self._conns.values())
+        )
 
     # -- pending-request tracking (for cancel + disconnect) --
     def register_pending(self, ws, rid: Any, cancel: threading.Event) -> None:
@@ -125,10 +174,10 @@ class Server:
             self._srv = srv
             log.info("ryudb-server listening on ws://%s:%d (data=%s)",
                      self.host, self.port, self.data_dir)
-            log.info("single logical session; cancel drops pending requests and "
-                     "raises CancelledByUser at the next node boundary of an "
-                     "in-flight request (a single long cuDF call is not mid-call "
-                     "interruptible)")
+            log.info("per-connection transactions (MVCC isolation); cancel drops "
+                     "pending requests and raises CancelledByUser at the next node "
+                     "boundary of an in-flight request (a single long cuDF call is "
+                     "not mid-call interruptible)")
             await asyncio.Future()  # run forever
 
     def stop(self) -> None:
@@ -143,11 +192,16 @@ class Server:
         conn_id = id(ws)
         self._pending[conn_id] = {}
         self._tasks[conn_id] = set()
+        self._conns[conn_id] = ws
         # Per-connection send lock: keeps a result's meta+binary frames atomic
         # when several requests are in flight on one connection (pipelined
         # clients). Attached to ``ws`` so the handlers can reach it without an
         # extra parameter.
         ws._ryudb_send_lock = asyncio.Lock()
+        # Per-connection transaction (Transaction | None). Loaded into
+        # engine._txn per request by run_sql; the engine is single-threaded so
+        # the assignment needs no lock. Dropped with the ws on disconnect.
+        ws._ryudb_txn = None
         peer = ws.remote_address if hasattr(ws, "remote_address") else None
         log.info("connection open from %s", peer)
         try:
@@ -187,4 +241,10 @@ class Server:
                 ev.set()
             for task in self._tasks.pop(conn_id, set()):
                 task.cancel()
+            # Drop this connection's session: an open txn (in ws._ryudb_txn) is
+            # rolled back by dropping the reference -- its buffered writes were
+            # never flushed to the delta/WAL. An in-flight request may still
+            # hold the ws and write ws._ryudb_txn back in run_sql's finally; the
+            # txn is then GC'd with the ws once that request completes.
+            self._conns.pop(conn_id, None)
             log.info("connection closed")
