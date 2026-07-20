@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { tableToIPC, Table } from "apache-arrow";
 import { useServer } from "./hooks/useServer";
 import { useWorksheets } from "./hooks/useWorksheets";
+import { useDashboards } from "./hooks/useDashboards";
 import { useTheme } from "./hooks/useTheme";
 import { useVersions, type Snapshot } from "./hooks/useVersions";
 import Toolbar from "./components/Toolbar";
@@ -19,10 +20,13 @@ import Chart from "./components/Chart";
 import Explain from "./components/Explain";
 import Catalog from "./components/Catalog";
 import History from "./components/History";
+import Dashboards from "./components/Dashboards";
+import DashboardModal from "./components/DashboardModal";
+import PinWidgetModal from "./components/PinWidgetModal";
 import { tableToCSV, tableToJSON, downloadBlob } from "./lib/csv";
 import { serializeBundle, serializeOne, parseImportFile, worksheetFileName } from "./lib/worksheetTransfer";
 import type {
-  CatalogResp, CatalogTable, ErrorResp, HistoryEntry, PlanNode,
+  CatalogResp, CatalogTable, ChartSpec, ErrorResp, HistoryEntry, PlanNode,
   ProfileResp, ResultMeta, Result, TableResp,
 } from "./lib/types";
 
@@ -34,6 +38,9 @@ const RUN_ID = "run";
 const PAGE_SIZE = 1000;
 // Page size for cursor-backed downloads (fewer round trips than PAGE_SIZE).
 const DL_PAGE = 50_000;
+// Rows fetched per dashboard widget (charts are display-only — bar caps at
+// MAX_BARS=60, line/scatter plot up to this many points; no cursor needed).
+const WIDGET_ROWS = 1000;
 
 type MainTab = "results" | "chart" | "explain" | "message";
 
@@ -102,6 +109,7 @@ export default function App() {
   // in a ref so the unmount/disconnect cleanup can close it without stale state.
   const cursorRef = useRef<string | null>(null);
   const { worksheets, activeId, active, setActive, create, rename, close, updateSql, importWorksheets } = useWorksheets();
+  const { dashboards, create: createDashboard, rename: renameDashboard, remove: removeDashboard, addWidget, removeWidget } = useDashboards();
   const { theme, toggle: toggleTheme } = useTheme();
   const { versions, capture, remove, clear, gc } = useVersions();
 
@@ -137,7 +145,9 @@ export default function App() {
   const [loadOpen, setLoadOpen] = useState(false);
   const [catalogNonce, setCatalogNonce] = useState(0);
   const [detailName, setDetailName] = useState<string | null>(null);
-  const [sidebar, setSidebar] = useState<"catalog" | "history">("catalog");
+  const [sidebar, setSidebar] = useState<"catalog" | "history" | "dashboards">("catalog");
+  const [dashboardOpenId, setDashboardOpenId] = useState<string | null>(null);
+  const [pinSpec, setPinSpec] = useState<ChartSpec | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -302,6 +312,8 @@ export default function App() {
         setSearchOpen(false);
         setHistoryOpen(false);
         setProfileName(null);
+        setPinSpec(null);
+        setDashboardOpenId(null);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -682,6 +694,35 @@ export default function App() {
     throw new Error(`unexpected upload response: ${m.op}`);
   };
 
+  // --- Dashboards -------------------------------------------------------- //
+  // A dashboard is a saved grid of chart widgets (a SQL query + a chart spec).
+  // Widgets re-run their query on open/refresh. The chart spec is captured on
+  // the Chart tab via "Pin to dashboard"; the SQL baked into the widget is the
+  // statement that produced the charted result (resultSql), not the editor's
+  // current text — so re-running the widget reproduces that result.
+  const fetchWidget = async (widgetSql: string): Promise<Result | null> => {
+    try {
+      return await op({ id: "dw", op: "sql", sql: widgetSql, max_rows: WIDGET_ROWS });
+    } catch {
+      return null;
+    }
+  };
+  const openDashboard = (id: string) => setDashboardOpenId(id);
+  const handleCreateDashboard = () => {
+    const id = createDashboard("");
+    setDashboardOpenId(id);
+  };
+  const handleRemoveWidget = (widgetId: string) => {
+    if (dashboardOpenId) removeWidget(dashboardOpenId, widgetId);
+  };
+  const handlePin = (dashboardId: string | null, title: string) => {
+    if (!pinSpec) return;
+    const bakedSql = resultSql ?? active?.sql ?? "";
+    const { dashboardId: did } = addWidget(dashboardId, title, bakedSql, pinSpec);
+    // Open the dashboard so the user sees the newly pinned widget render.
+    setDashboardOpenId(did);
+  };
+
   const connected = status === "open";
   const activeMeta = result?.meta as ResultMeta | undefined;
   const hasMore =
@@ -730,6 +771,23 @@ export default function App() {
       id: "import-ws", label: "Import worksheets from .sql", group: "Worksheets",
       run: pickImport,
     },
+    {
+      id: "sidebar-dashboards", label: "Open Dashboards sidebar", group: "View",
+      disabled: sidebar === "dashboards", run: () => setSidebar("dashboards"),
+    },
+    {
+      id: "new-dashboard", label: "New dashboard", group: "Dashboards",
+      run: handleCreateDashboard,
+    },
+    {
+      id: "pin-chart", label: "Pin current chart to a dashboard", hint: "Chart tab → Pin", group: "Dashboards",
+      disabled: !(connected && !!result && result.meta.op === "result"),
+      run: () => setMainTab("chart"),
+    },
+    ...dashboards.map((d) => ({
+      id: "dash-" + d.id, label: `Open dashboard ${d.name}`, group: "Dashboards",
+      run: () => openDashboard(d.id),
+    })),
     ...worksheets.map((w) => ({
       id: "go-" + w.id, label: `Go to ${w.name}`, group: "Worksheets",
       disabled: w.id === activeId, run: () => switchTab(w.id),
@@ -760,6 +818,7 @@ export default function App() {
           <div className="sidebar-tabs">
             <button className={sidebar === "catalog" ? "active" : ""} onClick={() => setSidebar("catalog")}>Catalog</button>
             <button className={sidebar === "history" ? "active" : ""} onClick={() => setSidebar("history")}>History</button>
+            <button className={sidebar === "dashboards" ? "active" : ""} onClick={() => setSidebar("dashboards")}>Dashboards</button>
           </div>
           {sidebar === "catalog" ? (
             <Catalog
@@ -774,11 +833,19 @@ export default function App() {
               status={status}
               nonce={catalogNonce}
             />
-          ) : (
+          ) : sidebar === "history" ? (
             <History
               fetchHistory={fetchHistory}
               onPick={(s) => active && updateSql(active.id, s)}
               status={status}
+            />
+          ) : (
+            <Dashboards
+              dashboards={dashboards}
+              onOpen={openDashboard}
+              onCreate={handleCreateDashboard}
+              onRename={renameDashboard}
+              onRemove={removeDashboard}
             />
           )}
         </aside>
@@ -869,7 +936,7 @@ export default function App() {
               )}
               {connected && mainTab === "chart" && (
                 result && result.meta.op === "result"
-                  ? <Chart meta={result.meta as ResultMeta} table={result.table} />
+                  ? <Chart meta={result.meta as ResultMeta} table={result.table} onPin={(spec) => setPinSpec(spec)} />
                   : <div className="empty">Run a query to chart its results.</div>
               )}
               {connected && mainTab === "explain" && <Explain tree={plan} />}
@@ -932,6 +999,22 @@ export default function App() {
         fetchTable={fetchTable}
         onRename={handleRename}
         onClose={() => setDetailName(null)}
+      />
+      <PinWidgetModal
+        open={pinSpec !== null}
+        spec={pinSpec}
+        sql={resultSql ?? active?.sql ?? ""}
+        dashboards={dashboards}
+        onClose={() => setPinSpec(null)}
+        onPin={handlePin}
+      />
+      <DashboardModal
+        open={dashboardOpenId !== null}
+        dashboard={dashboards.find((d) => d.id === dashboardOpenId) ?? null}
+        connected={connected}
+        fetchWidget={fetchWidget}
+        onClose={() => setDashboardOpenId(null)}
+        onRemoveWidget={handleRemoveWidget}
       />
     </div>
   );

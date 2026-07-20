@@ -123,6 +123,24 @@ does the GPU work; this is its client.
   reload its SQL into the editor. The buffer is bounded (default 500) so
   filtering + sorting run client-side. The `history` op now carries a `ts`
   (epoch-seconds session timestamp) on every entry.
+- **Dashboards** — a sidebar tab (Catalog / History / **Dashboards**) lists the
+  saved dashboards (each with its widget count); click to open one, double-click
+  a name to rename inline, `✕` to delete, `+ New` to create an empty one. A
+  **dashboard** is a named, persisted grid of **chart widgets** — each widget is
+  a saved SQL query + a chart spec (kind + X/Y column names). Opening a
+  dashboard re-runs every widget's query against the live GPU engine and paints
+  its chart via the headless `ChartView` (no picker controls); **⟳ Refresh**
+  re-runs them all. Widgets are authored on the **Chart** tab: tune the chart
+  (kind / X / Y), then **Pin to dashboard** picks a target dashboard (existing
+  or "New dashboard") + a widget title, and saves the spec + the SQL that
+  produced the charted result (so re-running reproduces that result). A stale
+  spec (a column renamed/dropped, or the query reshaped) is healed to a sensible
+  default rather than crashing. Dashboards persist to `localStorage` like
+  worksheets; the format is client-side only (no server op beyond the widget
+  SELECTs). The chart geometry is shared with the interactive Chart tab via the
+  pure `lib/chartRender.ts` (unit-tested by `test/chartRender_check.mjs`).
+  Command-palette entries: Open Dashboards sidebar, New dashboard, Pin current
+  chart (jumps to the Chart tab), and one per saved dashboard.
 
 ## Develop
 
@@ -160,6 +178,7 @@ node test/csv_check.mjs   # src/lib/csv.ts serializer (null-aware CSV) — no se
 node test/autocomplete_check.mjs  # src/lib/autocomplete.ts suggestion logic — no server needed
 node test/planLayout_check.mjs  # src/lib/planLayout.ts graph geometry — no server needed
 node test/worksheetTransfer_check.mjs  # src/lib/worksheetTransfer.ts .sql bundle round-trip — no server needed
+node test/chartRender_check.mjs  # src/lib/chartRender.ts bar/point geometry — no server needed
 ```
 
 `npm run smoke` needs a running `ryudb-server` with a registered `lineitem`; set
