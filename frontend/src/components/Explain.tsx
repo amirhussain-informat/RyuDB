@@ -1,6 +1,36 @@
+import { useState } from "react";
 import type { PlanNode } from "../lib/types";
+import PlanGraph from "./PlanGraph";
 
-function Node({ node }: { node: PlanNode }) {
+type View = "graph" | "tree";
+
+/** Explain-plan panel: a Snowsight-style profile graph (box-and-arrow tree of
+ *  the optimized plan) with a fallback to the classic indented text tree.
+ *  The graph is the default; the tree view is kept for compact plans and for
+ *  reading the full per-node detail inline. */
+export default function Explain({ tree }: { tree: PlanNode | null }) {
+  const [view, setView] = useState<View>("graph");
+  if (!tree) return <div className="empty">No plan. Run Explain to build the optimized plan.</div>;
+  return (
+    <div className="explain">
+      <div className="explain-view-tabs">
+        <button className={view === "graph" ? "active" : ""} onClick={() => setView("graph")}>Graph</button>
+        <button className={view === "tree" ? "active" : ""} onClick={() => setView("tree")}>Tree</button>
+      </div>
+      {view === "graph" ? <PlanGraph tree={tree} /> : <PlanTree tree={tree} />}
+    </div>
+  );
+}
+
+function PlanTree({ tree }: { tree: PlanNode }) {
+  return (
+    <ul className="plan-tree">
+      <TreeNode node={tree} />
+    </ul>
+  );
+}
+
+function TreeNode({ node }: { node: PlanNode }) {
   const detail = node.detail as Record<string, unknown>;
   const detailStr = Object.entries(detail)
     .map(([k, v]) => `${k}=${fmt(v)}`)
@@ -16,7 +46,7 @@ function Node({ node }: { node: PlanNode }) {
         {detailStr && <span className="plan-detail">{detailStr}</span>}
       </div>
       {node.children.length > 0 && (
-        <ul>{node.children.map((c, i) => <Node key={i} node={c} />)}</ul>
+        <ul>{node.children.map((c, i) => <TreeNode key={i} node={c} />)}</ul>
       )}
     </li>
   );
@@ -26,15 +56,4 @@ function fmt(v: unknown): string {
   if (Array.isArray(v)) return (v as unknown[]).join(",");
   if (v && typeof v === "object") return JSON.stringify(v);
   return String(v);
-}
-
-export default function Explain({ tree }: { tree: PlanNode | null }) {
-  if (!tree) return <div className="empty">No plan.</div>;
-  return (
-    <div className="explain">
-      <ul className="plan-tree">
-        <Node node={tree} />
-      </ul>
-    </div>
-  );
 }

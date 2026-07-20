@@ -280,6 +280,58 @@ button.dl { padding: 2px 8px; font-size: 11px; }
 .badge.fused { background: rgba(115, 201, 145, 0.2); color: var(--ok); border: 1px solid var(--ok); }
 .badge.est { background: var(--bg-3); color: var(--fg-dim); }
 
+/* explain view toggle */
+.explain-view-tabs { display: flex; gap: 4px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.explain-view-tabs button {
+  background: var(--bg); border: 1px solid var(--border); color: var(--fg-dim);
+  padding: 3px 10px; border-radius: 5px; font-size: 12px; cursor: pointer;
+}
+.explain-view-tabs button:hover { color: var(--fg); }
+.explain-view-tabs button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* query-profile graph */
+.plan-graph-wrap { display: flex; flex-direction: column; height: 100%; }
+.plan-graph-tools {
+  display: flex; align-items: center; gap: 4px; padding: 4px 10px;
+  border-bottom: 1px solid var(--border); background: var(--bg-2);
+}
+.plan-graph-tools button {
+  background: var(--bg); border: 1px solid var(--border); color: var(--fg);
+  width: 24px; height: 22px; border-radius: 4px; cursor: pointer; font-size: 13px;
+}
+.plan-graph-tools button:hover { border-color: var(--accent); }
+.plan-graph-zoom { color: var(--fg-dim); font-size: 11px; margin-left: 6px; }
+.plan-graph {
+  flex: 1; overflow: hidden; position: relative; cursor: grab;
+  background: var(--bg);
+}
+.plan-graph:active { cursor: grabbing; }
+.plan-graph svg { display: block; }
+.plan-edge { stroke: var(--border); stroke-width: 1.5; }
+.pnode-box { fill: var(--bg-2); stroke-width: 2; }
+.pnode-op { font: 600 13px ui-monospace, monospace; fill: var(--fg); }
+.pnode-est { font: 11px ui-monospace, monospace; fill: var(--fg-dim); }
+.pnode-fused { font: 600 10px ui-sans-serif, system-ui; fill: var(--ok); }
+.pnode-detail { font: 10px ui-monospace, monospace; fill: var(--fg-dim); }
+
+/* node category accent colors (box stroke + op label) */
+.pnode-scan .pnode-box { stroke: var(--ok); }
+.pnode-scan .pnode-op { fill: var(--ok); }
+.pnode-join .pnode-box { stroke: var(--accent); }
+.pnode-join .pnode-op { fill: var(--accent); }
+.pnode-agg .pnode-box { stroke: #c084fc; }
+.pnode-agg .pnode-op { fill: #c084fc; }
+.pnode-filter .pnode-box { stroke: #f0a868; }
+.pnode-filter .pnode-op { fill: #f0a868; }
+.pnode-sort .pnode-box { stroke: #56c9d6; }
+.pnode-sort .pnode-op { fill: #56c9d6; }
+.pnode-proj .pnode-box { stroke: var(--fg-dim); }
+.pnode-proj .pnode-op { fill: var(--fg); }
+.pnode-write .pnode-box { stroke: var(--err); }
+.pnode-write .pnode-op { fill: var(--err); }
+.pnode-other .pnode-box { stroke: var(--fg-dim); }
+.pnode-other .pnode-op { fill: var(--fg); }
+
 .empty { color: var(--fg-dim); padding: 16px; font-style: italic; }
 .msg { white-space: pre-wrap; font-family: monospace; font-size: 12px; padding: 8px; }
 .msg.error { color: var(--err); }
