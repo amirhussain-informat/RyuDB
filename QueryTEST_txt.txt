@@ -1,0 +1,87 @@
+Two things up front:
+
+  1. Your file is on /mnt/c (Windows mount via drvfs). Cold reads of 12GB through drvfs are I/O-bound and slow — the GPU will mostly wait on disk. To see real GPU performance, copy the parquet into WSL once
+  and re-register it:
+  mkdir -p ~/RyuDB/data/taxi && cp /mnt/c/Users/cance/Downloads/archive/rideshare_data.parquet ~/RyuDB/data/taxi/0.parquet
+  1. Then re-register the WSL path as taxi2 (or drop taxi and re-register). Scans from the WSL ext4 filesystem are dramatically faster, and the engine's scan cache then holds the warmed columns in GPU memory
+  across queries.
+  2. The worker is single-threaded — run these one at a time, and wait for each to finish before the next (otherwise they queue). If a query you launched seems stuck, hit Cancel in the UI (that's the #98
+  feature to test) before starting another.
+
+  Using the columns I confirmed (business, pickup_location, dropoff_location, trip_length, request_to_dropoff, request_to_pickup, total_ride_time, on_scene_to_pickup, on_scene_to_dropoff; the UI shows any
+  remaining ones), here's a complexity ladder. Run cold, then re-run to see warm-cache speedup.
+
+  Q1 — Heavy multi-aggregate global scan (stresses the per-aggregate inner loop; this is the one to Cancel mid-run to test #98):
+  SELECT
+    count(*) AS n,
+    sum(trip_length) AS s_len, avg(trip_length) AS a_len, min(trip_length) AS mn, max(trip_length) AS mx,
+    stddev(trip_length) AS sd_len, variance(trip_length) AS v_len,
+    sum(total_ride_time) AS s_t, avg(total_ride_time) AS a_t, min(total_ride_time) AS mn_t, max(total_ride_time) AS mx_t,
+    sum(request_to_pickup) AS s_rp, avg(request_to_pickup) AS a_rp, avg(on_scene_to_pickup) AS a_op,
+    avg(request_to_dropoff) AS a_rd, avg(on_scene_to_dropoff) AS a_od,
+    sum(on_scene_to_pickup) AS s_op, sum(on_scene_to_dropoff) AS s_od,
+    min(request_to_pickup) AS mn_rp, max(request_to_pickup) AS mx_rp,
+    min(on_scene_to_pickup) AS mn_op, max(on_scene_to_pickup) AS mx_op
+  FROM taxi;
+
+  Q2 — Group-by OLAP (groupby + agg + sort; classic HTAP workload):
+  SELECT business,
+    count(*) AS trips,
+    avg(trip_length) AS avg_len,
+    avg(total_ride_time) AS avg_time,
+    sum(trip_length) AS total_dist,
+    max(trip_length) AS max_len,
+    stddev(trip_length) AS sd_len
+  FROM taxi
+  GROUP BY business
+  ORDER BY trips DESC;
+
+  Q3 — Window functions (per-business ranking + running total + partition aggregate; stresses the window engine):
+  SELECT business, pickup_location, dropoff_location,
+    trip_length, total_ride_time,
+    ROW_NUMBER() OVER (PARTITION BY business ORDER BY trip_length DESC) AS rn,
+    RANK()       OVER (PARTITION BY business ORDER BY total_ride_time DESC) AS rnk,
+    AVG(trip_length) OVER (PARTITION BY business) AS biz_avg_len,
+    SUM(trip_length)  OVER (PARTITION BY business ORDER BY total_ride_time
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_len
+  FROM taxi
+  LIMIT 1000;
+
+  Q4 — Popular routes (two-column group-by + sort + limit):
+  SELECT pickup_location, dropoff_location,
+    count(*) AS trips,
+    avg(trip_length) AS avg_len,
+    avg(total_ride_time) AS avg_time,
+    sum(trip_length) AS total_dist
+  FROM taxi
+  GROUP BY pickup_location, dropoff_location
+  ORDER BY trips DESC
+  LIMIT 20;
+
+  Q5 — CTE + join of aggregates (zone throughput: outbound vs inbound; a real join, but on small aggregates so it won't OOM):
+  WITH outbound AS (
+    SELECT pickup_location AS zone, count(*) AS outs, avg(trip_length) AS avg_out_len
+    FROM taxi GROUP BY pickup_location
+  ),
+  inbound AS (
+    SELECT dropoff_location AS zone, count(*) AS ins, avg(trip_length) AS avg_in_len
+    FROM taxi GROUP BY dropoff_location
+  )
+  SELECT o.zone, o.outs, i.ins, o.avg_out_len, i.avg_in_len
+  FROM outbound o JOIN inbound i USING (zone)
+  ORDER BY o.outs DESC
+  LIMIT 20;
+
+  Q6 — Filtered efficiency metric (arithmetic expr + predicate + group-by + sort):
+  SELECT business,
+    avg(total_ride_time / NULLIF(trip_length, 0)) AS time_per_dist,
+    avg(on_scene_to_pickup) AS avg_wait,
+    count(*) AS n,
+    avg(trip_length) AS avg_len
+  FROM taxi
+  WHERE trip_length > 0 AND total_ride_time > 0
+  GROUP BY business
+  ORDER BY time_per_dist DESC;
+
+  How to read the numbers: the first query touching a column is cold (reads the parquet column off disk — slow on /mnt/c); rerun it immediately and it's warm (scan cache hit — should be dramatically faster,
+  and that warm number is the GPU compute time you actually want to see). So for each query, run it twice and compare.
