@@ -12,6 +12,7 @@ import ShortcutsHelp from "./components/ShortcutsHelp";
 import SearchModal from "./components/SearchModal";
 import VersionHistory from "./components/VersionHistory";
 import Results from "./components/Results";
+import Chart from "./components/Chart";
 import Explain from "./components/Explain";
 import Catalog from "./components/Catalog";
 import History from "./components/History";
@@ -30,7 +31,7 @@ const PAGE_SIZE = 1000;
 // Page size for cursor-backed downloads (fewer round trips than PAGE_SIZE).
 const DL_PAGE = 50_000;
 
-type MainTab = "results" | "explain" | "message";
+type MainTab = "results" | "chart" | "explain" | "message";
 
 // The per-worksheet view (results / plan / message / error / active sub-tab /
 // cursor id). Kept in memory keyed by worksheet id so switching tabs restores
@@ -507,6 +508,9 @@ export default function App() {
           <div className="output">
             <div className="output-tabs">
               <button className={mainTab === "results" ? "active" : ""} onClick={() => setMainTab("results")}>Results</button>
+              {result && result.meta.op === "result" && (
+                <button className={mainTab === "chart" ? "active" : ""} onClick={() => setMainTab("chart")}>Chart</button>
+              )}
               <button className={mainTab === "explain" ? "active" : ""} onClick={() => setMainTab("explain")}>Explain</button>
               {(message || error) && (
                 <button className={mainTab === "message" ? "active" : ""} onClick={() => setMainTab("message")}>
@@ -524,6 +528,11 @@ export default function App() {
                              hasMore={hasMore}
                              loadingMore={loadingMore} />
                   : <div className="empty">Run a query.</div>
+              )}
+              {connected && mainTab === "chart" && (
+                result && result.meta.op === "result"
+                  ? <Chart meta={result.meta as ResultMeta} table={result.table} />
+                  : <div className="empty">Run a query to chart its results.</div>
               )}
               {connected && mainTab === "explain" && <Explain tree={plan} />}
               {connected && mainTab === "message" && (

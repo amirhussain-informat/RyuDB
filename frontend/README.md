@@ -34,6 +34,12 @@ does the GPU work; this is its client.
   re-runs with `max_rows = row_count`. A result above 1M rows asks for
   confirmation first. **Copy** writes the displayed rows as TSV to the
   clipboard (pastes into Excel / Sheets); **click a cell** to copy its value.
+- **Chart** — a **Chart** output tab (shown when a result is present) renders
+  the loaded result rows as **bar / line / scatter** over hand-rolled SVG (no
+  charting library — keeps the offline/no-CDN ethos). Pick the X and Y columns;
+  bar plots one bar per row (capped at 60, ideal for an aggregated GROUP BY
+  result), line/scatter need numeric X and Y. v1 charts the displayed page;
+  GPU-accelerated inline aggregations are a later piece.
 - **Explain** — the structured plan tree with a `fused` badge on an
   `Aggregate` over a `Join` (the star-join+aggregate shape eligible for the
   fused C++ kernel — eligibility, not a guarantee).
