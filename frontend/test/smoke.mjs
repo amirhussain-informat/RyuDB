@@ -221,6 +221,27 @@ check("cleanup drop renamed", dropRen.meta.op === "ok" && dropRen.meta.detail?.d
 // "dropped table unqueryable" check above — so a dropped name errors instead
 // of returning the stale cached frame.)
 
+// 10b. admin alter: the constraint-editor wire path the table-detail panel
+//     uses. Set a PK (also marks its columns NOT NULL), clear it via the
+//     dedicated pk_clear kind (pk rejects an empty list), add a UNIQUE, and
+//     confirm the `table` op reflects each. Uses a throwaway copy.
+const altReg = await call(ws, { id: "ar", op: "admin", action: "register", args: { table: "li_alt", path: LIPATH } });
+check("alter prep register", altReg.meta.op === "ok", JSON.stringify(altReg.meta));
+const setPk = await call(ws, { id: "ap", op: "admin", action: "alter", args: { table: "li_alt", kind: "pk", cols: ["l_orderkey"] } });
+check("alter set pk ok", setPk.meta.op === "ok" && setPk.meta.detail?.set === "primary_key", JSON.stringify(setPk.meta));
+const t1 = await call(ws, { id: "at1", op: "table", name: "li_alt" });
+check("table reflects pk", t1.meta.op === "table" && JSON.stringify(t1.meta.constraints?.primary_key) === JSON.stringify(["l_orderkey"]) && (t1.meta.constraints?.not_null ?? []).includes("l_orderkey"), JSON.stringify(t1.meta.constraints));
+const clrPk = await call(ws, { id: "apc", op: "admin", action: "alter", args: { table: "li_alt", kind: "pk_clear" } });
+check("alter clear pk ok", clrPk.meta.op === "ok" && clrPk.meta.detail?.set === "primary_key_cleared", JSON.stringify(clrPk.meta));
+const t2 = await call(ws, { id: "at2", op: "table", name: "li_alt" });
+check("table reflects pk cleared", t2.meta.op === "table" && t2.meta.constraints?.primary_key === null, JSON.stringify(t2.meta.constraints));
+const addUnq = await call(ws, { id: "au", op: "admin", action: "alter", args: { table: "li_alt", kind: "unique", cols: ["l_orderkey", "l_quantity"] } });
+check("alter add unique ok", addUnq.meta.op === "ok" && addUnq.meta.detail?.set === "unique", JSON.stringify(addUnq.meta));
+const t3 = await call(ws, { id: "at3", op: "table", name: "li_alt" });
+check("table reflects unique", t3.meta.op === "table" && (t3.meta.constraints?.unique ?? []).some((u) => JSON.stringify(u) === JSON.stringify(["l_orderkey", "l_quantity"])), JSON.stringify(t3.meta.constraints));
+const altDrop = await call(ws, { id: "ad", op: "admin", action: "drop", args: { table: "li_alt" } });
+check("alter cleanup drop", altDrop.meta.op === "ok", JSON.stringify(altDrop.meta));
+
 // 11. upload op: two-frame text+binary ingest (browser file-upload path).
 //     Send the bytes of a real parquet file; the server writes them to
 //     <data>/uploads and registers the table, which is then queryable.

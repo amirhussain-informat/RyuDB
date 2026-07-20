@@ -985,6 +985,44 @@ def test_admin_alter_and_checkpoint(srv):
     assert cp["op"] == "ok" and "tables" in cp["detail"]
 
 
+def test_admin_alter_pk_clear_and_unique(srv):
+    """The alter op's constraint kinds the table-detail UI drives: set a PK,
+    clear it (the dedicated `pk_clear` kind — `pk` rejects an empty list), add a
+    UNIQUE, and after each the `table` op reflects the change. (Uses a throwaway
+    copy so the shared `lineitem` fixture's constraints are untouched.)"""
+    port, server, _ref, _ = srv
+    data_path = os.path.join(server.catalog.data_dir, "lineitem")
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            await _call(ws, {"id": "r", "op": "admin", "action": "register",
+                             "args": {"table": "li_alt", "path": data_path}})
+            setpk, _ = await _call(ws, {"id": "p", "op": "admin", "action": "alter",
+                                        "args": {"table": "li_alt", "kind": "pk",
+                                                 "cols": ["l_orderkey"]}})
+            t1, _ = await _call(ws, {"id": "t1", "op": "table", "name": "li_alt"})
+            clrpk, _ = await _call(ws, {"id": "pc", "op": "admin", "action": "alter",
+                                        "args": {"table": "li_alt", "kind": "pk_clear"}})
+            t2, _ = await _call(ws, {"id": "t2", "op": "table", "name": "li_alt"})
+            unq, _ = await _call(ws, {"id": "u", "op": "admin", "action": "alter",
+                                      "args": {"table": "li_alt", "kind": "unique",
+                                               "cols": ["l_orderkey", "l_quantity"]}})
+            t3, _ = await _call(ws, {"id": "t3", "op": "table", "name": "li_alt"})
+            await _call(ws, {"id": "d", "op": "admin", "action": "drop",
+                             "args": {"table": "li_alt"}})
+        return setpk, t1, clrpk, t2, unq, t3
+    setpk, t1, clrpk, t2, unq, t3 = _run(client())
+
+    assert setpk["op"] == "ok" and setpk["detail"]["set"] == "primary_key", setpk
+    assert t1["op"] == "table" and t1["constraints"]["primary_key"] == ["l_orderkey"], t1
+    # setting a PK also marks its columns NOT NULL
+    assert "l_orderkey" in t1["constraints"]["not_null"], t1
+    assert clrpk["op"] == "ok" and clrpk["detail"]["set"] == "primary_key_cleared", clrpk
+    assert t2["op"] == "table" and t2["constraints"]["primary_key"] is None, t2
+    assert unq["op"] == "ok" and unq["detail"]["set"] == "unique", unq
+    assert t3["op"] == "table" and ["l_orderkey", "l_quantity"] in t3["constraints"]["unique"], t3
+
+
 def test_history_records_invocations(srv):
     port, *_ = srv
     async def client():

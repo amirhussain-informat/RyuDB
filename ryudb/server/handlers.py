@@ -841,6 +841,13 @@ def _run_alter(cat, args: dict[str, Any]) -> dict[str, Any]:
     if kind == "pk":
         cat.set_primary_key(table, _arg_list(args, "cols"))
         return {"set": "primary_key"}
+    if kind == "pk_clear":
+        # set_primary_key([]) stores an empty tuple -> to_dict() reports None,
+        # i.e. no PK. (The NOT NULL flags the PK set on its columns are left in
+        # place; NOT NULL is an independent constraint.) `pk` uses `_arg_list`
+        # which rejects an empty list, so clearing needs its own kind.
+        cat.set_primary_key(table, [])
+        return {"set": "primary_key_cleared"}
     if kind == "notnull":
         cat.set_not_null(table, _arg(args, "col", str), True)
         return {"set": "not_null"}
