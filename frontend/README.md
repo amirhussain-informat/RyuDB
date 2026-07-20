@@ -18,7 +18,11 @@ does the GPU work; this is its client.
 
 - **Editor** — Monaco with SQL syntax. `Ctrl/Cmd+Enter` runs the current
   statement. A parse error from the server is underlined at the reported
-  `position`.
+  `position`. Multiple **worksheets** live as tabs above the editor: click to
+  switch, double-click a name to rename, `×` to close, `+` to create a new one.
+  Worksheets (names + SQL + the active tab) persist to `localStorage`, so they
+  survive a reload; each tab keeps its own last results/plan/message during a
+  session.
 - **Results** — the server's Arrow IPC binary frame is decoded with
   `apache-arrow` and rendered as a virtualized grid (`react-window`). The true
   `row_count` is shown. Each run opens a server-side **cursor** (`sql` with
