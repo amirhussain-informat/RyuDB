@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from typing import Any
 
 import cudf
@@ -104,6 +105,51 @@ def srv(srv_dir):
 
     # Sync shutdown: stop the worker, then stop the loop (which closes the
     # listening socket). Both are scheduled on the server loop's thread.
+    srv_loop.call_soon_threadsafe(server.stop)
+    srv_loop.call_soon_threadsafe(srv_loop.stop)
+    t.join(timeout=5)
+
+
+@pytest.fixture(scope="module")
+def srv_pool(srv_dir):
+    """Start a Server with a 4-worker engine pool on port 0; yield
+    (port, server, ref_engine, data_path). Same data as ``srv`` but the engine
+    runs on a pool of 4 threads so SELECTs can run concurrently (the RW lock
+    keeps writes/admin ops serialized). For the concurrency tests below."""
+    srv_loop = asyncio.new_event_loop()
+    server = Server(str(srv_dir), "127.0.0.1", 0, max_rows=100, n_workers=4)
+    ready = threading.Event()
+    port_box: dict[str, int] = {}
+
+    async def _start():
+        from websockets.asyncio.server import serve
+        ctx = serve(server._handler, server.host, 0, max_size=None)
+        ws_srv = await ctx.__aenter__()
+        server._srv = ws_srv
+        server._srv_ctx = ctx  # keep the serve context alive for the loop's lifetime
+        port_box["p"] = ws_srv.sockets[0].getsockname()[1]
+        ready.set()
+
+    def _run():
+        asyncio.set_event_loop(srv_loop)
+        srv_loop.run_until_complete(_start())
+        srv_loop.run_forever()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    assert ready.wait(5), "pool server did not start"
+    port = port_box["p"]
+
+    # Register the table on the server's catalog (no query in flight during
+    # module setup, same as the srv fixture).
+    server.catalog.register("lineitem", str(srv_dir / "lineitem"))
+
+    ref_cat = Catalog(str(srv_dir))
+    ref_cat.register("lineitem", str(srv_dir / "lineitem"))
+    ref_engine = Engine(ref_cat)
+
+    yield port, server, ref_engine, str(srv_dir / "lineitem")
+
     srv_loop.call_soon_threadsafe(server.stop)
     srv_loop.call_soon_threadsafe(srv_loop.stop)
     t.join(timeout=5)
@@ -748,3 +794,183 @@ def test_restore_refused_during_open_txn(srv, tmp_path):
     assert bad["op"] == "error" and bad["kind"] == "runtime"
     assert "transaction" in bad["message"].lower()
     assert good["op"] == "ok" and good["detail"].get("restored") is True
+
+
+# --------------------------------------------------------------------------- #
+# worker-pool concurrency (srv_pool: n_workers=4)
+# --------------------------------------------------------------------------- #
+#
+# These prove the engine runs concurrently on a worker pool (Option 1: thread
+# pool + MVCC). The Engine's read/write lock lets SELECTs overlap (shared read
+# lock) while writes/admin ops serialize (exclusive write lock). Each worker
+# thread has its own _txn / cancel_event slot (threading.local), so concurrent
+# requests never clobber a single shared slot.
+
+
+def test_pool_reads_run_concurrently(srv_pool):
+    """With n_workers=4, two SELECTs dispatched together overlap INSIDE the
+    engine -- proving the pool dispatches to separate worker threads AND the
+    read lock is shared (not exclusive), so concurrent reads are allowed. Patch
+    engine._scan (which runs under the read lock) to sleep and count how many
+    scans are in flight at once; two pipelined SELECTs must reach
+    max_in_flight >= 2. (On the single-worker ``srv`` fixture this would be 1 --
+    the reads would serialize.)"""
+    port, server, ref, _ = srv_pool
+    orig = server.engine._scan
+    state = {"in_flight": 0, "max": 0}
+    lock = threading.Lock()
+
+    def slow_scan(table, columns):
+        with lock:
+            state["in_flight"] += 1
+            state["max"] = max(state["max"], state["in_flight"])
+        try:
+            time.sleep(0.05)
+            return orig(table, columns)
+        finally:
+            with lock:
+                state["in_flight"] -= 1
+    server.engine._scan = slow_scan
+    try:
+        async def client():
+            async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+                # Pipeline two SELECTs without awaiting between them so both
+                # land in the worker queue before either completes.
+                await ws.send(json.dumps({"id": "q1", "op": "sql",
+                    "sql": "SELECT l_orderkey FROM lineitem LIMIT 5"}))
+                await ws.send(json.dumps({"id": "q2", "op": "sql",
+                    "sql": "SELECT l_orderkey FROM lineitem LIMIT 5"}))
+                got: dict[str, dict] = {}
+                while len(got) < 2:
+                    m = await asyncio.wait_for(ws.recv(), timeout=20)
+                    if isinstance(m, (bytes, bytearray)):
+                        continue
+                    d = json.loads(m)
+                    if d.get("id") in ("q1", "q2"):
+                        got[d["id"]] = d
+            return got
+        got = _run(client())
+    finally:
+        server.engine._scan = orig
+    assert got["q1"]["op"] == "result"
+    assert got["q2"]["op"] == "result"
+    assert state["max"] >= 2, f"reads did not overlap (max_in_flight={state['max']})"
+
+
+def test_pool_cancel_pending_when_full(srv_pool):
+    """With n_workers=4, block all 4 workers on long scans; a 5th request sits
+    pending in the queue (no free worker); cancel it before releasing the
+    blockers -> it returns ``cancelled`` (dropped while pending, never started).
+    This is the only way to reach a pending-cancel state with a pool: with 4
+    workers, one in-flight request does NOT block a second, so we must fill the
+    whole pool to force a pending request."""
+    port, server, ref, _ = srv_pool
+    block = threading.Event()
+    orig = server.engine._scan
+    n_started = [0]
+
+    def blocking_scan(table, columns):
+        n_started[0] += 1
+        block.wait(5)  # hold this worker until the test releases it
+        return orig(table, columns)
+    server.engine._scan = blocking_scan
+    try:
+        async def client():
+            async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+                # 4 queries fill the 4 workers.
+                for i in range(4):
+                    await ws.send(json.dumps({"id": f"q{i}", "op": "sql",
+                        "sql": "SELECT l_orderkey FROM lineitem LIMIT 5"}))
+                # Wait until all 4 workers are blocked inside _scan.
+                deadline = time.time() + 5
+                while n_started[0] < 4 and time.time() < deadline:
+                    await asyncio.sleep(0.01)
+                assert n_started[0] == 4, f"only {n_started[0]} workers started"
+                # 5th request: no free worker -> sits pending.
+                await ws.send(json.dumps({"id": "p5", "op": "sql",
+                    "sql": "SELECT l_orderkey FROM lineitem LIMIT 5"}))
+                await asyncio.sleep(0.05)  # let p5 register as pending
+                await ws.send(json.dumps({"id": "cx", "op": "cancel",
+                                          "targets": ["p5"]}))
+                got: dict[str, dict] = {}
+                block_set = False
+                # Collect all 6: q0..q3 (result), p5 (cancelled), cx (ok). The cx
+                # ok frame is sent only after cancel_pending() set p5's event, so
+                # once cx arrives it is safe to release the 4 blockers -- p5 will
+                # be dropped on dequeue.
+                while len(got) < 6:
+                    m = await asyncio.wait_for(ws.recv(), timeout=20)
+                    if isinstance(m, (bytes, bytearray)):
+                        continue  # a q result's binary frame; not needed here
+                    d = json.loads(m)
+                    rid = d.get("id")
+                    if rid in ("q0", "q1", "q2", "q3", "p5", "cx"):
+                        got[rid] = d
+                    if rid == "cx" and not block_set:
+                        block.set()
+                        block_set = True
+            return got
+        got = _run(client())
+    finally:
+        server.engine._scan = orig
+    for i in range(4):
+        assert got[f"q{i}"]["op"] == "result"     # the 4 blockers ran to completion
+    assert got["p5"]["op"] == "cancelled"        # dropped while pending
+    assert "p5" in got["cx"]["detail"]["cancelled"]
+
+
+def test_pool_checkpoint_waits_for_inflight_read(srv_pool):
+    """An in-flight SELECT holds the shared read lock; a checkpoint (exclusive
+    write lock) must WAIT for it to finish, then succeed -- it neither runs
+    concurrently with the read (which would corrupt the base+delta rewrite)
+    nor fails. Proves the RW lock coordinates checkpoint with concurrent reads
+    on the pool (writer-preference: the waiting writer blocks until the reader
+    releases)."""
+    port, server, ref, _ = srv_pool
+    hold = threading.Event()
+    started = threading.Event()
+    orig = server.engine._scan
+
+    def slow_scan(table, columns):
+        started.set()
+        hold.wait(5)  # hold the read lock until the test releases it
+        return orig(table, columns)
+    server.engine._scan = slow_scan
+    try:
+        async def client():
+            async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as a, \
+                       websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as b:
+                # a: start a slow read (holds the read lock).
+                await a.send(json.dumps({"id": "q", "op": "sql",
+                    "sql": "SELECT l_orderkey FROM lineitem LIMIT 5"}))
+                assert started.wait(2), "read did not start"
+                # b: checkpoint while the read is in flight. It must block on
+                # the write lock until the read releases, then succeed.
+                cp_done = asyncio.Event()
+                cp_result: dict[str, Any] = {}
+
+                async def do_ckpt():
+                    r, _ = await _call(b, {"id": "cp", "op": "admin",
+                                           "action": "checkpoint"})
+                    cp_result["r"] = r
+                    cp_done.set()
+                asyncio.create_task(do_ckpt())
+                await asyncio.sleep(0.1)  # give the checkpoint time to block
+                assert not cp_done.is_set(), "checkpoint returned before the read finished"
+                hold.set()  # release the read -> checkpoint acquires + runs
+                await asyncio.wait_for(cp_done.wait(), timeout=5)
+                # collect the read result
+                rq: dict[str, dict] = {}
+                while len(rq) < 1:
+                    m = await asyncio.wait_for(a.recv(), timeout=20)
+                    if isinstance(m, (bytes, bytearray)):
+                        continue
+                    d = json.loads(m)
+                    if d.get("id") == "q":
+                        rq["q"] = d
+            return rq["q"], cp_result["r"]
+        q, cp = _run(client())
+    finally:
+        server.engine._scan = orig
+    assert q["op"] == "result"
+    assert cp["op"] == "ok" and "tables" in cp["detail"]

@@ -56,6 +56,7 @@ class Server:
         port: int = 5430,
         max_rows: int = 200_000,
         history_size: int = 500,
+        n_workers: int = 1,
     ) -> None:
         self.data_dir = data_dir
         self.host = host
@@ -63,7 +64,12 @@ class Server:
         self.max_rows = max_rows
         self.catalog = Catalog(data_dir)
         self.engine = Engine(self.catalog)
-        self.worker = EngineWorker(self.engine)
+        # Worker pool size: 1 preserves the original single-worker semantics
+        # (the RW lock is uncontended, the per-thread _txn/cancel_event slots
+        # behave as a single slot). n_workers > 1 lets SELECTs run concurrently
+        # (the Engine's read/write lock keeps writes serialized); each worker
+        # thread gets its own per-thread _txn / cancel_event slot.
+        self.worker = EngineWorker(self.engine, n_workers=n_workers)
         # per-connection pending cancel events: id(ws) -> {request_id -> Event}
         self._pending: dict[int, dict[str, threading.Event]] = {}
         # per-connection in-flight request tasks (so cancel/disconnect can drop them)
@@ -86,11 +92,13 @@ class Server:
     # -- per-connection transaction context (called on the worker thread) --
     def run_sql(self, ws, sql: str):
         """Run ``engine.sql(sql)`` with THIS connection's transaction loaded as
-        the engine's current txn, then read it back. The worker serializes all
-        engine access, so only one request touches ``engine._txn`` at a time;
-        the txn is held on the ws (``_ryudb_txn``) between requests and dropped
-        with the ws on disconnect (its buffered writes were never flushed, so
-        dropping the reference is the rollback).
+        the engine's current txn, then read it back. ``engine._txn`` is a
+        per-thread slot (threading.local), so on a worker pool each request
+        touches only its own worker's slot -- concurrent requests no longer
+        clobber a single shared _txn. The txn is held on the ws
+        (``_ryudb_txn``) between requests and dropped with the ws on disconnect
+        (its buffered writes were never flushed, so dropping the reference is
+        the rollback).
 
         ``BEGIN`` leaves a new ``Transaction`` in ``engine._txn`` -> stored on
         the ws. ``COMMIT``/``ROLLBACK`` leave ``None`` -> the ws txn is cleared.

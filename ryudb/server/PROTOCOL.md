@@ -8,9 +8,12 @@ sharing the same engine, worker, and per-connection transaction model:
 - an optional **Postgres v3 wire-protocol** front (see *Postgres wire front*
   below), enabled with `--pg-port` / `RYUDB_PG_PORT` (default `0` = disabled).
 
-Both fronts serialize all engine/catalog access through the single worker
-thread, so correctness and FIFO submission order are identical across them; a
-PG connection and a WS connection are just two sessions over the same engine
+Both fronts dispatch to the same engine worker pool (default **1** worker,
+`--workers` / `RYUDB_WORKERS`; `N>1` lets SELECTs run concurrently). The
+engine guards its shared state with a read/write lock — SELECTs take the shared
+read lock (concurrent reads allowed), writes and admin ops take the exclusive
+write lock (serialized) — so correctness is identical across both fronts; a PG
+connection and a WS connection are just two sessions over the same engine
 (per-connection MVCC isolation applies to both).
 
 ## WebSocket front
@@ -226,13 +229,27 @@ ring buffer (default 500 entries).
 ## Concurrency
 
 Each request is dispatched as its own task, so one connection may have several
-requests in flight. All engine/catalog access is serialized through a single
-worker thread (one `Engine`), so:
+requests in flight. They run on the engine worker pool (default 1 worker;
+`--workers N` for a pool of `N`). The engine's read/write lock gives:
 
-- **correctness** is identical to in-process `engine.sql()` — no two statements
-  ever run concurrently on the engine;
-- **submission order** is FIFO (the worker drains its queue in order), so
-  responses for sequentially-submitted requests arrive in order;
+- **concurrent reads** — SELECTs (and `explain`/`catalog`/`table`) take the
+  shared read lock, so with `--workers N>1` several SELECTs run on the engine
+  at once. Each worker thread has its own `_txn` / `cancel_event` slot
+  (`threading.local`), so concurrent requests never clobber a single shared
+  slot. MVCC isolation is unchanged: a txn read still uses its frozen
+  `snapshot_ts` (`batches_at(snapshot_ts)`); autocommit reads see all committed
+  batches.
+- **serialized writes** — INSERT/UPDATE/DELETE/MERGE and admin ops take the
+  exclusive write lock, so no two writes (and no write alongside a read) ever
+  overlap on the engine. This is what keeps the `_code_cache`/`_pk_cache`
+  coherent without versioning: a write's cache invalidation runs with no
+  concurrent reader, and a read's cache population runs with no concurrent
+  writer.
+- **submission order** is FIFO (the worker pool drains its queue in order), so
+  with the default 1 worker, responses for sequentially-submitted requests
+  arrive in order — identical to in-process `engine.sql()`. With `N>1` workers,
+  submission is still FIFO but response ordering becomes per-request (a later
+  query that finishes faster may return first) — match by `id`.
 - a **pipelined** client (many requests sent without awaiting) may see responses
   arrive out of order — match by `id`.
 
@@ -273,9 +290,9 @@ wire.
 With `--pg-port` set, `ryudb-server` also binds a PostgreSQL v3 wire-protocol
 front (`ryudb/server/pgwire.py`) so real drivers — `psql`, `psycopg`,
 `pg8000`, `asyncpg`, JDBC — can connect and run SQL instead of speaking the
-custom JSON+Arrow protocol. It shares the WebSocket `Server`'s engine, worker,
-and per-connection transaction core: each PG connection is a session with its
-own `_ryudb_txn` routed through `Server.run_sql`, so the cross-session MVCC
+custom JSON+Arrow protocol. It shares the WebSocket `Server`'s engine, worker
+pool, and per-connection transaction core: each PG connection is a session with
+its own `_ryudb_txn` routed through `Server.run_sql`, so the cross-session MVCC
 isolation above applies identically. `--pg-max-rows` / `RYUDB_PG_MAX_ROWS`
 (default `200000`) caps the rows returned per SELECT over this front.
 

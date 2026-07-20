@@ -1,22 +1,34 @@
-"""The single engine worker — serialization + pending-request cancellation.
+"""The engine worker pool — dispatch + pending-request cancellation.
 
-The ``Engine`` is single-session / one-thread (``executor.py:152``): its
-``_txn`` / ``_commit_ts`` / ``_snapshots`` are unprotected mutable state, and a
-query runs to completion on the calling thread. So the server may NOT run two
-engine calls concurrently. This module is the serialization boundary: a single
-dedicated thread owns the ``Engine`` (and the ``Catalog`` — the engine reads it
-mid-query, so catalog mutations must serialize with queries too) and pulls work
-items from a FIFO queue one at a time.
+The ``Engine``'s shared mutable state (catalog, delta, ``_commit_ts``,
+``_snapshots``, ``_wal``, the scan/code/pk caches) is guarded by the Engine's
+read/write lock (``_RWLock`` in ``executor.py``): SELECTs take the shared read
+side and may run concurrently; writes and the global admin ops take the
+exclusive write side. Per-request state that the executor reads mid-query --
+the current transaction (``engine._txn``) and the in-flight cancel Event
+(``engine.cancel_event``) -- is kept in per-thread slots (``threading.local``)
+so each worker sees its own request's state, not a single clobbered slot.
+
+So the server MAY run several engine calls concurrently, up to the pool size.
+This module is the dispatch boundary: a pool of N dedicated threads (default 1,
+preserving the old single-worker semantics; ``--workers N`` enlarges it) shares
+one FIFO queue and pulls work items one at a time. Submission order within the
+queue is still FIFO, but with N>1 a later item may be picked up by a free worker
+before an earlier (still-running) item finishes -- so response ordering becomes
+per-request, not global (match by ``id``). Correctness is unchanged: the RW lock
+serializes writes and the per-thread slots isolate per-request state.
 
 It also implements cancellation. ``ThreadPoolExecutor`` does not expose its
 internal queue, so a hand-rolled worker is used instead: each submitted item
-carries a ``threading.Event`` cancel flag. The worker checks it *before*
-starting the call and drops the item if set (pending cancel). For a request
-already in flight, the same event is published to ``engine.cancel_event`` for
-the duration of the call, so the executor raises ``CancelledByUser`` at the
-next plan-node boundary (cooperative in-flight cancel). A single long cuDF
-call (a big groupby, a cold parquet read) is still not interruptible mid-call —
-cancel fires at the next node boundary; that is the one remaining limit.
+carries a ``threading.Event`` cancel flag. A worker checks it *before* starting
+the call and drops the item if set (pending cancel -- only reachable when every
+worker is busy, i.e. the pool is full). For a request already in flight, the
+same event is published to ``engine.cancel_event`` (this worker's per-thread
+slot) for the duration of the call, so the executor raises ``CancelledByUser``
+at the next plan-node boundary (cooperative in-flight cancel). A single long
+cuDF call (a big groupby, a cold parquet read) is still not interruptible
+mid-call -- cancel fires at the next node boundary; that is the one remaining
+limit (full preemption would need subprocess isolation).
 
 Results/exceptions are delivered back to the asyncio loop with
 ``loop.call_soon_threadsafe`` (an asyncio.Future may only be resolved on the
@@ -36,21 +48,26 @@ class Cancelled(Exception):
 
 
 class EngineWorker:
-    """Owns the single Engine; processes requests strictly one at a time on a
-    dedicated thread. Supports cancelling a request that has not started."""
+    """Owns the Engine; processes requests on a pool of N dedicated threads
+    sharing one FIFO queue. Supports cancelling a request that has not started."""
 
-    def __init__(self, engine: Any) -> None:
+    def __init__(self, engine: Any, n_workers: int = 1) -> None:
+        if n_workers < 1:
+            raise ValueError("n_workers must be >= 1")
         self.engine = engine
+        self.n_workers = n_workers
         self._q: queue.Queue = queue.Queue()
-        self._thread = threading.Thread(
-            target=self._run, name="ryudb-engine", daemon=True
-        )
-        self._thread.start()
+        self._threads: list[threading.Thread] = [
+            threading.Thread(target=self._run, name=f"ryudb-engine-{i}", daemon=True)
+            for i in range(n_workers)
+        ]
+        for t in self._threads:
+            t.start()
 
     def submit(
         self, loop: asyncio.AbstractEventLoop, fn: Callable[..., Any], *args: Any
     ) -> tuple[asyncio.Future, threading.Event]:
-        """Enqueue ``fn(*args)`` on the worker thread.
+        """Enqueue ``fn(*args)`` on a worker thread.
 
         Returns ``(future, cancel_event)``: await the future for the result (or
         ``Cancelled`` / the raised exception); set the cancel event to drop the
@@ -62,9 +79,11 @@ class EngineWorker:
         return fut, cancel
 
     def shutdown(self) -> None:
-        """Signal the worker to stop and wait briefly for it to drain."""
-        self._q.put(None)
-        self._thread.join(timeout=5.0)
+        """Signal every worker to stop and wait briefly for them to drain."""
+        for _ in self._threads:
+            self._q.put(None)  # one shutdown sentinel per worker
+        for t in self._threads:
+            t.join(timeout=5.0)
 
     def _run(self) -> None:
         while True:
@@ -78,9 +97,11 @@ class EngineWorker:
             # Expose this request's cancel event to the engine for the duration
             # of the call so a cooperative in-flight cancel (set by ``cancel``
             # while the request runs) raises ``CancelledByUser`` at the next
-            # plan-node boundary. Cleared afterwards so a non-server caller
-            # (CLI / in-process) sees no stale event. The engine is single-thread
-            # (only this thread calls it), so the assignment needs no lock.
+            # plan-node boundary. ``engine.cancel_event`` is a per-thread slot
+            # (threading.local), so each worker publishes its own in-flight
+            # request's Event -- a pool of workers no longer clobber a single
+            # shared slot. Cleared afterwards so the slot is fresh for the next
+            # request this worker picks up.
             self.engine.cancel_event = cancel
             try:
                 result = fn(*args)

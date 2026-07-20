@@ -7,6 +7,7 @@ RangeIndex so that Series and scalar broadcasts line up in Project/Aggregate.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import json
@@ -135,17 +136,105 @@ _SNAPSHOT_RE = re.compile(r"CREATE\s+SNAPSHOT\s+([A-Za-z_][\w]*)\s*;?", re.IGNOR
 _RESTORE_RE = re.compile(r"RESTORE\s+TO\s+SNAPSHOT\s+([A-Za-z_][\w]*)\s*;?", re.IGNORECASE)
 
 
+# Statements that read state (shared lock -> concurrent SELECTs on a worker
+# pool). Everything else (INSERT/DELETE/UPDATE/MERGE/CREATE/DROP/ALTER/BEGIN/
+# COMMIT/ROLLBACK + the CREATE SNAPSHOT / RESTORE admin shorthand) mutates the
+# delta/catalog/WAL and takes the exclusive write lock. WITH ... SELECT (CTE)
+# is a read; EXPLAIN reaches Engine.explain, not Engine.sql, but is permissive.
+_READ_HEADS = frozenset({"SELECT", "WITH", "EXPLAIN", "VALUES"})
+
+
+class _RWLock:
+    """A simple read-write lock: many concurrent readers OR one exclusive writer.
+
+    The Engine's shared mutable state (catalog, delta, ``_commit_ts``,
+    ``_snapshots``, ``_wal``, the scan/code/pk caches) was originally protected
+    by the single-worker invariant -- only one thread ever touched the Engine.
+    A worker pool breaks that, so this lock replaces it: SELECTs take the shared
+    read side and run concurrently; writes, catalog mutations, and the global
+    checkpoint/restore/snapshot admin ops take the exclusive write side and
+    serialize against everything. Because reads and writes never overlap, the
+    caches (keyed by ``(table, col)`` with no data version) stay coherent for
+    free -- a write's ``_invalidate_table_caches`` runs with no concurrent reader
+    to race, and a read's cache population runs with no concurrent writer to
+    invalidate it mid-use. That sidesteps the OOB cache-coherency race a true
+    read/write-overlap (MVCC-snapshot) design would need cache versioning for.
+
+    Writer-preference: a waiting writer blocks new readers, so a write is never
+    starved by a steady stream of reads (writes are rare and brief -- delta
+    append + WAL fsync, no GPU compute -- so blocking new reads behind a waiting
+    write is cheap). Not reentrant for writers; the Engine never re-enters
+    (``Engine.sql`` is the single entry and is not called recursively).
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    def acquire_read(self) -> None:
+        with self._cond:
+            while self._writer or self._waiting_writers > 0:
+                self._cond.wait()
+            self._readers += 1
+
+    def release_read(self) -> None:
+        with self._cond:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    def acquire_write(self) -> None:
+        with self._cond:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers > 0:
+                    self._cond.wait()
+            finally:
+                self._waiting_writers -= 1
+            self._writer = True
+
+    def release_write(self) -> None:
+        with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def read_locked(self):
+        self.acquire_read()
+        try:
+            yield
+        finally:
+            self.release_read()
+
+    @contextlib.contextmanager
+    def write_locked(self):
+        self.acquire_write()
+        try:
+            yield
+        finally:
+            self.release_write()
+
+
 class Engine:
     """Front door: parse -> optimize -> execute on GPU, returning a cuDF frame."""
 
     def __init__(self, catalog: Catalog):
         self.catalog = catalog
-        # Cooperative in-flight cancel: set by the server worker to the running
-        # request's threading.Event for the duration of a query, None otherwise.
-        # Checked at each plan-node boundary in _exec -> raises CancelledByUser.
-        # The Engine is single-threaded (only the worker thread calls it), so
-        # this attribute needs no lock; Event.is_set() is itself thread-safe.
-        self.cancel_event: threading.Event | None = None
+        # Read/write lock gating all engine+catalog access (see _RWLock). With
+        # the default 1-worker pool it is uncontended (identical to the old
+        # single-worker invariant); with --workers N>1, SELECTs take the shared
+        # read side and run concurrently while writes/admin ops take the
+        # exclusive write side.
+        self._rw = _RWLock()
+        # Cooperative in-flight cancel: the worker running a request publishes
+        # that request's threading.Event here for the duration of the call;
+        # _exec checks it at each plan-node boundary -> raises CancelledByUser.
+        # Per-thread (threading.local) so a pool of workers each see their own
+        # in-flight request's Event, not a single clobbered slot. The property
+        # below backs the ``cancel_event`` attribute used throughout the engine.
+        self._cancel_local = threading.local()
         # GPU-resident scan cache: (table, frozenset(columns)) -> coerced cuDF
         # frame. Warm (repeated) queries skip the Parquet read + decimal coercion.
         # The cached frame is returned directly (no copy): the fused kernel path
@@ -168,14 +257,15 @@ class Engine:
         # Step 2 leaves this empty (reads unchanged); step 3 appends INSERTs;
         # step 5 tags each committed batch with a monotonic commit_ts (MVCC).
         self.delta: DeltaStore = DeltaStore()
-        # Phase 2 step 5 -- MVCC transaction layer. Single-session: at most one
-        # txn is active and no commit happens mid-txn (INSERTs buffer, not
-        # commit), so snapshot isolation is structural, not lock-based. The
-        # commit_ts is required for full snapshot restore and is forward-looking
-        # for concurrent connections. _txn/_commit_ts/_snapshots are unprotected
-        # mutable state -- the Engine is single-session/one-thread (no locks).
+        # Phase 2 step 5 -- MVCC transaction layer. The commit_ts is required
+        # for full snapshot restore and is forward-looking for concurrent
+        # connections. _commit_ts/_snapshots are guarded by the RW lock (writes
+        # take the exclusive side); _txn is per-thread (threading.local) so each
+        # worker -- and each in-process caller's thread -- has its own slot (a
+        # pool of workers no longer clobber a single shared _txn). The property
+        # below backs the ``_txn`` attribute used throughout the engine.
         self._commit_ts: int = 0          # monotonic; bumped on each commit
-        self._txn: Transaction | None = None
+        self._txn_local = threading.local()
         self._snapshots: dict[str, int] = {}  # name -> commit_ts captured
         # Phase 2 step 6 -- WAL + recovery. Each commit is appended to
         # <data_dir>/ryudb.wal and fsync'd BEFORE the in-memory delta is mutated,
@@ -195,6 +285,36 @@ class Engine:
                 self.delta.append(table, frame, cts)
             max_ts = max(max_ts, cts)
         self._commit_ts = max_ts
+
+    # -- per-thread slots (see _txn_local / _cancel_local in __init__) ----------
+    # Backed by threading.local so a worker pool of N threads each see their own
+    # in-flight request's txn / cancel Event; an in-process caller on the main
+    # thread has its own slot too. The getters default to None (no slot set), so
+    # a fresh thread sees no txn / no cancel Event without any __init__ write.
+
+    @property
+    def _txn(self) -> "Transaction | None":
+        return getattr(self._txn_local, "value", None)
+
+    @_txn.setter
+    def _txn(self, value: "Transaction | None") -> None:
+        self._txn_local.value = value
+
+    @property
+    def cancel_event(self) -> "threading.Event | None":
+        return getattr(self._cancel_local, "value", None)
+
+    @cancel_event.setter
+    def cancel_event(self, value: "threading.Event | None") -> None:
+        self._cancel_local.value = value
+
+    def read_locked(self):
+        """Context manager: the shared read lock (concurrent SELECTs allowed)."""
+        return self._rw.read_locked()
+
+    def write_locked(self):
+        """Context manager: the exclusive write lock (no concurrent engine access)."""
+        return self._rw.write_locked()
 
     def clear_scan_cache(self) -> None:
         """Clear the GPU-resident frame cache (forces a re-read on next scan).
@@ -1433,9 +1553,27 @@ class Engine:
         return matched_n + not_matched_n
 
     def sql(self, sql: str) -> "cudf.DataFrame | int | None":
+        # Classify the statement for the RW lock: SELECT/WITH (CTE) read state
+        # and take the shared read side (concurrent SELECTs on a worker pool);
+        # everything else mutates the delta/catalog/WAL and takes the exclusive
+        # write side. CREATE SNAPSHOT / RESTORE (the regex shorthand in
+        # _sql_body) are admin writes -> exclusive too. With the default 1-worker
+        # pool the lock is uncontended, so this is identical to the old
+        # single-worker behavior; --workers N>1 is what makes the read side
+        # actually shared.
+        s = sql.lstrip()
+        head = s.split(None, 1)[0].upper() if s.split(None, 1) else ""
+        if head in _READ_HEADS:
+            with self._rw.read_locked():
+                return self._sql_body(sql, s)
+        with self._rw.write_locked():
+            return self._sql_body(sql, s)
+
+    def _sql_body(self, sql: str, s: str) -> "cudf.DataFrame | int | None":
         # Non-standard snapshot/restore bypass sqlglot entirely (no AST node).
         # Cheap prefix guard so the regex never runs on a SELECT/INSERT/BEGIN.
-        s = sql.lstrip()
+        # Run under the write lock acquired by sql() -- snapshot/restore mutate
+        # global state (and do not acquire the lock themselves).
         if s[:7].upper() in ("CREATE ", "RESTORE"):
             m = _SNAPSHOT_RE.match(s)
             if m:
@@ -1479,31 +1617,35 @@ class Engine:
         return self.execute(plan)
 
     def explain(self, sql: str) -> str:
+        # EXPLAIN only reads the catalog to build/optimize a plan -> shared read
+        # lock (concurrent with SELECTs). With the default 1-worker pool it is
+        # uncontended.
         from ..sql.plan import pretty
 
-        s = sql.lstrip()
-        if s[:7].upper() in ("CREATE ", "RESTORE"):
-            m = _SNAPSHOT_RE.match(s)
-            if m:
-                return f"CreateSnapshot({m.group(1)})"
-            m = _RESTORE_RE.match(s)
-            if m:
-                return f"RestoreToSnapshot({m.group(1)})"
-        plan = parse(sql, self.catalog.schema_dict())
-        # INSERT ... SELECT: optimize the subplan so EXPLAIN shows the optimized
-        # plan (predicate pushdown etc.), mirroring sql(). A MERGE's USING source
-        # is optimized the same way.
-        if isinstance(plan, Insert) and plan.source is not None:
-            plan.source = optimize(
-                plan.source, self.catalog.schema_dict(), self.catalog.stats_dict()
-            )
-        if isinstance(plan, Merge) and plan.source is not None:
-            plan.source = optimize(
-                plan.source, self.catalog.schema_dict(), self.catalog.stats_dict()
-            )
-        if not isinstance(plan, (Insert, Delete, Update, Merge, TxnControl)):
-            plan = optimize(plan, self.catalog.schema_dict(), self.catalog.stats_dict())
-        return pretty(plan)
+        with self._rw.read_locked():
+            s = sql.lstrip()
+            if s[:7].upper() in ("CREATE ", "RESTORE"):
+                m = _SNAPSHOT_RE.match(s)
+                if m:
+                    return f"CreateSnapshot({m.group(1)})"
+                m = _RESTORE_RE.match(s)
+                if m:
+                    return f"RestoreToSnapshot({m.group(1)})"
+            plan = parse(sql, self.catalog.schema_dict())
+            # INSERT ... SELECT: optimize the subplan so EXPLAIN shows the optimized
+            # plan (predicate pushdown etc.), mirroring sql(). A MERGE's USING source
+            # is optimized the same way.
+            if isinstance(plan, Insert) and plan.source is not None:
+                plan.source = optimize(
+                    plan.source, self.catalog.schema_dict(), self.catalog.stats_dict()
+                )
+            if isinstance(plan, Merge) and plan.source is not None:
+                plan.source = optimize(
+                    plan.source, self.catalog.schema_dict(), self.catalog.stats_dict()
+                )
+            if not isinstance(plan, (Insert, Delete, Update, Merge, TxnControl)):
+                plan = optimize(plan, self.catalog.schema_dict(), self.catalog.stats_dict())
+            return pretty(plan)
 
     def execute(self, plan: PlanNode) -> "cudf.DataFrame | int | None":
         return self._exec(plan)
