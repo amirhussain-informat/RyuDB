@@ -35,6 +35,7 @@ import asyncio
 import collections
 import logging
 import threading
+import uuid
 from typing import Any, Callable
 
 from websockets.asyncio.server import serve
@@ -57,11 +58,21 @@ class Server:
         max_rows: int = 200_000,
         history_size: int = 500,
         n_workers: int = 1,
+        max_cursors_per_conn: int = 16,
+        max_cursor_rows: int = 1_000_000,
     ) -> None:
         self.data_dir = data_dir
         self.host = host
         self.port = port
         self.max_rows = max_rows
+        # Result-cursor paging limits. A cursor holds a query's full result as a
+        # host-memory pyarrow.Table (the GPU frame is freed once df_to_arrow
+        # copies to host), sliced per ``fetch``. ``max_cursor_rows`` bounds host
+        # RAM per cursor — opening a cursor on a larger result falls back to the
+        # plain truncated ``sql`` path (the client is told so). ``max_cursors_
+        # per_conn`` bounds the number of live cursors per connection.
+        self.max_cursors_per_conn = max_cursors_per_conn
+        self.max_cursor_rows = max_cursor_rows
         self.catalog = Catalog(data_dir)
         self.engine = Engine(self.catalog)
         # Worker pool size: 1 preserves the original single-worker semantics
@@ -122,6 +133,45 @@ class Server:
             getattr(w, "_ryudb_txn", None) is not None
             for w in list(self._conns.values())
         )
+
+    # -- per-connection result cursors (paged browsing of large results) --
+    # A cursor is a frozen pyarrow.Table (host memory) of a query's full result,
+    # keyed by an opaque id on the connection (``ws._ryudb_cursors``). It is
+    # sliced per ``fetch`` op. All access is on the asyncio loop thread (the
+    # _op_* handlers run there), so no lock is needed; the heavy work
+    # (engine.sql) ran on the worker thread and produced a cuDF frame, which
+    # df_to_arrow copied to this host Table before the read lock released.
+    def open_cursor(self, ws, table, sql: str) -> str:
+        """Register a cursor holding ``table`` on ``ws``; return its id. Raises
+        ProtocolError if this connection already has ``max_cursors_per_conn``
+        live cursors (the client should ``close`` one)."""
+        cursors = getattr(ws, "_ryudb_cursors", None)
+        if cursors is None:
+            cursors = {}
+            ws._ryudb_cursors = cursors
+        if len(cursors) >= self.max_cursors_per_conn:
+            raise ProtocolError(
+                f"too many open cursors (limit {self.max_cursors_per_conn}); "
+                "close one before opening another"
+            )
+        cid = uuid.uuid4().hex
+        cursors[cid] = {"table": table, "total": table.num_rows, "sql": sql}
+        return cid
+
+    def get_cursor(self, ws, cursor_id: str) -> dict[str, Any] | None:
+        """Look up a cursor on THIS connection only. A cursor is unreachable
+        from another connection by construction, so a cross-connection fetch
+        simply reads as ``None`` (-> 'unknown cursor' error)."""
+        cursors = getattr(ws, "_ryudb_cursors", None)
+        return None if cursors is None else cursors.get(cursor_id)
+
+    def close_cursor(self, ws, cursor_id: str) -> bool:
+        """Drop a cursor on this connection; return whether it existed. Safe to
+        call with an unknown id (the ``close`` op is idempotent)."""
+        cursors = getattr(ws, "_ryudb_cursors", None)
+        if cursors is None:
+            return False
+        return cursors.pop(cursor_id, None) is not None
 
     # -- pending-request tracking (for cancel + disconnect) --
     def register_pending(self, ws, rid: Any, cancel: threading.Event) -> None:
@@ -210,6 +260,10 @@ class Server:
         # engine._txn per request by run_sql; the engine is single-threaded so
         # the assignment needs no lock. Dropped with the ws on disconnect.
         ws._ryudb_txn = None
+        # Per-connection result cursors (cursor_id -> {table, total, sql}).
+        # Dropped on disconnect so the host-memory pa.Tables are freed; a
+        # cursor's frozen snapshot is independent of the engine/GPU by then.
+        ws._ryudb_cursors = {}
         peer = ws.remote_address if hasattr(ws, "remote_address") else None
         log.info("connection open from %s", peer)
         try:
@@ -255,4 +309,8 @@ class Server:
             # hold the ws and write ws._ryudb_txn back in run_sql's finally; the
             # txn is then GC'd with the ws once that request completes.
             self._conns.pop(conn_id, None)
+            # Drop this connection's result cursors so the host-memory
+            # pa.Tables are freed. (An in-flight fetch may still hold the ws and
+            # finish its slice, but the cursor it read is then GC'd with the ws.)
+            ws._ryudb_cursors = {}
             log.info("connection closed")

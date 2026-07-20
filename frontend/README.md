@@ -21,11 +21,14 @@ does the GPU work; this is its client.
   `position`.
 - **Results** — the server's Arrow IPC binary frame is decoded with
   `apache-arrow` and rendered as a virtualized grid (`react-window`). The true
-  `row_count` is shown; `truncated` flags when the displayed rows are a subset.
-  **Download CSV / Arrow** serializes the full result set: if the displayed rows
-  are truncated, the query is re-run with `max_rows = row_count` (the server's
-  `sql` op accepts an uncapped per-request `max_rows`) to fetch every row before
-  serializing. A result above 1M rows asks for confirmation first.
+  `row_count` is shown. Each run opens a server-side **cursor** (`sql` with
+  `cursor: true`) that freezes the full result; the first page is shown and a
+  **Load more** button pages the rest via the `fetch` op (growing the grid) up to
+  `--max-cursor-rows` (default 1M) — above that the result is served truncated
+  and not pageable. **Download CSV / Arrow** serializes the full set: a
+  cursor-backed result is paged from the cursor; a non-cursor (too-large) result
+  re-runs with `max_rows = row_count`. A result above 1M rows asks for
+  confirmation first.
 - **Explain** — the structured plan tree with a `fused` badge on an
   `Aggregate` over a `Join` (the star-join+aggregate shape eligible for the
   fused C++ kernel — eligibility, not a guarantee).

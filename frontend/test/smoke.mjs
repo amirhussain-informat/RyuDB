@@ -99,6 +99,41 @@ const pe = await call(ws, { id: "p", op: "sql", sql: "SELECT * FROM" });
 check("parse error kind", pe.meta.op === "error" && pe.meta.kind === "parse", JSON.stringify(pe.meta));
 check("parse error position", pe.meta.op === "error" && pe.meta.position && "line" in pe.meta.position, JSON.stringify(pe.meta.position));
 
+// 6. cursor paging: sql cursor:true returns first page + cursor_id; fetch pages
+//    the rest; close drops it. Concatenated pages cover the full row_count.
+//    LIMIT 500 bounds the result so 5 pages of 100 cover it regardless of the
+//    registered lineitem's size.
+const PAGE = 100;
+const cur = await call(ws, { id: "cur", op: "sql", sql: "SELECT l_orderkey, l_returnflag FROM lineitem LIMIT 500", max_rows: PAGE, cursor: true });
+check("cursor first page meta", cur.meta.op === "result" && typeof cur.meta.cursor_id === "string" && cur.meta.offset === 0, JSON.stringify(cur.meta));
+check("cursor first page rows", cur.table !== null && cur.table.numRows === PAGE, String(cur.table?.numRows));
+check("cursor truncated", cur.meta.truncated === true, JSON.stringify(cur.meta));
+
+let totalRows = cur.table ? cur.table.numRows : 0;
+let off = totalRows;
+let fetches = 0;
+const cid = cur.meta.cursor_id;
+while (off < cur.meta.row_count && fetches < 100) {
+  const f = await call(ws, { id: `f${fetches}`, op: "fetch", cursor_id: cid, offset: off, limit: PAGE });
+  if (f.meta.op !== "result" || !f.table) {
+    check(`fetch ${fetches}`, false, JSON.stringify(f.meta));
+    break;
+  }
+  totalRows += f.table.numRows;
+  off += f.table.numRows;
+  fetches++;
+  if (f.table.numRows === 0) break;
+}
+check("cursor paged to full row_count", totalRows === cur.meta.row_count, `${totalRows} vs ${cur.meta.row_count}`);
+
+// 7. close cursor → ok (idempotent); a subsequent fetch → error
+const cl = await call(ws, { id: "cl", op: "close", cursor_id: cid });
+check("close ok", cl.meta.op === "ok", JSON.stringify(cl.meta));
+const cl2 = await call(ws, { id: "cl2", op: "close", cursor_id: cid });
+check("close idempotent", cl2.meta.op === "ok", JSON.stringify(cl2.meta));
+const afErr = await call(ws, { id: "afe", op: "fetch", cursor_id: cid, offset: 0, limit: 10 });
+check("fetch after close errors", afErr.meta.op === "error" && /unknown cursor/.test(afErr.meta.message ?? ""), JSON.stringify(afErr.meta));
+
 ws.close();
 if (failures === 0) {
   console.log("SMOKE OK");

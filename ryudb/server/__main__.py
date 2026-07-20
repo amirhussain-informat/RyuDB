@@ -46,7 +46,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-rows", type=int,
                     default=int(_env("RYUDB_MAX_ROWS", "200000")),
                     help="max rows returned per SELECT over WebSocket (full result "
-                         "available via export); default 200000")
+                         "available via cursor paging); default 200000")
+    ap.add_argument("--max-cursors-per-conn", type=int,
+                    default=int(_env("RYUDB_MAX_CURSORS_PER_CONN", "16")),
+                    help="max live result cursors per WebSocket connection (each "
+                         "holds a query's full result in host memory for paging); "
+                         "default 16")
+    ap.add_argument("--max-cursor-rows", type=int,
+                    default=int(_env("RYUDB_MAX_CURSOR_ROWS", "1000000")),
+                    help="max rows a single result cursor will hold (a larger "
+                         "result is served truncated without a cursor); default "
+                         "1000000")
     ap.add_argument("--workers", type=int,
                     default=int(_env("RYUDB_WORKERS", "1")),
                     help="engine worker pool size. 1 (default) preserves the "
@@ -66,13 +76,23 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     server = Server(args.data, args.host, args.port, args.max_rows,
-                    n_workers=args.workers)
-    coros = [server.serve()]
-    if args.pg_port:
-        pg = PGServer(server, args.host, args.pg_port, args.pg_max_rows)
-        coros.append(pg.serve())
+                    n_workers=args.workers,
+                    max_cursors_per_conn=args.max_cursors_per_conn,
+                    max_cursor_rows=args.max_cursor_rows)
+    pg = (PGServer(server, args.host, args.pg_port, args.pg_max_rows)
+          if args.pg_port else None)
+
+    async def _serve() -> None:
+        # asyncio.run needs a coroutine (not the Future gather returns), so wrap
+        # the gather in an async function. With no PG front this is just the WS
+        # server; with --pg-port both fronts run concurrently on one loop.
+        if pg is not None:
+            await asyncio.gather(server.serve(), pg.serve())
+        else:
+            await server.serve()
+
     try:
-        asyncio.run(asyncio.gather(*coros))
+        asyncio.run(_serve())
     except KeyboardInterrupt:
         log = logging.getLogger("ryudb.server")
         log.info("interrupted, shutting down")

@@ -104,6 +104,21 @@ export class RyuDBClient {
     return this.request({ id: null, op: "sql", sql, max_rows: maxRows });
   }
 
+  /** Convenience: open a cursor-backed SQL query (first page + cursor_id). */
+  sqlCursor(sql: string, maxRows?: number): Promise<Result> {
+    return this.request({ id: null, op: "sql", sql, max_rows: maxRows, cursor: true });
+  }
+
+  /** Convenience: fetch the next page of a cursor. */
+  fetch(cursorId: string, offset: number, limit?: number): Promise<Result> {
+    return this.request({ id: null, op: "fetch", cursor_id: cursorId, offset, limit });
+  }
+
+  /** Convenience: close a cursor (best-effort; never throws on unknown id). */
+  closeCursor(cursorId: string): Promise<Result> {
+    return this.request({ id: null, op: "close", cursor_id: cursorId });
+  }
+
   private onMessage(ev: MessageEvent): void {
     const data = ev.data;
     if (typeof data === "string") {
