@@ -18,8 +18,13 @@ does the GPU work; this is its client.
 
 - **Editor** — Monaco with SQL syntax. `Ctrl/Cmd+Enter` runs the current
   statement. A parse error from the server is underlined at the reported
-  `position`. Multiple **worksheets** live as tabs above the editor: click to
-  switch, double-click a name to rename, `×` to close, `+` to create a new one.
+  `position`. **Schema-aware autocomplete** — type to get the catalog's tables +
+  columns (plus common SQL keywords), ranked tables-first; after `table.` you
+  get just that table's columns. The schema is fetched on connect (the `catalog`
+  op + a per-table `table` op fan-out) and re-fetched after any write/DDL, then
+  handed to a Monaco completion provider registered once on editor mount.
+  Multiple **worksheets** live as tabs above the editor: click to switch,
+  double-click a name to rename, `×` to close, `+` to create a new one.
   Worksheets (names + SQL + the active tab) persist to `localStorage`, so they
   survive a reload; each tab keeps its own last results/plan/message during a
   session.
@@ -107,6 +112,7 @@ Then open the worksheet UI, point it at `ws://127.0.0.1:5430`, and Connect.
 npm run build      # tsc -b + vite build (type-checks + bundles to dist/)
 npm run smoke      # node test/smoke.mjs — Arrow IPC round-trip vs a running server
 node test/csv_check.mjs   # src/lib/csv.ts serializer (null-aware CSV) — no server needed
+node test/autocomplete_check.mjs  # src/lib/autocomplete.ts suggestion logic — no server needed
 ```
 
 `npm run smoke` needs a running `ryudb-server` with a registered `lineitem`; set

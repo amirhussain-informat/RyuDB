@@ -5,7 +5,7 @@ import { useWorksheets } from "./hooks/useWorksheets";
 import { useTheme } from "./hooks/useTheme";
 import { useVersions, type Snapshot } from "./hooks/useVersions";
 import Toolbar from "./components/Toolbar";
-import SqlEditor, { type EditorHandle } from "./components/Editor";
+import SqlEditor, { type EditorHandle, type Schema } from "./components/Editor";
 import WorksheetTabs from "./components/WorksheetTabs";
 import CommandPalette, { type Command } from "./components/CommandPalette";
 import ShortcutsHelp from "./components/ShortcutsHelp";
@@ -125,6 +125,11 @@ export default function App() {
   const [resultTs, setResultTs] = useState<number | null>(null);
   const [resultHistory, setResultHistory] = useState<ResultEntry[]>([]);
   const resultIdRef = useRef(0);
+  // Catalog schema for SQL autocompletion (table name -> typed columns). Built
+  // on connect and re-built when a write/DDL lands (`schemaNonce` bumped in
+  // applyResult). Passed down to SqlEditor; a SELECT does not bump the nonce.
+  const [schema, setSchema] = useState<Schema>(new Map());
+  const [schemaNonce, setSchemaNonce] = useState(0);
   const [sidebar, setSidebar] = useState<"catalog" | "history">("catalog");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -343,10 +348,12 @@ export default function App() {
       case "write":
         setMessage(`${m.rows_affected} row${m.rows_affected === 1 ? "" : "s"} affected (${m.duration_ms.toFixed(1)} ms)`);
         setMainTab("message");
+        setSchemaNonce((n) => n + 1);
         break;
       case "ok":
         setMessage(m.detail ? `ok: ${JSON.stringify(m.detail)}` : "ok");
         setMainTab("message");
+        setSchemaNonce((n) => n + 1);
         break;
       case "cancelled":
         setMessage("cancelled");
@@ -546,6 +553,29 @@ export default function App() {
     const res = await op({ id: "tbl", op: "table", name });
     return res.meta.op === "table" ? (res.meta as TableResp) : ({} as TableResp);
   };
+  // Build the autocompletion schema: the catalog list, then a per-table `table`
+  // op fan-out for typed columns. Re-runs on connect and after any write/DDL
+  // (schemaNonce). A dropped-between-catalog-and-fetch table yields no columns.
+  useEffect(() => {
+    if (status !== "open") {
+      setSchema(new Map());
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const tables = await fetchCatalog();
+      if (cancelled) return;
+      const entries = await Promise.all(
+        tables.map(async (t) => [t.name, (await fetchTable(t.name)).columns ?? []] as const),
+      );
+      if (cancelled) return;
+      setSchema(new Map(entries.filter((e) => e[0])));
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, schemaNonce]);
   const fetchHistory = async (): Promise<HistoryEntry[]> => {
     const res = await op({ id: "hist", op: "history" });
     return res.meta.op === "history" ? res.meta.entries : [];
@@ -654,6 +684,7 @@ export default function App() {
                 value={sql}
                 onChange={(v) => active && updateSql(active.id, v)}
                 onRun={run}
+                schema={schema}
                 theme={theme === "dark" ? "vs-dark" : "vs"}
               />
             </div>
