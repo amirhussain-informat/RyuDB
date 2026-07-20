@@ -41,9 +41,11 @@ does the GPU work; this is its client.
   click a column header to cycle ascending → descending → clear (a `▲`/`▼`
   marks the active sort; NULLs sort last); toggle the **Filter** button for a
   per-column case-insensitive substring filter row. **Resize** a column by
-  dragging the right edge of its header (floor 40px); widths reset with each
-  new result. The grid and Copy reflect the sorted/filtered view; Download
-  still pulls the full server result.
+  dragging the right edge of its header (floor 40px); **reorder** columns by
+  dragging a header onto another header. Sort + filter keep operating on the
+  original column, so reorder is a pure display remap (the grid and Copy follow
+  the new order; Download still pulls the full server result). Widths and order
+  reset with each new result.
   **Result history** — each successful SELECT run is kept as a tab in a strip
   above the results (newest first, capped at 10); click a past tab to view that
   result again, `×` to drop one, **Clear** to drop all. Download re-runs the
