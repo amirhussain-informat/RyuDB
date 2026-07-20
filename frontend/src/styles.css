@@ -102,6 +102,8 @@ button.primary:hover:not(:disabled) { background: #6dd1ff; }
 .results-meta { display: flex; gap: 12px; align-items: center; color: var(--fg-dim); margin-bottom: 6px; }
 .results-meta .truncated { color: var(--warn); }
 .results-meta .dur { margin-left: auto; }
+.dl-group { display: flex; gap: 4px; }
+button.dl { padding: 2px 8px; font-size: 11px; }
 .grid-header, .grid-row {
   display: grid; grid-template-columns: repeat(var(--cols, 4), minmax(120px, 1fr));
 }

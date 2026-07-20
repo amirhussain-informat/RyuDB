@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { tableToIPC } from "apache-arrow";
 import { useServer } from "./hooks/useServer";
 import Toolbar from "./components/Toolbar";
 import SqlEditor, { type EditorHandle } from "./components/Editor";
@@ -6,6 +7,7 @@ import Results from "./components/Results";
 import Explain from "./components/Explain";
 import Catalog from "./components/Catalog";
 import History from "./components/History";
+import { tableToCSV, downloadBlob } from "./lib/csv";
 import type {
   CatalogResp, CatalogTable, ErrorResp, HistoryEntry, PlanNode,
   ResultMeta, Result, TableResp,
@@ -25,6 +27,7 @@ export default function App() {
     "FROM lineitem\nGROUP BY l_returnflag\nORDER BY l_returnflag;",
   );
   const [running, setRunning] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [result, setResult] = useState<Result | null>(null);
   const [plan, setPlan] = useState<PlanNode | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -133,6 +136,46 @@ export default function App() {
     }
   };
 
+  const download = async (format: "csv" | "arrow") => {
+    const cur = result;
+    if (!cur || cur.meta.op !== "result") return;
+    const m = cur.meta as ResultMeta;
+    // Guard against an accidental giant download (a cross-join can report
+    // billions of rows). The re-fetch below would try to materialize all of
+    // them into one frame + browser memory.
+    if (m.row_count > 1_000_000) {
+      if (!window.confirm(`Download all ${m.row_count.toLocaleString()} rows?`)) return;
+    }
+    setDownloading(true);
+    try {
+      let table = cur.table;
+      // If the displayed result is truncated, re-run the query with the full
+      // row_count as max_rows to fetch every row. The server's sql op accepts a
+      // per-request max_rows (uncapped), so no server change is needed. A
+      // non-truncated result already holds all rows -> serialize it directly.
+      if (m.truncated && table && table.numRows < m.row_count) {
+        const res = await op({ id: "dl", op: "sql", sql, max_rows: m.row_count });
+        if (res.meta.op !== "result" || !res.table) {
+          setMessage("download: could not fetch full result");
+          setMainTab("message");
+          return;
+        }
+        table = res.table;
+      }
+      if (!table) return;
+      if (format === "arrow") {
+        downloadBlob("result.arrow", "application/vnd.apache.arrow.stream", tableToIPC(table));
+      } else {
+        downloadBlob("result.csv", "text/csv", tableToCSV(table));
+      }
+    } catch (e) {
+      setMessage(`download failed: ${(e as Error).message}`);
+      setMainTab("message");
+    } finally {
+      setDownloading(false);
+    }
+  };
+
   const fetchCatalog = async (): Promise<CatalogTable[]> => {
     const res = await op({ id: "cat", op: "catalog" });
     return res.meta.op === "catalog" ? (res.meta as CatalogResp).tables : [];
@@ -200,7 +243,8 @@ export default function App() {
               {!connected && <div className="empty">Connect to ryudb-server to run queries.</div>}
               {connected && mainTab === "results" && (
                 result && result.meta.op === "result"
-                  ? <Results meta={result.meta as ResultMeta} table={result.table} />
+                  ? <Results meta={result.meta as ResultMeta} table={result.table}
+                             onDownload={download} downloading={downloading} />
                   : <div className="empty">Run a query.</div>
               )}
               {connected && mainTab === "explain" && <Explain tree={plan} />}

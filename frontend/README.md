@@ -21,8 +21,11 @@ does the GPU work; this is its client.
   `position`.
 - **Results** — the server's Arrow IPC binary frame is decoded with
   `apache-arrow` and rendered as a virtualized grid (`react-window`). The true
-  `row_count` is shown; `truncated` flags when the displayed rows are a subset
-  (raise `--max-rows` on the server).
+  `row_count` is shown; `truncated` flags when the displayed rows are a subset.
+  **Download CSV / Arrow** serializes the full result set: if the displayed rows
+  are truncated, the query is re-run with `max_rows = row_count` (the server's
+  `sql` op accepts an uncapped per-request `max_rows`) to fetch every row before
+  serializing. A result above 1M rows asks for confirmation first.
 - **Explain** — the structured plan tree with a `fused` badge on an
   `Aggregate` over a `Join` (the star-join+aggregate shape eligible for the
   fused C++ kernel — eligibility, not a guarantee).
@@ -63,6 +66,7 @@ Then open the worksheet UI, point it at `ws://127.0.0.1:5430`, and Connect.
 ```bash
 npm run build      # tsc -b + vite build (type-checks + bundles to dist/)
 npm run smoke      # node test/smoke.mjs — Arrow IPC round-trip vs a running server
+node test/csv_check.mjs   # src/lib/csv.ts serializer (null-aware CSV) — no server needed
 ```
 
 `npm run smoke` needs a running `ryudb-server` with a registered `lineitem`; set
