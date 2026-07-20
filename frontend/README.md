@@ -83,6 +83,11 @@ does the GPU work; this is its client.
   stddev, a 10-bucket equal-width histogram, and the top-K most frequent
   values for low-NDV columns. The headline GPU differentiator — the stats come
   back in milliseconds, not by scanning in the browser.
+- **Table details** — the `ℹ` button (per table in the Catalog) opens an
+  object-detail panel: the columns with types + nullability, the constraints
+  (primary key, NOT NULL, UNIQUE, defaults — stored, not enforced), the source
+  parquet paths, a best-effort reconstructed registration DDL (copyable), and a
+  rename control. All from the `table` op + `admin rename` — no server change.
 - **History** — the server-side query ring buffer; click an entry to reload
   its SQL.
 

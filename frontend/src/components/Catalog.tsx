@@ -7,6 +7,8 @@ interface Props {
   onInsert: (text: string) => void;
   onSample: (name: string) => void;
   onProfile: (name: string) => void;
+  /** Open the table detail panel (columns/constraints/paths/DDL/rename). */
+  onDetail: (name: string) => void;
   /** Open the data-load wizard (admin register). */
   onLoad: () => void;
   /** Drop a table (admin drop); the parent confirms + refreshes. */
@@ -21,7 +23,7 @@ interface Props {
  * table name to insert it). The refresh button re-fetches after DDL. The
  * histogram button opens the GPU column-profile panel for a table. The "Load
  * data" button opens the registration wizard; the per-table × drops a table. */
-export default function Catalog({ fetchCatalog, fetchTable, onInsert, onSample, onProfile, onLoad, onDrop, status, nonce }: Props) {
+export default function Catalog({ fetchCatalog, fetchTable, onInsert, onSample, onProfile, onDetail, onLoad, onDrop, status, nonce }: Props) {
   const [tables, setTables] = useState<CatalogTable[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [cols, setCols] = useState<TableResp | null>(null);
@@ -68,6 +70,7 @@ export default function Catalog({ fetchCatalog, fetchTable, onInsert, onSample, 
               <span className="row-count">{t.row_count}</span>
               <button className="sample" onClick={() => onProfile(t.name)} title="Column profile (GPU)">▮</button>
               <button className="sample" onClick={() => onSample(t.name)} title="SELECT * LIMIT 100">⤵</button>
+              <button className="sample" onClick={() => onDetail(t.name)} title="Table details (columns, constraints, DDL, rename)">ℹ</button>
               <button className="sample drop" onClick={() => onDrop(t.name)} title="Drop table">✕</button>
             </div>
             {expanded === t.name && (

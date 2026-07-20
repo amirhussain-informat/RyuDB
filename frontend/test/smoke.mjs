@@ -171,6 +171,15 @@ const dropOk = await call(ws, { id: "dr", op: "admin", action: "drop", args: { t
 check("admin drop ok", dropOk.meta.op === "ok" && dropOk.meta.detail?.dropped === true, JSON.stringify(dropOk.meta));
 const catAfterDrop = await call(ws, { id: "cat2", op: "catalog" });
 check("catalog no longer lists dropped table", !catAfterDrop.meta.tables.some((t) => t.name === "li_copy"), JSON.stringify(catAfterDrop.meta.tables?.map((t) => t.name)));
+// rename: register fresh, rename, catalog reflects the new name, drop the new name
+const r1 = await call(ws, { id: "r1", op: "admin", action: "register", args: { table: "li_tmp", path: LIPATH } });
+check("rename prep register", r1.meta.op === "ok", JSON.stringify(r1.meta));
+const rn = await call(ws, { id: "rn", op: "admin", action: "rename", args: { old: "li_tmp", new: "li_renamed" } });
+check("admin rename ok", rn.meta.op === "ok" && rn.meta.detail?.renamed === true, JSON.stringify(rn.meta));
+const catRen = await call(ws, { id: "cat3", op: "catalog" });
+check("catalog shows renamed table", catRen.meta.tables.some((t) => t.name === "li_renamed") && !catRen.meta.tables.some((t) => t.name === "li_tmp"), JSON.stringify(catRen.meta.tables?.map((t) => t.name)));
+const dropRen = await call(ws, { id: "dr2", op: "admin", action: "drop", args: { table: "li_renamed" } });
+check("cleanup drop renamed", dropRen.meta.op === "ok" && dropRen.meta.detail?.dropped === true, JSON.stringify(dropRen.meta));
 // (A SELECT on the dropped name may still hit the engine's scan cache — a
 // pre-existing server behavior, out of scope for the UI's drop contract, which
 // is "the catalog no longer lists it" — asserted above.)
