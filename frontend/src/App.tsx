@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { tableToIPC, Table } from "apache-arrow";
 import { useServer } from "./hooks/useServer";
+import { useWorksheets } from "./hooks/useWorksheets";
 import Toolbar from "./components/Toolbar";
 import SqlEditor, { type EditorHandle } from "./components/Editor";
+import WorksheetTabs from "./components/WorksheetTabs";
 import Results from "./components/Results";
 import Explain from "./components/Explain";
 import Catalog from "./components/Catalog";
@@ -24,6 +26,22 @@ const DL_PAGE = 50_000;
 
 type MainTab = "results" | "explain" | "message";
 
+// The per-worksheet view (results / plan / message / error / active sub-tab /
+// cursor id). Kept in memory keyed by worksheet id so switching tabs restores
+// each tab's last view during a session (not persisted across reloads).
+interface View {
+  result: Result | null;
+  plan: PlanNode | null;
+  message: string | null;
+  error: ErrorResp | null;
+  mainTab: MainTab;
+  cursorId: string | null;
+}
+
+const EMPTY_VIEW: View = {
+  result: null, plan: null, message: null, error: null, mainTab: "results", cursorId: null,
+};
+
 export default function App() {
   const { status, connect, disconnect, op } = useServer();
   const editorRef = useRef<EditorHandle>(null);
@@ -31,21 +49,63 @@ export default function App() {
   // not opened as a cursor, or exceeded --max-cursor-rows and fell back). Held
   // in a ref so the unmount/disconnect cleanup can close it without stale state.
   const cursorRef = useRef<string | null>(null);
-  const [cursorId, setCursorId] = useState<string | null>(null);
-  const [loadingMore, setLoadingMore] = useState(false);
+  const { worksheets, activeId, active, setActive, create, rename, close, updateSql } = useWorksheets();
 
-  const [sql, setSql] = useState(
-    "SELECT l_returnflag, count(*) AS c, sum(l_extendedprice) AS s\n" +
-    "FROM lineitem\nGROUP BY l_returnflag\nORDER BY l_returnflag;",
-  );
+  // Per-worksheet view state (in-memory). Switching a tab saves the view of the
+  // tab being left and restores (or initializes) the view of the new tab.
+  const viewsRef = useRef<Map<string, View>>(new Map());
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
+
   const [running, setRunning] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [result, setResult] = useState<Result | null>(null);
   const [plan, setPlan] = useState<PlanNode | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<ErrorResp | null>(null);
   const [mainTab, setMainTab] = useState<MainTab>("results");
+  const [cursorId, setCursorId] = useState<string | null>(null);
   const [sidebar, setSidebar] = useState<"catalog" | "history">("catalog");
+
+  // Apply a stored View to the live state slots.
+  const setView = (v: View) => {
+    setResult(v.result);
+    setPlan(v.plan);
+    setMessage(v.message);
+    setError(v.error);
+    setMainTab(v.mainTab);
+    setCursorId(v.cursorId);
+    cursorRef.current = v.cursorId;
+  };
+
+  // Switch to another worksheet: stash the leaving tab's view, restore the new.
+  const switchTab = (id: string) => {
+    if (id === activeIdRef.current) return;
+    viewsRef.current.set(activeIdRef.current, { result, plan, message, error, mainTab, cursorId });
+    editorRef.current?.setParseError(null);
+    setActive(id);
+    setView(viewsRef.current.get(id) ?? EMPTY_VIEW);
+  };
+
+  // Close a worksheet tab: best-effort close its cursor if it had one, drop its
+  // stored view, then remove it (the hook keeps at least one worksheet).
+  const closeTab = (id: string) => {
+    const v = viewsRef.current.get(id);
+    if (v?.cursorId) {
+      try { void op({ id: "cc", op: "close", cursor_id: v.cursorId }).catch(() => {}); } catch { /* disconnected */ }
+    }
+    viewsRef.current.delete(id);
+    if (id === activeIdRef.current) {
+      const idx = worksheets.findIndex((w) => w.id === id);
+      const next = worksheets.filter((w) => w.id !== id);
+      if (next.length) {
+        const nb = next[Math.min(idx, next.length - 1)];
+        setView(viewsRef.current.get(nb.id) ?? EMPTY_VIEW);
+      }
+    }
+    close(id);
+  };
 
   // Close the current cursor best-effort (unknown id is a server-side no-op).
   const closeCursorNow = (id: string | null) => {
@@ -63,6 +123,8 @@ export default function App() {
     return () => closeCursorNow(cursorRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const sql = active?.sql ?? "";
 
   const run = async () => {
     if (running) return;
@@ -280,6 +342,11 @@ export default function App() {
   };
 
   const connected = status === "open";
+  const activeMeta = result?.meta as ResultMeta | undefined;
+  const hasMore =
+    !!cursorId &&
+    !!result && result.meta.op === "result" &&
+    !!activeMeta && activeMeta.returned < activeMeta.row_count;
 
   return (
     <div className="app">
@@ -310,14 +377,29 @@ export default function App() {
           ) : (
             <History
               fetchHistory={fetchHistory}
-              onPick={(s) => setSql(s)}
+              onPick={(s) => active && updateSql(active.id, s)}
               status={status}
             />
           )}
         </aside>
         <main className="main">
           <div className="editor-pane">
-            <SqlEditor ref={editorRef} value={sql} onChange={setSql} onRun={run} />
+            <WorksheetTabs
+              worksheets={worksheets}
+              activeId={activeId}
+              onSelect={switchTab}
+              onCreate={create}
+              onClose={closeTab}
+              onRename={rename}
+            />
+            <div className="editor-host">
+              <SqlEditor
+                ref={editorRef}
+                value={sql}
+                onChange={(v) => active && updateSql(active.id, v)}
+                onRun={run}
+              />
+            </div>
           </div>
           <div className="output">
             <div className="output-tabs">
@@ -336,7 +418,7 @@ export default function App() {
                   ? <Results meta={result.meta as ResultMeta} table={result.table}
                              onDownload={download} downloading={downloading}
                              onLoadMore={loadMore}
-                             hasMore={!!cursorId && (result.meta as ResultMeta).returned < (result.meta as ResultMeta).row_count}
+                             hasMore={hasMore}
                              loadingMore={loadingMore} />
                   : <div className="empty">Run a query.</div>
               )}
