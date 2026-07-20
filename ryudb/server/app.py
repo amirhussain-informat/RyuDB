@@ -42,8 +42,8 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 from .. import Catalog, Engine
-from .handlers import handle_request
-from .protocol import ProtocolError, dumps_json, loads_request
+from .handlers import _op_upload, handle_request
+from .protocol import ProtocolError, dumps_json, error_frame, loads_request
 from .worker import EngineWorker
 
 log = logging.getLogger("ryudb.server")
@@ -61,6 +61,7 @@ class Server:
         max_cursors_per_conn: int = 16,
         max_cursor_rows: int = 1_000_000,
         max_export_rows: int = 5_000_000,
+        max_upload_bytes: int = 256 * 1024 * 1024,
     ) -> None:
         self.data_dir = data_dir
         self.host = host
@@ -78,6 +79,14 @@ class Server:
         # uncapped by ``max_rows`` — so this bounds host RAM per export (a
         # larger result errors out instead of OOMing).
         self.max_export_rows = max_export_rows
+        # ``upload`` ingests a parquet file sent over the wire as one binary
+        # frame (text meta + binary payload). ``max_upload_bytes`` bounds that
+        # binary frame -- websockets closes the connection with 1009 (message
+        # too big) if a client exceeds it, and the frontend pre-checks the file
+        # size. This is also the ``max_size`` cap on every incoming frame, so
+        # it bounds all requests (text requests are tiny; outgoing exports are
+        # unbounded by it -- max_size only gates incoming frames).
+        self.max_upload_bytes = max_upload_bytes
         self.catalog = Catalog(data_dir)
         self.engine = Engine(self.catalog)
         # Worker pool size: 1 preserves the original single-worker semantics
@@ -232,7 +241,7 @@ class Server:
     # -- serve --
     async def serve(self) -> None:
         async with serve(
-            self._handler, self.host, self.port, max_size=None
+            self._handler, self.host, self.port, max_size=self.max_upload_bytes
         ) as srv:
             self._srv = srv
             log.info("ryudb-server listening on ws://%s:%d (data=%s)",
@@ -282,6 +291,30 @@ class Server:
                     async with ws._ryudb_send_lock:
                         await ws.send(dumps_json({"op": "error", "kind": "protocol",
                                                   "message": str(exc)}))
+                    continue
+                # ``upload`` is a two-frame request: this text meta frame is
+                # followed by ONE binary frame (the parquet payload). The binary
+                # frame must be consumed here, by this single ws consumer,
+                # before the loop advances -- it cannot be deferred to a task
+                # (there is no second ws reader). So intercept the op, read the
+                # payload inline, then dispatch _op_upload (which validates +
+                # persists + registers on the worker thread) as its own task.
+                if req.get("op") == "upload":
+                    try:
+                        payload = await ws.recv()
+                    except ConnectionClosed:
+                        return
+                    if not isinstance(payload, (bytes, bytearray)):
+                        async with ws._ryudb_send_lock:
+                            await ws.send(dumps_json(error_frame(
+                                req.get("id"),
+                                ProtocolError("upload must be followed by a "
+                                              "binary frame"))))
+                        continue
+                    task = asyncio.create_task(
+                        _op_upload(req, bytes(payload), ws, self))
+                    self._tasks[conn_id].add(task)
+                    task.add_done_callback(self._tasks[conn_id].discard)
                     continue
                 # Dispatch each request as its own task so a connection can have
                 # several requests in flight (one running on the worker, the rest

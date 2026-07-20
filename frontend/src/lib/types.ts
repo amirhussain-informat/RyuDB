@@ -88,6 +88,14 @@ export interface ExportRequest {
   sql: string;
   format?: "parquet";
 }
+/** Two-frame request: this text meta is followed by one binary frame with the
+ *  parquet bytes (browser file-upload ingest). `format` must be "parquet". */
+export interface UploadRequest {
+  id: RequestId;
+  op: "upload";
+  name: string;
+  format?: "parquet";
+}
 export type Request =
   | SqlRequest
   | FetchRequest
@@ -100,7 +108,8 @@ export type Request =
   | CancelRequest
   | HistoryRequest
   | ProfileRequest
-  | ExportRequest;
+  | ExportRequest
+  | UploadRequest;
 
 // ---- responses ----
 

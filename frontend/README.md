@@ -69,10 +69,16 @@ does the GPU work; this is its client.
 - **Catalog** — tables + row counts; expand a table for its columns; click a
   name to drop it into the editor; the `⤵` button runs `SELECT * … LIMIT 100`;
   the `▮` button opens the **column profile** panel for that table. The **+
-  Load** button opens the **data-load wizard**: give a table name + a parquet
-  path on the server filesystem (a file, a directory expanded to `*.parquet`,
-  or a glob) and it registers the table via `admin register` (the engine is
-  parquet-only and reads from the server's FS — there is no browser upload).
+  Load** button opens the **data-load wizard**, which has two modes:
+  - **Upload file** (default) — pick a `.parquet` from your browser; it is sent
+    over the wire via the `upload` op (a two-frame text+binary request), the
+    server writes it to `<data>/uploads/<uuid>.parquet` and registers the table.
+    The table name defaults to the file stem. The size is pre-checked against
+    the server's `--max-upload-bytes` (default 256 MB) so an oversized file is
+    refused before sending.
+  - **From path** — give a table name + a parquet path on the server filesystem
+    (a file, a directory expanded to `*.parquet`, or a glob) and it registers
+    the table via `admin register` (the engine reads the server's FS directly).
   The per-table **✕** drops it via `admin drop` (unregisters; source files are
   kept). Both refresh the catalog + the autocomplete schema. A `Load data from
   parquet path` command-palette entry opens the wizard too.
@@ -130,8 +136,10 @@ node test/autocomplete_check.mjs  # src/lib/autocomplete.ts suggestion logic —
 `npm run smoke` needs a running `ryudb-server` with a registered `lineitem`; set
 `RYUDB_PORT` and `RYUDB_LINEITEM_PATH` (a directory containing a lineitem
 parquet) and `RYUDB_N` (its row count). It verifies admin register, SELECT
-round-trip + Arrow decode + value match, GROUP BY, EXPLAIN fused badge, and a
-parse error with position — the same wire path the browser uses.
+round-trip + Arrow decode + value match, GROUP BY, EXPLAIN fused badge, a
+parse error with position, cursor paging, column profile, Parquet export, and
+the two-frame `upload` ingest (sends a real parquet's bytes, asserts the table
+is registered + queryable) — the same wire path the browser uses.
 
 ## Notes / Phase 1 limits
 

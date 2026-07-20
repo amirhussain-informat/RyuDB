@@ -94,7 +94,7 @@ function isTypingTarget(t: EventTarget | null): boolean {
 }
 
 export default function App() {
-  const { status, connect, disconnect, op } = useServer();
+  const { status, connect, disconnect, op, upload } = useServer();
   const editorRef = useRef<EditorHandle>(null);
   // The server-side cursor id for the current result (null when the result was
   // not opened as a cursor, or exceeded --max-cursor-rows and fell back). Held
@@ -628,6 +628,21 @@ export default function App() {
     await fetchAdmin("rename", { old: oldName, new: newName });
     refreshAfterDdl();
   };
+  // Client-side pre-check cap for browser uploads (the server enforces its
+  // own --max-upload-bytes; this matches the default and avoids a 1009 close
+  // for obviously-too-large files). The upload op writes the parquet to
+  // <data>/uploads and registers the table.
+  const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
+  const handleUpload = async (name: string, bytes: Uint8Array, _fileName: string) => {
+    const res = await upload(name, bytes, MAX_UPLOAD_BYTES);
+    const m = res.meta;
+    if (m.op === "ok") {
+      refreshAfterDdl();
+      return;
+    }
+    if (m.op === "error") throw new Error((m as ErrorResp).message ?? "upload failed");
+    throw new Error(`unexpected upload response: ${m.op}`);
+  };
 
   const connected = status === "open";
   const activeMeta = result?.meta as ResultMeta | undefined;
@@ -846,6 +861,8 @@ export default function App() {
       <LoadDataModal
         open={loadOpen}
         onSubmit={handleLoad}
+        onUpload={handleUpload}
+        maxUploadBytes={MAX_UPLOAD_BYTES}
         onClose={() => setLoadOpen(false)}
       />
       <TableDetailModal

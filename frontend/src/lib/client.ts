@@ -119,6 +119,35 @@ export class RyuDBClient {
     return this.request({ id: null, op: "close", cursor_id: cursorId });
   }
 
+  /** Ingest a parquet file uploaded from the browser. Two-frame request: a text
+   *  meta frame ({op:"upload",name,format}) immediately followed by one binary
+   *  frame with the parquet bytes. The server responds with a text `ok` (or
+   *  `error`) frame — no binary follows, so the normal handleText resolve path
+   *  completes the pending promise. Pre-check the size against `maxBytes` so an
+   *  oversized upload is refused before sending (the transport would close with
+   *  1009 otherwise). */
+  upload(name: string, bytes: Uint8Array, format: "parquet" = "parquet",
+         maxBytes?: number): Promise<Result> {
+    const ws = this.ws;
+    if (ws === null || ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("not connected"));
+    }
+    if (maxBytes !== undefined && bytes.byteLength > maxBytes) {
+      return Promise.reject(new Error(
+        `file is ${bytes.byteLength.toLocaleString()} bytes; upload limit is ` +
+        `${maxBytes.toLocaleString()} bytes`));
+    }
+    const id = `r${this.idCounter++}`;
+    const key = String(id);
+    return new Promise<Result>((resolve, reject) => {
+      this.pending.set(key, { resolve, reject });
+      ws.send(JSON.stringify({ id, op: "upload", name, format }));
+      // The binary payload must be the very next frame; WebSocket preserves
+      // send order, and the server reads it inline in its connection loop.
+      ws.send(bytes);
+    });
+  }
+
   private onMessage(ev: MessageEvent): void {
     const data = ev.data;
     if (typeof data === "string") {

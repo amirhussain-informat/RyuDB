@@ -26,8 +26,19 @@ export function useServer() {
     return c.request(req);
   }, []);
 
+  /** Upload a parquet file from the browser (two-frame text+binary ingest).
+   *  `maxBytes` is pre-checked client-side so an oversized file is refused
+   *  before sending (the transport would otherwise close with 1009). */
+  const upload = useCallback(async (
+    name: string, bytes: Uint8Array, maxBytes?: number,
+  ): Promise<Result> => {
+    const c = clientRef.current;
+    if (!c) throw new Error("not connected");
+    return c.upload(name, bytes, "parquet", maxBytes);
+  }, []);
+
   // Tear down on unmount.
   useEffect(() => () => clientRef.current?.disconnect(), []);
 
-  return { status, connect, disconnect, op };
+  return { status, connect, disconnect, op, upload };
 }
