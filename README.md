@@ -69,6 +69,43 @@ stale (a source newer than the binary), the executor falls back to the
 Numba/cuDF paths, so `ryudb build` is never required for correctness, only for
 the fused star-join+aggregate hot path.
 
+## Docker
+
+The "single artifact" for a GPU app is a Docker image (a PyInstaller blob
+bundling cuDF + RAPIDS + the CUDA runtime is large and fragile). The image is a
+plain `ubuntu:22.04` base + a conda env (`docker/env.yml`, a `--no-builds` export
+of the dev env: CUDA 13.3, cuDF 26.06, libnvcomp 5.2, pybind11 3.0.4) that brings
+the full CUDA toolkit (nvcc + cudart + libnvcomp), plus the built `fused.so` and
+the `ryudb-server` entrypoint. The NVIDIA driver is injected by the host via
+`--gpus all` (NVIDIA Container Toolkit) — the image carries no driver.
+
+```bash
+docker build -t ryudb -f docker/Dockerfile .
+# fat binary for a range of GPUs (default: Ampere/Ada/Hopper):
+docker build --build-arg CUDA_ARCH=sm_80,sm_86,sm_89,sm_90 -t ryudb .
+
+docker run --gpus all -p 5430:5430 -p 5432:5432 -v ryudb-data:/data ryudb
+psql -h 127.0.0.1 -p 5432 -U ryudb ryudb        # Postgres wire front (no auth)
+```
+
+The container defaults to `RYUDB_HOST=0.0.0.0` (so host port mapping works),
+`RYUDB_PG_PORT=5432` (PG wire front on), and `RYUDB_DATA=/data` (a named volume).
+Override any `RYUDB_*` var with `-e`, or pass `ryudb-server` flags directly
+(`docker run ryudb --data /data --port 6000`). A known command as the first arg
+runs it instead of the server: `docker run -it ryudb ryudb -e "SELECT ..."` or
+`docker run -it ryudb bash`.
+
+> **No auth, no TLS.** The server authenticates nobody. Binding `0.0.0.0` is only
+> safe on a trusted network or behind a proxy — do not expose the published ports
+> to the public internet. The host GPU driver must be recent enough for the
+> CUDA 13.3 userland (`nvidia-smi` should report >= 13.3).
+
+`docker/smoke.sh` builds the image and runs a real SQL round-trip over the PG
+wire (generate a parquet → `CREATE TABLE ... FROM` → `SELECT count(*)` via
+pg8000). It needs Docker + the NVIDIA Container Toolkit on the host. *(The image
+was not built in the dev environment — Docker is unavailable in the WSL distro —
+so `docker/smoke.sh` is the validation step for a Docker-equipped host.)*
+
 ## Usage
 
 ```bash
