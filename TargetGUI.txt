@@ -1,0 +1,102 @@
+Snowflake is a cloud multi-tenant service, so a chunk of Snowsight is inapplicable to a local single-user GPU DB: warehouse/compute management, RBAC/users/roles, data sharing & Marketplace, Snowpipe, Cortex
+  cloud AI, governance/masking, billing/budgets, replication, Native Apps. I'll mark those N/A and not build them. The win is to match Snowsight on the developer-experience surface (worksheets, results,
+  charts, object explorer, data loading, query profile, dashboards, history) and then exceed it with GPU-native features Snowflake structurally can't:
+
+  1. Instant column profiling — click a column → histogram, distinct count, min/max/null% in milliseconds on the GPU (Snowflake charges compute for this).
+  2. GPU-kernel-aware query profile — the plan graph shows which operators fired the fused C++/CUDA kernel vs cuDF vs Numba fallback, with timings.
+  3. GPU-accelerated inline charts — aggregations for charts computed on-device, so you can chart a million-point result without the browser choking.
+  4. Zero-latency local console — no round-trip to a remote warehouse.
+
+  Snowsight feature inventory → RyuDB status
+
+  ┌────────────────────────────────────────────────────────────────┬──────────────────────────────────────────┬────────────────────────────┐
+  │                       Snowsight feature                        │                RyuDB now                 │           Build?           │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ SQL worksheet + Monaco editor                                  │ ✅ have (syntax + parse-error underline) │ extend                     │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Run at cursor / run selection / run all                        │ partial (Ctrl+Enter whole stmt)          │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Schema-aware autocomplete                                      │ ❌ (tokenizer only)                      │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Multiple worksheets + folders + pin                            │ ❌ (single sheet)                        │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Auto-save + version history                                    │ ❌                                       │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Split panes                                                    │ ❌                                       │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Results grid: sort / filter / resize / reorder / freeze / copy │ ❌ (virtual grid, no interactivity)      │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Result charts (bar/line/scatter/heat/scorecard)                │ ❌                                       │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Pivot tables                                                   │ ❌                                       │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Contextual column statistics (histograms, freq, domains)       │ ❌                                       │ build (GPU-instant)        │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Multi-result / run-multiple                                    │ ❌                                       │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Export CSV / Arrow                                             │ ✅ have                                  │ extend (+JSON, +Parquet)   │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Cursor paging / Load more                                      │ ✅ have (PR #67)                         │ —                          │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Query details (duration, rows, bytes)                          │ partial (duration + rows)                │ extend                     │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Query profile (visual operator graph + per-op stats)           │ partial (text tree + fused badge)        │ build (GPU-kernel-aware)   │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Query history (global, filterable, replay)                     │ partial (sidebar ring buffer)            │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Object explorer (db→schema→table/view/fn tree)                 │ partial (flat table list)                │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Object details: columns/constraints/DDL/row count/preview      │ partial (columns + sample)               │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Create/drop/alter objects via UI                               │ ❌ (CLI only)                            │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Data loading wizard (upload → preview → typed CREATE)          │ ❌                                       │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Dashboards (chart tiles, filters, auto-refresh)                │ ❌                                       │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Notebooks (SQL + Python cells)                                 │ ❌                                       │ build (later)              │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Streamlit/data apps                                            │ ❌                                       │ N/A (local)                │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ dbt IDE / Git integration                                      │ ❌                                       │ build (Git for worksheets) │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Universal search (objects, columns, history)                   │ ❌                                       │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Command palette (Cmd+K) + keyboard shortcuts                   │ ❌                                       │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Dark/light theme                                               │ ❌                                       │ build                      │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ AI SQL assistant (NL→SQL)                                      │ ❌                                       │ build (BYO key)            │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Warehouses / compute pools                                     │ N/A                                      │ —                          │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Users / roles / RBAC / grants                                  │ N/A                                      │ —                          │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Data sharing / Marketplace / Native Apps                       │ N/A                                      │ —                          │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Snowpipe / streams / tasks / dynamic tables                    │ N/A (local files)                        │ —                          │
+  ├────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────┤
+  │ Cortex cloud AI / governance / masking / budgets / replication │ N/A                                      │ —                          │
+  └────────────────────────────────────────────────────────────────┴──────────────────────────────────────────┴────────────────────────────┘
+
+  Proposed roadmap
+
+  Phase 0 — Worksheet foundation (DX): multi-worksheet tabs, localStorage persistence + version history, command palette (Cmd+K), dark/light theme, keyboard shortcuts, global object search.
+
+  Phase 1 — Results experience (the heart of "better"): grid sort/filter/resize/reorder/freeze/copy-cell; a Chart tab (bar/line/area/scatter/pie/heatmap) next to Results/Explain; click-to-profile columns
+  (GPU-instant histogram/distinct/min/max/null%); multi-result tabs; export +JSON/+Parquet.
+
+  Phase 2 — Object management + data loading: db→schema→table/view tree with DDL/columns/constraints/stats/preview; create/drop/alter UI forms (mirror :alter/:drop); drag-drop data-loading wizard (parquet/csv
+  → schema preview → typed CREATE TABLE FROM); schema-aware autocomplete wired to the catalog.
+
+  Phase 3 — Query intelligence + dashboards: visual query-profile graph with per-operator stats + GPU-kernel badges (fused C++ / cuDF / Numba-fallback); overhauled filterable query history with per-query
+  details + replay; dashboards (saved queries → chart tiles → filters → auto-refresh); Git-backed worksheet export/import.
+
+  Phase 4 — AI + advanced: NL→SQL assistant (BYO Anthropic/OpenAI key); query diff/compare; SQL+Python notebooks.
+
+  Each phase is a stack of one-PR-per-feature merges (per the autonomy you've granted). Phase 1 is where "better than Snowflake" becomes visible fastest — it builds on the Results component and cursor paging
+  that just landed, and the column-profiling + charting are the GPU differentiators.
+
+  Sources: Snowsight overview (https://docs.snowflake.com/en/user-guide/ui-snowsight), worksheets (https://docs.snowflake.com/en/user-guide/ui-snowsight-worksheets), dashboards
+  (https://docs.snowflake.com/en/user-guide/ui-snowsight-dashboards), visualizations (https://docs.snowflake.com/en/user-guide/ui-snowsight-visualizations), querying
+  (https://docs.snowflake.com/en/user-guide/ui-snowsight-query), object explorer (https://docs.snowflake.com/en/user-guide/ui-snowsight-data).
