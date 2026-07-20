@@ -6,6 +6,8 @@ import type { ResultMeta } from "../lib/types";
 interface Props {
   meta: ResultMeta;
   table: Table | null;
+  onDownload: (format: "csv" | "arrow") => void;
+  downloading: boolean;
 }
 
 const ROW_HEIGHT = 24;
@@ -27,7 +29,7 @@ function formatCell(v: unknown): string {
 /** Renders an Arrow Table as a header + a virtualized row grid. The server caps
  * rows at `max_rows`; `meta.row_count` is the true total and `meta.truncated`
  * flags whether the displayed `meta.returned` rows are a subset. */
-export default function Results({ meta, table }: Props) {
+export default function Results({ meta, table, onDownload, downloading }: Props) {
   const columns = meta.columns;
   const colArrays = useMemo(() => {
     if (!table) return [];
@@ -50,10 +52,18 @@ export default function Results({ meta, table }: Props) {
         <span>{meta.row_count} row{meta.row_count === 1 ? "" : "s"}</span>
         {meta.truncated && (
           <span className="truncated">
-            (showing first {meta.returned} of {meta.row_count}; raise --max-rows)
+            (showing first {meta.returned} of {meta.row_count})
           </span>
         )}
         <span className="dur">{meta.duration_ms.toFixed(1)} ms</span>
+        <span className="dl-group">
+          <button className="dl" disabled={downloading} onClick={() => onDownload("csv")}>
+            {downloading ? "…" : "Download CSV"}
+          </button>
+          <button className="dl" disabled={downloading} onClick={() => onDownload("arrow")}>
+            Arrow
+          </button>
+        </span>
       </div>
       <div className="grid-header" style={{ gridTemplateColumns: `repeat(${columns.length}, minmax(120px, 1fr))` }}>
         {columns.map((c) => (
