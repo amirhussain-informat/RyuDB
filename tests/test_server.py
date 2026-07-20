@@ -28,12 +28,14 @@ import asyncio
 import json
 import threading
 import time
+from io import BytesIO
 from typing import Any
 
 import cudf
 import numpy as np
 import pandas as pd
 import pyarrow.ipc as ipc
+import pyarrow.parquet as pq
 import pytest
 import websockets
 
@@ -178,8 +180,9 @@ async def _call(ws, obj: dict[str, Any], want_bin: bool = False):
         data = json.loads(msg)
         if data.get("id") == obj.get("id"):
             meta = data
-            # only a successful result is followed by a binary IPC frame
-            if want_bin and meta.get("op") == "result":
+            # a successful `result` (Arrow IPC) or `export` (Parquet blob) meta
+            # is followed by exactly one binary frame.
+            if want_bin and meta.get("op") in ("result", "export"):
                 nxt = await asyncio.wait_for(ws.recv(), timeout=20)
                 if isinstance(nxt, (bytes, bytearray)):
                     bins.append(bytes(nxt))
@@ -848,6 +851,83 @@ def test_profile_rejects_bad_top_k(srv):
         return r
     r = _run(client())
     assert r["op"] == "error" and r["kind"] == "protocol"
+
+
+def test_export_parquet(srv):
+    port, server, ref, _ = srv
+    sql = "SELECT l_orderkey, l_quantity, l_returnflag FROM lineitem"
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta, bins = await _call(ws, {"id": "x", "op": "export", "sql": sql,
+                                          "format": "parquet"}, want_bin=True)
+        return meta, bins
+    meta, bins = _run(client())
+    assert meta["op"] == "export" and meta["format"] == "parquet"
+    assert meta["row_count"] == 500
+    assert meta["byte_count"] == len(bins[0])
+    # Parquet files begin and end with the b"PAR1" magic.
+    assert bins[0][:4] == b"PAR1" and bins[0][-4:] == b"PAR1"
+    # Decode the Parquet blob and compare to the in-process reference result
+    # (sorted by all columns, mirroring assert_same).
+    got = pq.read_table(BytesIO(bins[0])).to_pandas()
+    exp = ref.sql(sql).to_pandas()
+    cols = list(exp.columns)
+    got_s = got.sort_values(cols).reset_index(drop=True)
+    exp_s = exp.sort_values(cols).reset_index(drop=True)
+    pd.testing.assert_frame_equal(got_s, exp_s)
+
+
+def test_export_default_format_is_parquet(srv):
+    port, *_ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta, bins = await _call(ws, {"id": "x", "op": "export",
+                                          "sql": "SELECT l_orderkey FROM lineitem LIMIT 1"},
+                                     want_bin=True)
+        return meta, bins
+    meta, bins = _run(client())
+    assert meta["op"] == "export" and meta["format"] == "parquet"
+    assert bins[0][:4] == b"PAR1" and meta["row_count"] == 1
+
+
+def test_export_rejects_bad_format(srv):
+    port, *_ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            r, _ = await _call(ws, {"id": "x", "op": "export",
+                                    "sql": "SELECT l_orderkey FROM lineitem LIMIT 1",
+                                    "format": "csv"})
+        return r
+    r = _run(client())
+    assert r["op"] == "error" and r["kind"] == "protocol"
+
+
+def test_export_non_select_errors(srv):
+    port, *_ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            r, _ = await _call(ws, {"id": "x", "op": "export",
+                                    "sql": "DROP TABLE nope_x"}, want_bin=False)
+        return r
+    r = _run(client())
+    assert r["op"] == "error"  # non-SELECT -> ProtocolError inside run()
+
+
+def test_export_too_large_errors(srv):
+    port, server, *_ = srv
+    orig = server.max_export_rows
+    server.max_export_rows = 50  # the 500-row lineitem exceeds this
+    try:
+        async def client():
+            async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+                r, _ = await _call(ws, {"id": "x", "op": "export",
+                                        "sql": "SELECT * FROM lineitem"}, want_bin=False)
+            return r
+        r = _run(client())
+    finally:
+        server.max_export_rows = orig
+    assert r["op"] == "error" and r["kind"] == "runtime"
+    assert "too large" in r["message"]
 
 
 def test_sample_op(srv):

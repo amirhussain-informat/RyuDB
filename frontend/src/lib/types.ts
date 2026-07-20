@@ -82,6 +82,12 @@ export interface ProfileRequest {
   name: string;
   top_k?: number;
 }
+export interface ExportRequest {
+  id: RequestId;
+  op: "export";
+  sql: string;
+  format?: "parquet";
+}
 export type Request =
   | SqlRequest
   | FetchRequest
@@ -93,7 +99,8 @@ export type Request =
   | AdminRequest
   | CancelRequest
   | HistoryRequest
-  | ProfileRequest;
+  | ProfileRequest
+  | ExportRequest;
 
 // ---- responses ----
 
@@ -199,6 +206,14 @@ export interface ProfileResp {
   row_count: number;
   columns: ProfileColumn[];
 }
+export interface ExportResp {
+  id: RequestId;
+  op: "export";
+  format: string;
+  row_count: number;
+  byte_count: number;
+  duration_ms: number;
+}
 export interface CancelledResp {
   id: RequestId;
   op: "cancelled";
@@ -223,12 +238,16 @@ export type Response =
   | TableResp
   | HistoryResp
   | ProfileResp
+  | ExportResp
   | CancelledResp
   | ErrorResp;
 
 // A parsed result (meta + decoded Arrow table). `table` is null for non-result
-// responses and for results whose binary frame failed to decode.
+// responses and for results whose binary frame failed to decode. `bytes` is set
+// for `export` responses (a raw binary blob — Parquet — that is NOT Arrow IPC
+// and so is kept as bytes rather than decoded into a Table).
 export interface Result {
   meta: Response;
   table: import("apache-arrow").Table | null;
+  bytes?: Uint8Array;
 }

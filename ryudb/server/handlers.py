@@ -16,6 +16,8 @@ Op set (Phase 1):
   catalog  list tables + row counts + columns
   table    one table's columns/types/constraints/paths/row_count
   sample   SELECT * FROM <t> LIMIT n  (validated table name)
+  export   run a SELECT and stream the FULL result as a binary file (Parquet;
+           no in-browser writer for apache-arrow 17, so serialized server-side)
   admin    drop / rename / alter / register / checkpoint / snapshot / restore /
            clear_cache
   cancel   drop pending requests on this connection, or raise CancelledByUser
@@ -156,6 +158,29 @@ async def _send_arrow(ws, rid: Any, table, total: int, offset: int,
         await ws.send(table_to_ipc(table))
 
 
+async def _send_bytes(ws, rid: Any, fmt: str, data: bytes, row_count: int,
+                      duration_ms: float, sql: str, server) -> None:
+    """Serialize a raw binary payload (e.g. Parquet bytes) as a JSON ``export``
+    meta + one binary frame under the per-connection send lock. Same meta-then-
+    binary glue as ``_send_arrow`` but the frame is NOT Arrow IPC — the client
+    keeps it as a blob (it cannot decode Parquet in-browser). Records a history
+    entry tagged ``export``."""
+    meta = {
+        "id": rid, "op": "export", "format": fmt,
+        "row_count": row_count, "byte_count": len(data),
+        "duration_ms": round(duration_ms, 3),
+    }
+    lock = getattr(ws, "_ryudb_send_lock", None)
+    if lock is not None:
+        async with lock:
+            await ws.send(dumps_json(meta))
+            await ws.send(data)
+    else:
+        await ws.send(dumps_json(meta))
+        await ws.send(data)
+    server.record_history(rid, sql, duration_ms, row_count, "export")
+
+
 # --------------------------------------------------------------------------- #
 # dispatch
 # --------------------------------------------------------------------------- #
@@ -180,6 +205,8 @@ async def handle_request(req: dict[str, Any], ws, server) -> None:
             await _op_profile(req, ws, server)
         elif op == "sample":
             await _op_sample(req, ws, server)
+        elif op == "export":
+            await _op_export(req, ws, server)
         elif op == "admin":
             await _op_admin(req, ws, server)
         elif op == "cancel":
@@ -492,6 +519,48 @@ async def _op_sample(req, ws, server) -> None:
         await _send_result(ws, rid, result, max_rows, dur, sql, server)
     else:
         await _send_json(ws, {"id": rid, "op": "ok", "duration_ms": round(dur, 3)})
+
+
+async def _op_export(req, ws, server) -> None:
+    """Run a SELECT and stream the FULL result back as a binary file in a
+    client-chosen format. v1 supports only Parquet (CSV/JSON/Arrow are already
+    produced in-browser from the paged result; Parquet has no in-browser writer
+    for apache-arrow 17, so it is serialized server-side with pyarrow.parquet).
+
+    Runs the query on the worker thread (cancellable, serialized with other
+    engine work), copies the cuDF frame to a host pyarrow.Table, writes it to a
+    Parquet buffer, and sends one ``export`` meta + one binary frame. The result
+    is NOT capped at ``max_rows`` — the point is to export everything — but
+    ``--max-export-rows`` bounds host RAM (a larger result errors out instead of
+    OOMing). Non-SELECT statements and bad formats surface as error frames."""
+    rid = req.get("id")
+    sql = _require(req, "sql", str)
+    fmt = req.get("format", "parquet")
+    if fmt != "parquet":
+        raise ProtocolError("export 'format' must be 'parquet'")
+
+    def run():
+        result = server.run_sql(ws, sql)
+        if not isinstance(result, (cudf.DataFrame, pd.DataFrame)):
+            raise ProtocolError("export requires a SELECT statement")
+        table = df_to_arrow(result)
+        if table.num_rows > server.max_export_rows:
+            raise RuntimeError(
+                f"export too large ({table.num_rows} rows; limit "
+                f"{server.max_export_rows}). Narrow the query or raise "
+                f"--max-export-rows.")
+        import io
+        import pyarrow.parquet as pq
+        buf = io.BytesIO()
+        pq.write_table(table, buf)
+        return buf.getvalue(), table.num_rows
+
+    ok, payload, dur = await _cancellable(server, ws, rid, run)
+    if not ok:
+        server.record_history(rid, sql, 0.0, 0, "cancelled")
+        return
+    data, row_count = payload
+    await _send_bytes(ws, rid, fmt, data, row_count, dur, sql, server)
 
 
 async def _op_admin(req, ws, server) -> None:

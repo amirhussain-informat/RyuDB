@@ -60,6 +60,7 @@ class Server:
         n_workers: int = 1,
         max_cursors_per_conn: int = 16,
         max_cursor_rows: int = 1_000_000,
+        max_export_rows: int = 5_000_000,
     ) -> None:
         self.data_dir = data_dir
         self.host = host
@@ -73,6 +74,10 @@ class Server:
         # per_conn`` bounds the number of live cursors per connection.
         self.max_cursors_per_conn = max_cursors_per_conn
         self.max_cursor_rows = max_cursor_rows
+        # ``export`` sends a query's FULL result as one binary file (Parquet),
+        # uncapped by ``max_rows`` — so this bounds host RAM per export (a
+        # larger result errors out instead of OOMing).
+        self.max_export_rows = max_export_rows
         self.catalog = Catalog(data_dir)
         self.engine = Engine(self.catalog)
         # Worker pool size: 1 preserves the original single-worker semantics

@@ -37,13 +37,18 @@ function call(ws, obj) {
     const onMsg = (data, isBinary) => {
       if (isBinary) {
         ws.off("message", onMsg);
+        if (pendingMeta && pendingMeta.op === "export") {
+          // Raw bytes (Parquet) — NOT Arrow IPC; keep as a blob.
+          resolve({ meta: pendingMeta, table: null, bytes: new Uint8Array(data) });
+          return;
+        }
         const table = tableFromIPC(new Uint8Array(data));
         resolve({ meta: pendingMeta, table });
         return;
       }
       const frame = JSON.parse(data.toString());
       if (frame.id !== id) return;
-      if (frame.op === "result") {
+      if (frame.op === "result" || frame.op === "export") {
         pendingMeta = frame;
         return;
       }
@@ -146,6 +151,14 @@ check("profile histogram sums to rows", qty && qty.histogram.reduce((a, b) => a 
 const flag = pcols.get("l_returnflag");
 check("profile categorical top", flag && flag.top && flag.top.length > 0 && flag.top.reduce((a, t) => a + t.count, 0) === N, JSON.stringify(flag?.top));
 check("profile unknown table errors", (await call(ws, { id: "pr2", op: "profile", name: "nope" })).meta.op === "error");
+
+// 9. export op: full result as a Parquet blob (meta + one binary frame; NOT IPC)
+const exRes = await call(ws, { id: "x", op: "export", sql: "SELECT l_orderkey, l_quantity, l_returnflag FROM lineitem", format: "parquet" });
+check("export op", exRes.meta.op === "export" && exRes.meta.format === "parquet", JSON.stringify(exRes.meta));
+check("export row_count", exRes.meta.row_count === N, String(exRes.meta.row_count));
+check("export bytes present", exRes.bytes instanceof Uint8Array && exRes.bytes.length === exRes.meta.byte_count, `${exRes.bytes?.length} vs ${exRes.meta.byte_count}`);
+check("export parquet magic", exRes.bytes && exRes.bytes[0] === 0x50 && exRes.bytes[1] === 0x41 && exRes.bytes[2] === 0x52 && exRes.bytes[3] === 0x31, "PAR1 head");
+check("export bad format errors", (await call(ws, { id: "x2", op: "export", sql: "SELECT l_orderkey FROM lineitem LIMIT 1", format: "csv" })).meta.op === "error");
 
 ws.close();
 if (failures === 0) {

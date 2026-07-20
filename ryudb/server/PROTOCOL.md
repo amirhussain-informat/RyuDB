@@ -59,6 +59,7 @@ The response `op` tells the client what to expect next:
 | `catalog`   | nothing          | `tables` list |
 | `table`     | nothing          | one table's schema (`columns`, `constraints`, ...) |
 | `profile`   | nothing          | per-column GPU statistics (`columns` with null%/distinct/min/max/mean/stddev/histogram/top) |
+| `export`    | 1 binary frame   | a SELECT serialized as a binary file (Parquet); `format`/`row_count`/`byte_count` |
 | `history`   | nothing          | `entries` ring buffer |
 | `cancelled` | nothing          | dropped while pending, or `CancelledByUser` at a node boundary |
 | `error`     | nothing          | something failed; `kind` + `message` (+ `position`) |
@@ -250,6 +251,29 @@ positive int → else `error` (protocol).
 for low-NDV columns. Runs under the shared read lock (excludes concurrent
 admin writes).
 
+### `export`
+
+```json
+{"id": "...", "op": "export", "sql": "SELECT * FROM lineitem", "format": "parquet"}
+```
+Runs the SELECT on the worker thread (cancellable, serialized with other engine
+work), copies the full cuDF frame to a host pyarrow.Table, and serializes it as
+a binary file. v1 supports only `parquet` (the default); CSV/JSON/Arrow are
+already produced in-browser from the paged result, and apache-arrow 17 has no
+in-browser Parquet writer, so Parquet is written server-side with
+`pyarrow.parquet`. The result is **not** capped at `--max-rows` — the point is
+to export everything — but `--max-export-rows` (default 5M) bounds host RAM: a
+larger result → `error` (runtime, "export too large") instead of OOMing. A
+non-SELECT statement → `error` (protocol, "export requires a SELECT"). An
+unsupported `format` → `error` (protocol).
+
+```json
+{"id": "...", "op": "export", "format": "parquet",
+ "row_count": 600572, "byte_count": 842313, "duration_ms": 187.3}
+```
+followed by one binary frame: the raw Parquet bytes (NOT Arrow IPC — the client
+keeps them as a blob for download). Records a history entry tagged `export`.
+
 ### `admin`
 
 ```json
@@ -380,9 +404,10 @@ the head of.
   binary frame capped at `--max-rows` (or `limit`) rows; the true `row_count` is
   reported and `truncated` flags more. A `sql` request with `cursor: true` pages
   the rest via `fetch` (see *Result cursors*); without a cursor, rows beyond
-  `max_rows` are simply truncated. No chunked streaming of a single response as
-  multiple Arrow batches (the `frame_count` field is reserved for that future
-  option).
+  `max_rows` are simply truncated. An `export` response is also one binary frame,
+  but raw Parquet bytes (not Arrow IPC). No chunked streaming of a single
+  response as multiple Arrow batches (the `frame_count` field is reserved for
+  that future option).
 
 ## Postgres wire front (`--pg-port`)
 
