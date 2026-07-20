@@ -76,6 +76,12 @@ export interface HistoryRequest {
   id: RequestId;
   op: "history";
 }
+export interface ProfileRequest {
+  id: RequestId;
+  op: "profile";
+  name: string;
+  top_k?: number;
+}
 export type Request =
   | SqlRequest
   | FetchRequest
@@ -86,7 +92,8 @@ export type Request =
   | SampleRequest
   | AdminRequest
   | CancelRequest
-  | HistoryRequest;
+  | HistoryRequest
+  | ProfileRequest;
 
 // ---- responses ----
 
@@ -162,6 +169,36 @@ export interface HistoryResp {
   op: "history";
   entries: HistoryEntry[];
 }
+export interface ProfileBucket {
+  lo: number;
+  hi: number;
+  count: number;
+}
+export interface ProfileTopValue {
+  value: string | number | boolean | null;
+  count: number;
+}
+export interface ProfileColumn {
+  name: string;
+  type: string;
+  row_count: number;
+  null_count: number;
+  null_pct: number;
+  distinct: number;
+  min?: string | number | boolean | null;
+  max?: string | number | boolean | null;
+  mean?: number | null;
+  stddev?: number | null;
+  histogram?: ProfileBucket[] | null;
+  top?: ProfileTopValue[] | null;
+}
+export interface ProfileResp {
+  id: RequestId;
+  op: "profile";
+  name: string;
+  row_count: number;
+  columns: ProfileColumn[];
+}
 export interface CancelledResp {
   id: RequestId;
   op: "cancelled";
@@ -185,6 +222,7 @@ export type Response =
   | CatalogResp
   | TableResp
   | HistoryResp
+  | ProfileResp
   | CancelledResp
   | ErrorResp;
 

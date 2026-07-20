@@ -6,13 +6,15 @@ interface Props {
   fetchTable: (name: string) => Promise<TableResp>;
   onInsert: (text: string) => void;
   onSample: (name: string) => void;
+  onProfile: (name: string) => void;
   status: string;
 }
 
 /** Sidebar catalog browser. Lists tables + row counts; expanding a table loads
  * its columns (click a column to drop the name into the editor; click the
- * table name to insert it). The refresh button re-fetches after DDL. */
-export default function Catalog({ fetchCatalog, fetchTable, onInsert, onSample, status }: Props) {
+ * table name to insert it). The refresh button re-fetches after DDL. The
+ * histogram button opens the GPU column-profile panel for a table. */
+export default function Catalog({ fetchCatalog, fetchTable, onInsert, onSample, onProfile, status }: Props) {
   const [tables, setTables] = useState<CatalogTable[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [cols, setCols] = useState<TableResp | null>(null);
@@ -54,6 +56,7 @@ export default function Catalog({ fetchCatalog, fetchTable, onInsert, onSample, 
                 {t.name}
               </span>
               <span className="row-count">{t.row_count}</span>
+              <button className="sample" onClick={() => onProfile(t.name)} title="Column profile (GPU)">▮</button>
               <button className="sample" onClick={() => onSample(t.name)} title="SELECT * LIMIT 100">⤵</button>
             </div>
             {expanded === t.name && (

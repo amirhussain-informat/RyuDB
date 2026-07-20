@@ -793,6 +793,63 @@ def test_catalog_and_table_ops(srv):
     assert col_names == ["l_orderkey", "l_quantity", "l_extendedprice", "l_returnflag"]
 
 
+def test_profile_op(srv):
+    port, server, ref, _ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            prof, _ = await _call(ws, {"id": "pr", "op": "profile", "name": "lineitem"})
+        return prof
+    prof = _run(client())
+    assert prof["op"] == "profile" and prof["name"] == "lineitem"
+    assert prof["row_count"] == 500
+    by = {c["name"]: c for c in prof["columns"]}
+    assert set(by) == {"l_orderkey", "l_quantity", "l_extendedprice", "l_returnflag"}
+    # common stats on every column
+    for c in prof["columns"]:
+        assert c["row_count"] == 500
+        assert c["null_count"] == 0 and c["null_pct"] == 0.0
+        assert c["distinct"] >= 1
+        assert c["min"] is not None and c["max"] is not None
+    # numeric columns carry mean/stddev + a 10-bucket histogram
+    for nm in ("l_orderkey", "l_quantity", "l_extendedprice"):
+        c = by[nm]
+        assert c["mean"] is not None and c["stddev"] is not None
+        assert c["histogram"] is not None and len(c["histogram"]) == 10
+        assert sum(b["count"] for b in c["histogram"]) == 500
+    # low-NDV categorical column has top-K value frequencies; high-NDV numeric
+    # columns skip top (distinct > 1000 not the case here, but orderkey's
+    # distinct is <= 199 so top IS present — verify the categorical one closely)
+    flag = by["l_returnflag"]
+    assert flag["distinct"] == 3
+    assert flag["top"] is not None and len(flag["top"]) <= 10
+    assert sum(t["count"] for t in flag["top"]) == 500
+    values = {t["value"] for t in flag["top"]}
+    assert values <= {"N", "R", "A"}
+    # min/max of the categorical column are real flag values
+    assert flag["min"] in {"N", "R", "A"} and flag["max"] in {"N", "R", "A"}
+
+
+def test_profile_unknown_table_errors(srv):
+    port, *_ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            r, _ = await _call(ws, {"id": "pr", "op": "profile", "name": "nope"})
+        return r
+    r = _run(client())
+    assert r["op"] == "error"  # catalog.get KeyError -> runtime error frame
+
+
+def test_profile_rejects_bad_top_k(srv):
+    port, *_ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            r, _ = await _call(ws, {"id": "pr", "op": "profile",
+                                    "name": "lineitem", "top_k": 0})
+        return r
+    r = _run(client())
+    assert r["op"] == "error" and r["kind"] == "protocol"
+
+
 def test_sample_op(srv):
     port, *_ = srv
     async def client():
