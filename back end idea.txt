@@ -1,0 +1,80 @@
+
+
+Great instinct to decide this before building the frontend — it's the fork that determines whether the frontend is "a UI bolted onto a library" or "one client of a database
+  server." Let me lay out the idea cleanly.
+
+  The three tiers (and which one you're really asking about)
+
+  ┌─────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬────────────┐
+  │        Tier         │                                                                 What it is                                                                 │   Today?   │
+  ├─────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────┤
+  │ A — Embedded        │ Engine imported in-process by whoever uses it (CLI, tests, bench, and the FastAPI "gateway" I proposed in Phase 1). One process, one       │ You're     │
+  │ library             │ Engine instance.                                                                                                                           │ here.      │
+  ├─────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────┤
+  │ B — Database server │ A ryudb-server daemon that owns the Engine + storage, listens on a port, speaks a wire protocol. Clients (web console, CLI, BI tools)      │ Not built  │
+  │                     │ connect over the network.                                                                                                                  │            │
+  ├─────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────┤
+  │ C — Installable     │ Tier B + packaging (Docker image / systemd unit / installer / config) so someone runs docker run ryudb or brew install ryudb && ryudb      │ Not built  │
+  │ server              │ start. The "install like MS SQL Server" story.                                                                                             │            │
+  └─────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴────────────┘
+
+  The Phase-1 gateway I sketched is technically a server (it serves HTTP), but it's not a database server — it imports Engine in-process and is the only client. That's Tier
+  A-with-a-web-gateway, not Tier B. Your question is really: should we move to Tier B before the frontend?
+
+  My short answer: yes — build Tier B, and make the frontend just one of its clients
+
+  Not because the frontend needs it (an in-process gateway would render the same UI), but because:
+
+  1. It avoids a future rewrite. An in-process gateway couples the UI to the engine's process lifetime, memory, and the single-Engine constraint. The day you want a second client
+  (the CLI over the network, a BI tool, a second browser session, a remote user), you refactor the gateway into a client. Building the server once means the frontend is born a
+  client.
+  2. It's the "install like SQL Server" promise. That promise is Tier B+C. There's no way to get there without a server process that owns storage and accepts connections.
+  3. It clarifies the concurrency story now instead of discovering it in the UI (see below).
+  4. It separates "what RyuDB does" (query engine) from "how you talk to it" (protocol) — the engine stays a library; the server is a thin process around it. Clean layering.
+
+  The one big fork: which wire protocol?
+
+  This is the real decision inside Tier B.
+
+  - Custom protocol (Arrow IPC + JSON over WebSocket/HTTP). Simple to build, fully under your control, you already chose Arrow IPC for the frontend. Cost: you build every client
+  yourself (the web console is fine; anything else — psql, dbt, Tableau — won't speak it).
+  - Postgres wire protocol. Enormous ecosystem for free: psql, pgAdmin, every BI tool, dbt, ORMs. Cost: it's a real spec to implement, and RyuDB's SQL is a subset (no cursors, no
+  full prepared-statement semantics, no COPY, limited DDL) — many tools would connect but then fail confusingly on features you don't have. Half-compatibility can be worse than none.
+
+  My recommendation: custom Arrow-over-WebSocket protocol first — it's 80% less work and the web console is your primary client anyway. Treat Postgres-wire compatibility as a
+  separate later phase, only if/when BI-tool or psql integration becomes a real goal. Don't pay that cost speculatively.
+
+  The reality check that makes Tier B real work, not a wrapper
+
+  Engine is single-session / one-thread by design (executor.py:152) — unprotected _txn, _commit_ts, _snapshots. A server that accepts multiple connections has to answer "what does a
+  second session mean?" Three honest options, in order of effort:
+
+  1. Single Engine + serialized queue (v1). Every connection's request goes through one async queue onto one Engine. Multi-connection, not multi-concurrent-execution. Fine for a
+  dev/single-user server and a local web console. One user feels no difference. This is what I'd ship first.
+  2. Engine-per-session pool. A separate Engine + Catalog per connection, sharing the on-disk base but each with its own delta/txn. Needs delta-store coordination (who flushes,
+  conflict rules) — real backend work, but bounded.
+  3. True multi-threaded Engine. Locks around the shared state. Largest effort; arguably not worth it for a GPU engine where one big query saturates the device anyway.
+
+  The point: Tier B v1 doesn't require solving multi-session concurrency. It requires making the single Engine safely reachable over the network, behind a queue. You can defer
+  options 2/3 until a second real user demands them.
+
+  How this reshapes the frontend plan
+
+  - Phase 1 (gateway) becomes "build ryudb-server" — the daemon, the wire protocol, the request queue, the result serialization (Arrow IPC). The engine stays a library it imports.
+  - The frontend becomes a pure client — it talks to ryudb-server over the protocol instead of importing Engine. All later phases (worksheets, browser, monitoring) are unchanged;
+  they just hit the server instead of an in-process gateway.
+  - The CLI gets a --host/--port mode so it's a second client of the same server (great for scripting, and it proves the protocol isn't UI-specific).
+  - Packaging (Tier C) becomes a late phase — Docker image + systemd unit + config, once the server is stable.
+
+  So: do we need it?
+
+  - For a frontend alone: no — an in-process gateway renders the same UI.
+  - For "install RyuDB like a server, with multiple clients, remotely reachable": yes, and there's no shortcut.
+  - For avoiding a rewrite when the second client shows up: yes.
+
+  My recommendation: build Tier B (single-Engine + queue, custom Arrow protocol) as Phase 1, and have the frontend connect to it. It's a modest amount of extra work over an
+  in-process gateway, it directly delivers the "server" concept you're describing, and it keeps the engine a clean library. Defer Postgres-wire compatibility and multi-session
+  concurrency until a concrete need appears.
+
+  Want me to turn this into the executable Phase 1 server build plan (daemon layout, protocol message set, the request-queue model, CLI client mode), or keep weighing the
+  protocol/concurrency tradeoffs first?
