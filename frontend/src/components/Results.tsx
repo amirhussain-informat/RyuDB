@@ -1,12 +1,13 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { FixedSizeList } from "react-window";
 import type { Table } from "apache-arrow";
 import type { ResultMeta } from "../lib/types";
+import { copyText, tableToTSV } from "../lib/csv";
 
 interface Props {
   meta: ResultMeta;
   table: Table | null;
-  onDownload: (format: "csv" | "arrow") => void;
+  onDownload: (format: "csv" | "json" | "arrow") => void;
   downloading: boolean;
   onLoadMore: () => void;
   hasMore: boolean;
@@ -42,6 +43,25 @@ export default function Results({ meta, table, onDownload, downloading,
     return columns.map((c) => table.getChild(c.name)?.toArray() ?? []);
   }, [table, columns]);
 
+  // `copiedKey` flashes a "copied" tick on the last cell copied to the
+  // clipboard; cleared after a short timeout so the indicator is transient.
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [copyAllState, setCopyAllState] = useState<"idle" | "ok" | "err">("idle");
+  const copyCell = (key: string, value: string) => {
+    void copyText(value).then((ok) => {
+      if (!ok) return;
+      setCopiedKey(key);
+      window.setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 800);
+    });
+  };
+  const copyAll = () => {
+    if (!table) return;
+    void copyText(tableToTSV(table.slice(0, meta.returned))).then((ok) => {
+      setCopyAllState(ok ? "ok" : "err");
+      window.setTimeout(() => setCopyAllState("idle"), 1200);
+    });
+  };
+
   // Fixed column width + a fixed inner grid width so the header and the
   // virtualized rows lay out with the TRUE column count and stay aligned.
   // The .grid-row CSS rule otherwise falls back to a hardcoded 4 columns via
@@ -53,11 +73,20 @@ export default function Results({ meta, table, onDownload, downloading,
   const gridWidth = columns.length * COL_W;
   const Row = ({ index, style }: { index: number; style: React.CSSProperties }) => (
     <div className="grid-row" style={{ ...style, gridTemplateColumns: gridTemplate }}>
-      {colArrays.map((arr, ci) => (
-        <div className="grid-cell" key={ci} title={formatCell(arr[index])}>
-          {formatCell(arr[index])}
-        </div>
-      ))}
+      {colArrays.map((arr, ci) => {
+        const key = `${index}:${ci}`;
+        const val = formatCell(arr[index]);
+        return (
+          <div
+            className={"grid-cell" + (copiedKey === key ? " copied" : "")}
+            key={ci}
+            title={`${val}  (click to copy)`}
+            onClick={() => copyCell(key, val)}
+          >
+            {val}
+          </div>
+        );
+      })}
     </div>
   );
 
@@ -77,8 +106,19 @@ export default function Results({ meta, table, onDownload, downloading,
         )}
         <span className="dur">{meta.duration_ms.toFixed(1)} ms</span>
         <span className="dl-group">
+          <button
+            className="dl"
+            disabled={!table || meta.returned === 0 || copyAllState !== "idle"}
+            onClick={copyAll}
+            title="Copy the displayed rows as TSV to the clipboard"
+          >
+            {copyAllState === "idle" ? "Copy" : copyAllState === "ok" ? "Copied" : "Failed"}
+          </button>
           <button className="dl" disabled={downloading} onClick={() => onDownload("csv")}>
             {downloading ? "…" : "Download CSV"}
+          </button>
+          <button className="dl" disabled={downloading} onClick={() => onDownload("json")}>
+            JSON
           </button>
           <button className="dl" disabled={downloading} onClick={() => onDownload("arrow")}>
             Arrow
