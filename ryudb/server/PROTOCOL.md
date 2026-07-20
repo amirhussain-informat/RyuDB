@@ -519,6 +519,26 @@ psql "host=127.0.0.1 port=5432 user=ryudb dbname=ryudb"
   matching real Postgres). `BEGIN`/`COMMIT`/`ROLLBACK` map to the engine's
   transaction control; a disconnect rolls back the open txn (buffered writes
   were never flushed).
+- **SQL cursors (`DECLARE`/`FETCH`/`MOVE`/`CLOSE`)**, layered on the same
+  per-connection frozen-result cursor store as the WebSocket `fetch` op.
+  `DECLARE <name> CURSOR FOR <select>` runs the query once and freezes the
+  full result as a `pa.Table`; `FETCH`/`MOVE` page it with the full Postgres
+  scroll-direction grammar (`NEXT`/`PRIOR`/`FIRST`/`LAST`/`FORWARD`/`BACKWARD`
+  `[n|ALL]`/`ABSOLUTE n`/`RELATIVE n`, bare count, `ALL`). `FETCH` emits
+  `RowDescription` + `DataRow`* + `CommandComplete` (`FETCH n`) directly,
+  **bypassing the `--pg-max-rows` per-Response cap**, so a driver can page a
+  result larger than the cap — `psql`'s `\set FETCH_COUNT 100`, or a named
+  cursor in a real driver. `MOVE` advances without emitting rows
+  (`CommandComplete` `MOVE n`). `CLOSE <name>` / `CLOSE ALL` drop cursors
+  (unknown name → error `34000`, matching Postgres). `WITH HOLD` is rejected
+  (`0A000` — cursors would have to survive `COMMIT`, which RyuDB does not
+  support); every cursor is `WITHOUT HOLD` and is closed at
+  `COMMIT`/`ROLLBACK` and on disconnect. Cursors work over both the
+  Simple-Query front and the Extended-Query front (an Execute's max-rows caps
+  an explicit `FETCH` count). Errors carry real SQLSTATEs: `34000`
+  (`invalid_cursor_name`), `42P03` (`duplicate_cursor`), `42P11`
+  (`invalid_cursor_definition`), `54000` (`program_limit_exceeded` — the
+  per-connection `--max-cursors-per-conn` limit), `0A000`, `42601`.
 - **`CancelRequest`** (the v3 startup message with version `80877102`). At
   startup the server emits `BackendKeyData` (`K`) carrying the session's
   `(pid, secret)`. A *separate, short-lived* connection may send a
@@ -534,15 +554,14 @@ psql "host=127.0.0.1 port=5432 user=ryudb dbname=ryudb"
 ### Not supported (documented limits)
 
 - **SSL/TLS, GSSAPI, SCRAM/password auth** (no auth).
-- **`COPY`, `LISTEN`/`NOTIFY`, portal scroll, binary result format (text
-  only), binary parameter format (text only).** A client requesting binary
-  results/params gets an error.
+- **`COPY`, `LISTEN`/`NOTIFY`, binary result format (text only), binary
+  parameter format (text only).** A client requesting binary results/params
+  gets an error.
 - **Result rows are capped at `--pg-max-rows`** (the same cap as the
   WebSocket front); the PG protocol has no truncation signal, so the cap is
-  silent. Raise `--pg-max-rows` for full exports. The WebSocket front's
-  `cursor`/`fetch`/`close` paging ops are **not** exposed over PG (real PG
-  `DECLARE CURSOR`/`FETCH` is a follow-up); PG clients page by re-querying with
-  `LIMIT`/`OFFSET`.
+  silent for a plain `SELECT`. Raise `--pg-max-rows` for full exports, or
+  page past it with a **`DECLARE CURSOR`/`FETCH`** (see *Supported* above),
+  which bypasses the cap per `FETCH`. `WITH HOLD` cursors are not supported.
 - **Parameter type inference** uses the Parse param OIDs; an unknown OID (`0`)
   renders the param as a quoted string literal and lets the engine coerce.
 - **`SELECT` without `FROM`** is not supported by the engine (a parameterized

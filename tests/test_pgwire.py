@@ -781,3 +781,356 @@ def test_pg8000_end_to_end(pg, tmp_path):
         assert cur.fetchone()[0] == 3           # rollback discarded the buffer
     finally:
         conn.close()
+
+
+def test_pg8000_named_cursor_pages_past_pg_max_rows(pg):
+    """A real driver uses a server-side (named) cursor to page a large result
+    past the 100-row --pg-max-rows cap: pg8000 issues DECLARE CURSOR FOR ...
+    and FETCH N repeatedly, reassembling the full 500-row set. Skips if
+    pg8000 is not installed."""
+    pytest.importorskip("pg8000")
+    import pg8000
+    port, _, ref = pg
+    sql = _ordered_lineitem_sql()
+    exp = ref.sql(sql).to_pandas().reset_index(drop=True)
+    assert len(exp) == 500
+
+    conn = pg8000.connect(user="ryudb", host="127.0.0.1", port=port,
+                          database="ryudb", ssl_context=False, timeout=10)
+    try:
+        # pg8000 (1.31) has no built-in named-cursor API, so drive the
+        # DECLARE/FETCH protocol by hand. autocommit=False begins an implicit
+        # txn on the first statement, which is required for a WITHOUT HOLD
+        # cursor. Each FETCH goes out as an extended-protocol Execute, so this
+        # also exercises the cursor path over the extended (P/B/E/S) front.
+        cur = conn.cursor()
+        cur.execute(f"DECLARE pgcur CURSOR FOR {sql}")
+        rows: list = []
+        while True:
+            cur.execute("FETCH 100 FROM pgcur")
+            batch = cur.fetchall()
+            if not batch:
+                break
+            rows.extend(batch)
+        cur.execute("CLOSE pgcur")
+        conn.rollback()                        # closes the WITHOUT HOLD cursor
+        assert len(rows) == 500
+        for got, (_, erow) in zip(rows, exp.iterrows()):
+            assert int(got[0]) == int(erow["l_orderkey"])
+            assert int(got[1]) == int(erow["l_quantity"])
+            assert got[2] == erow["l_returnflag"]
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# SQL cursors: DECLARE / FETCH / MOVE / CLOSE (PR #97)
+# --------------------------------------------------------------------------- #
+
+async def _simple(reader, writer, sql: str) -> tuple[str, list]:
+    """Send one simple Query (``Q``) and drain to ReadyForQuery."""
+    writer.write(_fmsg(b"Q", sql.encode() + b"\x00"))
+    await writer.drain()
+    return await _drain_until_ready(reader)
+
+
+def _ordered_lineitem_sql() -> str:
+    # ORDER BY makes the cursor result deterministic for row-by-row comparison
+    # against the in-process engine; both paths run the same engine, so the
+    # row order is identical.
+    return ("SELECT l_orderkey, l_quantity, l_returnflag FROM lineitem "
+            "ORDER BY l_orderkey, l_quantity, l_returnflag")
+
+
+def test_declare_fetch_pages_reassemble(pg):
+    """DECLARE CURSOR + repeated FETCH 100 pages past the 100-row pg max-rows
+    cap and reassembles the full 500-row result, matching the engine."""
+    port, _, ref = pg
+    sql = _ordered_lineitem_sql()
+
+    async def client():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(reader, writer)
+        await _simple(reader, writer, f"DECLARE c1 CURSOR FOR {sql}")
+        rows: list[list[str | None]] = []
+        for _ in range(5):
+            status, msgs = await _simple(reader, writer, "FETCH 100 FROM c1")
+            assert status == "I"
+            res = _collect(msgs)
+            assert res["tag"] == "FETCH 100"
+            rows.extend(res["rows"])
+        await _simple(reader, writer, "CLOSE c1")
+        writer.close()
+        return rows
+    rows = _run(client())
+    assert len(rows) == 500
+    exp = ref.sql(sql).to_pandas().reset_index(drop=True)
+    assert len(exp) == 500
+    for got, (_, erow) in zip(rows, exp.iterrows()):
+        assert int(got[0]) == int(erow["l_orderkey"])
+        assert int(got[1]) == int(erow["l_quantity"])
+        assert got[2] == erow["l_returnflag"]
+
+
+def test_fetch_all_bypasses_pg_max_rows(pg):
+    """FETCH ALL from a cursor returns all 500 rows in one shot, past the
+    100-row --pg-max-rows cap (cursors emit rows directly, not via _emit_result)."""
+    port, _, ref = pg
+    sql = _ordered_lineitem_sql()
+
+    async def client():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(reader, writer)
+        await _simple(reader, writer, f"DECLARE c2 CURSOR FOR {sql}")
+        status, msgs = await _simple(reader, writer, "FETCH ALL FROM c2")
+        await _simple(reader, writer, "CLOSE c2")
+        writer.close()
+        return status, _collect(msgs)
+    status, res = _run(client())
+    assert status == "I"
+    assert res["tag"] == "FETCH 500"
+    assert len(res["rows"]) == 500
+
+
+def test_move_advances_offset(pg):
+    """MOVE advances the cursor without emitting rows; a following FETCH returns
+    the window starting at the new offset."""
+    port, _, ref = pg
+    sql = _ordered_lineitem_sql()
+
+    async def client():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(reader, writer)
+        await _simple(reader, writer, f"DECLARE c3 CURSOR FOR {sql}")
+        sm, mm = await _simple(reader, writer, "MOVE 250 IN c3")
+        sf, mf = await _simple(reader, writer, "FETCH 100 FROM c3")
+        await _simple(reader, writer, "CLOSE c3")
+        writer.close()
+        return _collect(mm), _collect(mf)
+    moved, fetched = _run(client())
+    assert moved["tag"] == "MOVE 250"
+    assert moved["rows"] == []
+    assert fetched["tag"] == "FETCH 100"
+    assert len(fetched["rows"]) == 100
+    exp = ref.sql(sql).to_pandas().reset_index(drop=True)
+    for i, got in enumerate(fetched["rows"]):
+        assert int(got[0]) == int(exp.iloc[250 + i]["l_orderkey"])
+
+
+def test_fetch_then_move_backward(pg):
+    """FORWARD FETCH to the end, then BACKWARD 100 returns the last 100 rows in
+    reverse order (PG BACKWARD returns rows ending at the current position)."""
+    port, _, ref = pg
+    sql = _ordered_lineitem_sql()
+
+    async def client():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(reader, writer)
+        await _simple(reader, writer, f"DECLARE c4 CURSOR FOR {sql}")
+        await _simple(reader, writer, "FETCH ALL FROM c4")          # offset -> 500
+        status, msgs = await _simple(reader, writer, "FETCH BACKWARD 100 FROM c4")
+        await _simple(reader, writer, "CLOSE c4")
+        writer.close()
+        return _collect(msgs)
+    res = _run(client())
+    assert res["tag"] == "FETCH 100"
+    assert len(res["rows"]) == 100
+    exp = ref.sql(sql).to_pandas().reset_index(drop=True)
+    # BACKWARD 100 from offset 500 -> rows [400, 500) in reverse (last first)
+    expected = exp.iloc[400:500].iloc[::-1].reset_index(drop=True)
+    for got, (_, erow) in zip(res["rows"], expected.iterrows()):
+        assert int(got[0]) == int(erow["l_orderkey"])
+
+
+def test_close_then_fetch_errors(pg):
+    """CLOSE drops the cursor; a following FETCH is invalid_cursor_name (34000)."""
+    port, _, _ = pg
+    sql = _ordered_lineitem_sql()
+
+    async def client():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(reader, writer)
+        await _simple(reader, writer, f"DECLARE c5 CURSOR FOR {sql}")
+        sc, mc = await _simple(reader, writer, "CLOSE c5")
+        sf, mf = await _simple(reader, writer, "FETCH 10 FROM c5")
+        writer.close()
+        return _collect(mc), _collect(mf)
+    closed, fetched = _run(client())
+    assert closed["tag"] == "CLOSE CURSOR"
+    assert fetched["error"] is not None
+    assert fetched["error"]["C"] == "34000"
+
+
+def test_close_all_drops_every_cursor(pg):
+    """CLOSE ALL drops every cursor on the connection; both names become 34000."""
+    port, _, _ = pg
+    sql = _ordered_lineitem_sql()
+
+    async def client():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(reader, writer)
+        await _simple(reader, writer, f"DECLARE ca CURSOR FOR {sql}")
+        await _simple(reader, writer, f"DECLARE cb CURSOR FOR {sql}")
+        sa, ma = await _simple(reader, writer, "CLOSE ALL")
+        fa = await _simple(reader, writer, "FETCH 1 FROM ca")
+        fb = await _simple(reader, writer, "FETCH 1 FROM cb")
+        writer.close()
+        return _collect(ma), _collect(fa[1]), _collect(fb[1])
+    closed, ea, eb = _run(client())
+    assert closed["tag"] == "CLOSE ALL"
+    assert ea["error"]["C"] == "34000"
+    assert eb["error"]["C"] == "34000"
+
+
+def test_close_unknown_cursor_errors(pg):
+    """CLOSE of a cursor that was never declared is invalid_cursor_name (34000),
+    matching Postgres (not a silent CommandComplete)."""
+    port, _, _ = pg
+
+    async def client():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(reader, writer)
+        status, msgs = await _simple(reader, writer, "CLOSE nosuch")
+        writer.close()
+        return _collect(msgs)
+    res = _run(client())
+    assert res["error"] is not None
+    assert res["error"]["C"] == "34000"
+
+
+def test_with_hold_rejected(pg):
+    """WITH HOLD cursors are unsupported (0A000 feature_not_supported); they
+    would have to survive COMMIT, which RyuDB does not allow."""
+    port, _, _ = pg
+    sql = _ordered_lineitem_sql()
+
+    async def client():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(reader, writer)
+        status, msgs = await _simple(
+            reader, writer, f"DECLARE ch CURSOR WITH HOLD FOR {sql}")
+        writer.close()
+        return _collect(msgs)
+    res = _run(client())
+    assert res["error"] is not None
+    assert res["error"]["C"] == "0A000"
+
+
+def test_cursor_closed_on_commit(pg):
+    """A WITHOUT HOLD cursor is closed at COMMIT; a post-COMMIT FETCH is 34000."""
+    port, _, _ = pg
+    sql = _ordered_lineitem_sql()
+
+    async def client():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(reader, writer)
+        sb, _ = await _simple(reader, writer, "BEGIN")
+        await _simple(reader, writer, f"DECLARE cc CURSOR FOR {sql}")
+        sf1, mf1 = await _simple(reader, writer, "FETCH 50 FROM cc")
+        await _simple(reader, writer, "COMMIT")
+        sf2, mf2 = await _simple(reader, writer, "FETCH 50 FROM cc")
+        writer.close()
+        return _collect(mf1), _collect(mf2)
+    before, after = _run(client())
+    assert before["tag"] == "FETCH 50"            # cursor was live in-txn
+    assert after["error"]["C"] == "34000"          # closed at COMMIT
+
+
+def test_cursor_closed_on_rollback(pg):
+    """ROLLBACK likewise closes all WITHOUT HOLD cursors."""
+    port, _, _ = pg
+    sql = _ordered_lineitem_sql()
+
+    async def client():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(reader, writer)
+        await _simple(reader, writer, "BEGIN")
+        await _simple(reader, writer, f"DECLARE cr CURSOR FOR {sql}")
+        await _simple(reader, writer, "ROLLBACK")
+        _, msgs = await _simple(reader, writer, "FETCH 1 FROM cr")
+        writer.close()
+        return _collect(msgs)
+    res = _run(client())
+    assert res["error"]["C"] == "34000"
+
+
+def test_extended_fetch_portal_advances(pg):
+    """Extended-protocol FETCH (psql's FETCH_COUNT path): Parse once, Execute
+    repeatedly with the cursor offset advancing per Execute, paging past the
+    100-row --pg-max-rows cap."""
+    port, _, ref = pg
+    sql = _ordered_lineitem_sql()
+
+    async def client():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(reader, writer)
+        # DECLARE over the simple-Query front (cursors are connection-scoped).
+        await _simple(reader, writer, f"DECLARE ec CURSOR FOR {sql}")
+        writer.write(_fmsg(b"P", _parse_msg(b"ps", b"FETCH 100 FROM ec", [])))
+        writer.write(_fmsg(b"B", _bind(b"po", b"ps", [])))
+        writer.write(_fmsg(b"E", _execute(b"po", 0)))
+        writer.write(_fmsg(b"S", b""))
+        await writer.drain()
+        _, m1 = await _drain_until_ready(reader)
+        # Second Execute of the same bound portal -> next 100 rows.
+        writer.write(_fmsg(b"E", _execute(b"po", 0)))
+        writer.write(_fmsg(b"S", b""))
+        await writer.drain()
+        _, m2 = await _drain_until_ready(reader)
+        await _simple(reader, writer, "CLOSE ec")
+        writer.close()
+        return _collect(m1), _collect(m2)
+    r1, r2 = _run(client())
+    assert r1["tag"] == "FETCH 100" and len(r1["rows"]) == 100
+    assert r2["tag"] == "FETCH 100" and len(r2["rows"]) == 100
+    exp = ref.sql(sql).to_pandas().reset_index(drop=True)
+    for i, got in enumerate(r1["rows"]):
+        assert int(got[0]) == int(exp.iloc[i]["l_orderkey"])
+    for i, got in enumerate(r2["rows"]):
+        assert int(got[0]) == int(exp.iloc[100 + i]["l_orderkey"])
+
+
+def test_extended_fetch_maxrows_caps_explicit_count(pg):
+    """Execute max-rows caps an explicit FETCH count: FETCH 500 with maxrows=100
+    returns 100 rows (the Execute row limit bounds the page)."""
+    port, _, _ = pg
+    sql = _ordered_lineitem_sql()
+
+    async def client():
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(reader, writer)
+        await _simple(reader, writer, f"DECLARE em CURSOR FOR {sql}")
+        writer.write(_fmsg(b"P", _parse_msg(b"ps", b"FETCH 500 FROM em", [])))
+        writer.write(_fmsg(b"B", _bind(b"po", b"ps", [])))
+        writer.write(_fmsg(b"E", _execute(b"po", 100)))  # cap at 100
+        writer.write(_fmsg(b"S", b""))
+        await writer.drain()
+        _, msgs = await _drain_until_ready(reader)
+        await _simple(reader, writer, "CLOSE em")
+        writer.close()
+        return _collect(msgs)
+    res = _run(client())
+    assert res["tag"] == "FETCH 100"
+    assert len(res["rows"]) == 100
+
+
+def test_cursor_per_connection_isolation(pg):
+    """A cursor declared on connection A is unreachable from connection B
+    (per-connection cursor store) -> FETCH on B is 34000."""
+    port, _, _ = pg
+    sql = _ordered_lineitem_sql()
+
+    async def client():
+        ra, wa = await asyncio.open_connection("127.0.0.1", port)
+        rb, wb = await asyncio.open_connection("127.0.0.1", port)
+        await _startup(ra, wa)
+        await _startup(rb, wb)
+        await _simple(ra, wa, f"DECLARE iso CURSOR FOR {sql}")
+        _, msgs = await _simple(rb, wb, "FETCH 1 FROM iso")
+        wa.close()
+        await wa.wait_closed()
+        wb.close()
+        await wb.wait_closed()
+        return _collect(msgs)
+    res = _run(client())
+    assert res["error"]["C"] == "34000"

@@ -99,6 +99,17 @@ A single `Engine` + worker pool shared by two wire fronts:
 - Simple + Extended Query with `$N` substitution via a sqlglot AST walk;
   per-conn txn status I/T/E; `CancelRequest` (pid, secret) → cooperative
   cancel.
+- **SQL cursors** (`DECLARE`/`FETCH`/`MOVE`/`CLOSE`), layered on the same
+  per-connection frozen-result cursor store as the WS `fetch` op. `DECLARE
+  CURSOR FOR <select>` runs the query once and freezes the full `pa.Table`;
+  `FETCH`/`MOVE` page it with all PG scroll directions (NEXT/PRIOR/FIRST/LAST/
+  FORWARD/BACKWARD `n`/`ALL`/ABSOLUTE/RELATIVE). FETCH emits rows directly,
+  bypassing the `--pg-max-rows` per-Response cap, so a driver can page a
+  result larger than the cap (`psql`'s `\set FETCH_COUNT 100`, pg8000 named
+  cursors). `WITH HOLD` is rejected (0A000); all cursors are WITHOUT HOLD and
+  close on `COMMIT`/`ROLLBACK` and disconnect. Errors carry real SQLSTATEs
+  (34000 invalid_cursor_name, 42P03 duplicate_cursor, 42P11
+  invalid_cursor_definition, 54000 program_limit_exceeded).
 
 ### 3.3 Per-connection MVCC isolation
 - Each connection owns an in-flight transaction with a frozen snapshot; a
