@@ -18,6 +18,9 @@ Op set (Phase 1):
   sample   SELECT * FROM <t> LIMIT n  (validated table name)
   export   run a SELECT and stream the FULL result as a binary file (Parquet;
            no in-browser writer for apache-arrow 17, so serialized server-side)
+  upload   ingest a parquet file sent over the wire (two-frame text+binary);
+           the connection loop reads the binary payload, then this op persists
+           it to <data>/uploads and registers the table (browser file-upload)
   admin    drop / rename / alter / register / checkpoint / snapshot / restore /
            clear_cache
   cancel   drop pending requests on this connection, or raise CancelledByUser
@@ -28,6 +31,7 @@ Op set (Phase 1):
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Any
 
 import cudf
@@ -209,6 +213,12 @@ async def handle_request(req: dict[str, Any], ws, server) -> None:
             await _op_export(req, ws, server)
         elif op == "admin":
             await _op_admin(req, ws, server)
+        elif op == "upload":
+            # upload is a two-frame request handled in the connection loop
+            # (Server._handler reads the binary payload inline before
+            # dispatching _op_upload); it never reaches this dispatch.
+            raise ProtocolError("upload requires a binary payload frame; "
+                                "handled by the connection loop")
         elif op == "cancel":
             await _op_cancel(req, ws, server)
         elif op == "history":
@@ -638,6 +648,70 @@ def _run_admin(server, action: str, args: dict[str, Any]) -> dict[str, Any]:
                 eng.clear_code_cache()
             return {"cleared": which}
         raise ProtocolError(f"unknown admin action {action!r}")
+
+
+async def _op_upload(req, payload: bytes, ws, server) -> None:
+    """Handle a two-frame ``upload`` request: the binary parquet payload was
+    already read by ``Server._handler`` and passed in as ``payload``. Validate
+    the meta + size, then persist + register on the worker thread (mirroring
+    ``_op_admin``). Wrapped in the same try/except as ``handle_request`` so a
+    ``ProtocolError`` surfaces as kind ``protocol`` (``_cancellable`` would
+    otherwise classify it as ``runtime``)."""
+    rid = req.get("id")
+    try:
+        name = _require(req, "name", str)
+        fmt = req.get("format", "parquet")
+        if fmt != "parquet":
+            raise ProtocolError("upload 'format' must be 'parquet'")
+        if not payload:
+            raise ProtocolError("upload payload is empty")
+        if len(payload) > server.max_upload_bytes:
+            raise RuntimeError(
+                f"upload too large ({len(payload)} bytes; "
+                f"limit {server.max_upload_bytes})")
+
+        def run():
+            return _run_upload(server, name, payload)
+
+        ok, detail, dur = await _cancellable(server, ws, rid, run)
+        if not ok:
+            return
+        await _send_json(ws, {"id": rid, "op": "ok", "detail": detail,
+                             "duration_ms": round(dur, 3)})
+    except ProtocolError as exc:
+        await _send_json(ws, {"id": rid, "op": "error", "kind": "protocol",
+                             "message": str(exc)})
+    except Exception as exc:  # noqa: BLE001 -- a handler-side fault
+        kind, message, _ = classify(exc)
+        await _send_json(ws, {"id": rid, "op": "error", "kind": kind,
+                             "message": message})
+
+
+def _run_upload(server, name: str, payload: bytes) -> dict[str, Any]:
+    """Persist the uploaded parquet bytes to the catalog's ``uploads`` dir and
+    register the table. Runs on a worker thread; the file write is filesystem
+    I/O done before taking the engine's write lock, then ``register`` mutates
+    the catalog under the lock (serializing against reads/writes, like
+    ``_run_admin``). On register failure the file is removed so a bad upload
+    leaves no orphan. Raises on a bad payload (-> error frame)."""
+    import os
+    base = server.catalog.data_dir or "."
+    uploads_dir = os.path.join(base, "uploads")
+    os.makedirs(uploads_dir, exist_ok=True)
+    path = os.path.join(uploads_dir, f"{uuid.uuid4().hex}.parquet")
+    with open(path, "wb") as f:
+        f.write(payload)
+    try:
+        with server.engine.write_locked():
+            info = server.catalog.register(name, path)
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    return {"registered": info.name, "row_count": info.row_count,
+            "columns": len(info.columns), "path": path}
 
 
 def _run_alter(cat, args: dict[str, Any]) -> dict[str, Any]:

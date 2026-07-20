@@ -9,6 +9,8 @@
 
 import { WebSocket } from "ws";
 import { tableFromIPC } from "apache-arrow";
+import fs from "fs";
+import path from "path";
 
 const PORT = process.env.RYUDB_PORT || "5430";
 const LIPATH = process.env.RYUDB_LINEITEM_PATH;
@@ -67,6 +69,37 @@ function cells(table, row) {
     out[f.name] = arr ? arr[row] : null;
   }
   return out;
+}
+
+// Send a two-frame upload request (text meta + binary payload) and resolve on
+// the matching text ok/error frame (no binary follows an upload response).
+function callUpload(ws, obj, payload) {
+  const id = String(obj.id ?? `u${Math.random()}`);
+  const out = JSON.stringify({ ...obj, id });
+  return new Promise((resolve, reject) => {
+    const onMsg = (data, isBinary) => {
+      if (isBinary) return; // upload responses are text-only; ignore stray binary
+      const frame = JSON.parse(data.toString());
+      if (frame.id !== id) return;
+      ws.off("message", onMsg);
+      resolve({ meta: frame, table: null });
+    };
+    ws.on("message", onMsg);
+    ws.send(out);
+    ws.send(Buffer.from(payload)); // binary payload — must be the very next frame
+  });
+}
+
+// Read the bytes of one parquet file from RYUDB_LINEITEM_PATH (a file or a dir
+// of *.parquet) to use as an upload payload.
+function readSampleParquetBytes() {
+  let p = LIPATH;
+  if (fs.statSync(p).isDirectory()) {
+    const files = fs.readdirSync(p).filter((f) => f.endsWith(".parquet"));
+    if (!files.length) throw new Error(`no parquet files in ${p}`);
+    p = path.join(p, files[0]);
+  }
+  return fs.readFileSync(p);
 }
 
 const ws = await connect();
@@ -183,6 +216,24 @@ check("cleanup drop renamed", dropRen.meta.op === "ok" && dropRen.meta.detail?.d
 // (A SELECT on the dropped name may still hit the engine's scan cache — a
 // pre-existing server behavior, out of scope for the UI's drop contract, which
 // is "the catalog no longer lists it" — asserted above.)
+
+// 11. upload op: two-frame text+binary ingest (browser file-upload path).
+//     Send the bytes of a real parquet file; the server writes them to
+//     <data>/uploads and registers the table, which is then queryable.
+const upBytes = readSampleParquetBytes();
+check("upload bytes present", upBytes.length > 4 && upBytes[0] === 0x50 && upBytes[1] === 0x41 && upBytes[2] === 0x52 && upBytes[3] === 0x31, "PAR1 head");
+const upOk = await callUpload(ws, { id: "up", op: "upload", name: "li_up", format: "parquet" }, upBytes);
+check("upload ok", upOk.meta.op === "ok" && upOk.meta.detail?.registered === "li_up", JSON.stringify(upOk.meta));
+check("upload row_count", upOk.meta.op === "ok" && upOk.meta.detail?.row_count === N, String(upOk.meta.detail?.row_count));
+const catUp = await call(ws, { id: "catup", op: "catalog" });
+check("catalog lists uploaded table", catUp.meta.tables.some((t) => t.name === "li_up"), JSON.stringify(catUp.meta.tables?.map((t) => t.name)));
+const upCnt = await call(ws, { id: "upc", op: "sql", sql: "SELECT count(*) AS c FROM li_up" });
+check("uploaded table queryable", upCnt.meta.op === "result" && upCnt.table && Number(cells(upCnt.table, 0).c) === N, JSON.stringify(upCnt.meta));
+const upDrop = await call(ws, { id: "upd", op: "admin", action: "drop", args: { table: "li_up" } });
+check("cleanup drop uploaded", upDrop.meta.op === "ok" && upDrop.meta.detail?.dropped === true, JSON.stringify(upDrop.meta));
+// bad format is rejected before any file is written
+const upBad = await callUpload(ws, { id: "upbad", op: "upload", name: "li_bad", format: "csv" }, upBytes);
+check("upload bad format errors", upBad.meta.op === "error" && upBad.meta.kind === "protocol", JSON.stringify(upBad.meta));
 
 ws.close();
 if (failures === 0) {

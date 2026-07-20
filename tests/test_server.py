@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 from io import BytesIO
@@ -194,6 +195,23 @@ async def _recv(ws):
     msg = await asyncio.wait_for(ws.recv(), timeout=20)
     assert isinstance(msg, str), f"expected text frame, got {type(msg)}"
     return json.loads(msg)
+
+
+async def _call_upload(ws, obj: dict[str, Any], payload: bytes):
+    """Send a two-frame ``upload`` request (text meta + binary payload) and
+    return the response meta frame (an ``ok`` or ``error`` text frame; no
+    binary follows)."""
+    await ws.send(json.dumps(obj))
+    await ws.send(payload)
+    while True:
+        msg = await asyncio.wait_for(ws.recv(), timeout=20)
+        if isinstance(msg, (bytes, bytearray)):
+            # an upload response is text-only; an unexpected binary frame is a
+            # protocol bug -- drop it and keep waiting for the matching meta.
+            continue
+        data = json.loads(msg)
+        if data.get("id") == obj.get("id"):
+            return data
 
 
 def _ipc_table(bins: list[bytes]) -> pd.DataFrame:
@@ -1330,3 +1348,124 @@ def test_pool_checkpoint_waits_for_inflight_read(srv_pool):
         server.engine._scan = orig
     assert q["op"] == "result"
     assert cp["op"] == "ok" and "tables" in cp["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# upload (browser file-upload ingest: two-frame text+binary -> register)
+# --------------------------------------------------------------------------- #
+
+def _lineitem_parquet_bytes(server) -> bytes:
+    """Read the fixture's lineitem parquet bytes (the same file the server
+    registered ``lineitem`` from in setup)."""
+    path = os.path.join(server.catalog.data_dir, "lineitem", "0.parquet")
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def test_upload_roundtrip_registers_and_is_queryable(srv):
+    port, server, ref, _ = srv
+    payload = _lineitem_parquet_bytes(server)
+    assert len(payload) > 0
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta = await _call_upload(ws, {"id": "u1", "op": "upload",
+                                           "name": "up_copy", "format": "parquet"},
+                                      payload)
+            cat, _ = await _call(ws, {"id": "c", "op": "catalog"})
+            cnt, bins = await _call(ws, {"id": "q", "op": "sql",
+                                         "sql": "SELECT count(*) AS c FROM up_copy"},
+                                    want_bin=True)
+            await _call(ws, {"id": "d", "op": "admin", "action": "drop",
+                             "args": {"table": "up_copy"}})
+        return meta, cat, cnt, bins
+
+    meta, cat, cnt, bins = _run(client())
+    assert meta["op"] == "ok", meta
+    d = meta["detail"]
+    assert d["registered"] == "up_copy"
+    assert d["row_count"] == 500
+    assert d["columns"] == 4
+    assert d["path"].endswith(".parquet") and "uploads" in d["path"]
+    assert any(t["name"] == "up_copy" for t in cat["tables"]), cat
+    assert cnt["op"] == "result" and bins, cnt
+    df = _ipc_table(bins)
+    assert int(df.iloc[0]["c"]) == 500
+
+
+def test_upload_bad_format_errors(srv):
+    port, server, _ref, _ = srv
+    payload = _lineitem_parquet_bytes(server)
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta = await _call_upload(ws, {"id": "u2", "op": "upload",
+                                           "name": "up_bad", "format": "csv"},
+                                      payload)
+        return meta
+
+    meta = _run(client())
+    assert meta["op"] == "error" and meta["kind"] == "protocol", meta
+    assert "parquet" in meta["message"]
+
+
+def test_upload_empty_payload_errors(srv):
+    port, server, _ref, _ = srv
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta = await _call_upload(ws, {"id": "u3", "op": "upload",
+                                           "name": "up_empty", "format": "parquet"},
+                                      b"")
+        return meta
+
+    meta = _run(client())
+    assert meta["op"] == "error" and meta["kind"] == "protocol", meta
+    assert "empty" in meta["message"]
+
+
+def test_upload_non_parquet_bytes_errors(srv):
+    """Valid framing but a payload that is not a parquet file: register reads
+    the schema and fails; the orphan file is removed and an error is sent.
+    (Other upload tests leave files behind because ``admin drop`` keeps the
+    parquet on disk, so we snapshot the uploads dir before and assert the junk
+    upload added no new file.)"""
+    port, server, _ref, _ = srv
+    uploads_dir = os.path.join(server.catalog.data_dir, "uploads")
+    before = set(os.listdir(uploads_dir)) if os.path.isdir(uploads_dir) else set()
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta = await _call_upload(ws, {"id": "u4", "op": "upload",
+                                           "name": "up_junk", "format": "parquet"},
+                                      b"this is not a parquet file")
+            cat, _ = await _call(ws, {"id": "c", "op": "catalog"})
+        return meta, cat
+
+    meta, cat = _run(client())
+    assert meta["op"] == "error", meta
+    assert not any(t["name"] == "up_junk" for t in cat["tables"]), cat
+    after = set(os.listdir(uploads_dir)) if os.path.isdir(uploads_dir) else set()
+    assert after == before, f"orphan junk file left behind: {after - before}"
+
+
+def test_upload_too_large_errors(srv):
+    """A payload exceeding ``max_upload_bytes`` is refused by the handler-side
+    size check (independent of the transport ``max_size``)."""
+    port, server, _ref, _ = srv
+    payload = _lineitem_parquet_bytes(server)
+    server.max_upload_bytes = len(payload) - 1
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta = await _call_upload(ws, {"id": "u5", "op": "upload",
+                                           "name": "up_big", "format": "parquet"},
+                                      payload)
+        return meta
+
+    try:
+        meta = _run(client())
+    finally:
+        server.max_upload_bytes = 256 * 1024 * 1024
+    assert meta["op"] == "error", meta
+    assert "too large" in meta["message"], meta

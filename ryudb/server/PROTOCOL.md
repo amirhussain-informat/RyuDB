@@ -23,13 +23,16 @@ frames. The transport is plain WebSocket (no subprotocol). Two frame kinds:
 
 - **text frames** — UTF-8 JSON. Used for every request and for every response
   *except* the binary result payload.
-- **binary frames** — one Arrow IPC stream. Sent by the server only, only as
-  the second frame of a successful `sql`/`sample` result. Clients never send
-  binary frames (the server closes the connection with code 1003 if one
-  arrives).
+- **binary frames** — either an Arrow IPC stream (sent by the server only, as
+  the second frame of a successful `sql`/`sample`/`fetch` result) or an uploaded
+  parquet payload (sent by the client, as the second frame of an `upload`
+  request — see *upload* below). An unexpected binary frame at any other point
+  closes the connection with code 1003.
 
 `ryudb-server` listens on `127.0.0.1:5430` by default (`--host`/`--port`, or the
-`RYUDB_HOST`/`RYUDB_PORT` env vars). `max_size` is unbounded. A `sql`/`sample`
+`RYUDB_HOST`/`RYUDB_PORT` env vars). `max_size` is `--max-upload-bytes` (default
+256MB) — it bounds every incoming frame (a larger upload is rejected with 1009;
+the frontend pre-checks the file size). A `sql`/`sample`
 result is sent as one binary frame capped at `--max-rows` rows (see `truncated`);
 a `sql` request with `cursor: true` freezes the full result as a server-side
 cursor and pages the rest via `fetch` (see *Result cursors* below).
@@ -273,6 +276,35 @@ unsupported `format` → `error` (protocol).
 ```
 followed by one binary frame: the raw Parquet bytes (NOT Arrow IPC — the client
 keeps them as a blob for download). Records a history entry tagged `export`.
+
+### `upload`
+
+Ingest a parquet file sent over the wire (browser file-upload). A **two-frame
+request**: one text meta frame, then immediately one binary frame with the
+parquet bytes.
+
+```json
+{"id": "...", "op": "upload", "name": "<table>", "format": "parquet"}
+```
+followed by one binary frame: the raw parquet bytes. `format` must be
+`"parquet"` (the only supported ingest format — the engine is parquet-only).
+
+Response (text `ok`):
+```json
+{"id": "...", "op": "ok",
+ "detail": {"registered": "<name>", "row_count": 600572, "columns": 16,
+            "path": "<data>/uploads/<uuid>.parquet"},
+ "duration_ms": 187.3}
+```
+The server writes the bytes to `<data_dir>/uploads/<uuid>.parquet` then
+registers the table (same path as `admin register` / `CREATE TABLE FROM`). On a
+register failure (e.g. not a valid parquet) the file is removed so a bad upload
+leaves no orphan. The payload is bounded by `--max-upload-bytes` (default
+256MB) — which is also the WebSocket `max_size`, so an oversized upload is
+rejected by the transport with close code 1009 (the frontend pre-checks the
+file size and refuses before sending). `upload` is handled in the connection
+loop (the binary payload is read inline before dispatch), so it never reaches
+the generic op dispatch.
 
 ### `admin`
 

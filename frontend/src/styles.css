@@ -162,6 +162,13 @@ button.primary:hover:not(:disabled) { background: #6dd1ff; }
   border-radius: 8px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5); overflow: hidden;
 }
 .load-body { padding: 8px 14px 14px; display: flex; flex-direction: column; gap: 4px; }
+.load-tabs { display: flex; gap: 4px; margin: 2px 0 6px; }
+.load-tabs button {
+  background: var(--bg); border: 1px solid var(--border); color: var(--fg-dim);
+  padding: 4px 10px; border-radius: 5px; font-size: 12px; cursor: pointer;
+}
+.load-tabs button:hover { color: var(--fg); }
+.load-tabs button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 .load-hint { color: var(--fg-dim); font-size: 11px; margin: 4px 0 8px; }
 .load-hint code { background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; }
 .load-label { color: var(--fg-dim); font-size: 11px; margin-top: 4px; }
