@@ -1,5 +1,20 @@
 # ryudb-server wire protocol
 
+`ryudb-server` fronts one `Engine` over `data_dir` with **two** wire fronts
+sharing the same engine, worker, and per-connection transaction model:
+
+- a **WebSocket** front (custom JSON + Arrow IPC; this document), default
+  `127.0.0.1:5430` (`--port` / `RYUDB_PORT`); and
+- an optional **Postgres v3 wire-protocol** front (see *Postgres wire front*
+  below), enabled with `--pg-port` / `RYUDB_PG_PORT` (default `0` = disabled).
+
+Both fronts serialize all engine/catalog access through the single worker
+thread, so correctness and FIFO submission order are identical across them; a
+PG connection and a WS connection are just two sessions over the same engine
+(per-connection MVCC isolation applies to both).
+
+## WebSocket front
+
 A client opens a single WebSocket connection to the server and exchanges
 frames. The transport is plain WebSocket (no subprotocol). Two frame kinds:
 
@@ -252,3 +267,58 @@ wire.
 - **One binary frame per result.** No chunked streaming of huge results; rows
   beyond `max_rows` are truncated (the true `row_count` is reported; a future
   export/fetch op can page them).
+
+## Postgres wire front (`--pg-port`)
+
+With `--pg-port` set, `ryudb-server` also binds a PostgreSQL v3 wire-protocol
+front (`ryudb/server/pgwire.py`) so real drivers — `psql`, `psycopg`,
+`pg8000`, `asyncpg`, JDBC — can connect and run SQL instead of speaking the
+custom JSON+Arrow protocol. It shares the WebSocket `Server`'s engine, worker,
+and per-connection transaction core: each PG connection is a session with its
+own `_ryudb_txn` routed through `Server.run_sql`, so the cross-session MVCC
+isolation above applies identically. `--pg-max-rows` / `RYUDB_PG_MAX_ROWS`
+(default `200000`) caps the rows returned per SELECT over this front.
+
+```
+psql "host=127.0.0.1 port=5432 user=ryudb dbname=ryudb"
+```
+
+### Supported
+
+- **Startup v3.0 + `AuthenticationOk`** (no auth; the server binds
+  `127.0.0.1` for a local single-user console). `SSLRequest` / `GSSRequest`
+  are refused with a single `N` byte (the client retries plain).
+- **Simple Query (`Q`)**: `RowDescription` + `DataRow`* (text format) +
+  `CommandComplete` + `ReadyForQuery`. A multi-statement Query is split on
+  top-level `;` and run statement-by-statement.
+- **Extended Query (`P`/`B`/`D`/`E`/`S`/`C`)**: Parse/Bind/Describe/Execute/
+  Sync/Close. `$N` placeholders are substituted with typed literals via a
+  sqlglot AST walk (`exp.Parameter` → `exp.Literal`), so the engine's
+  string-SQL entry point is reused as-is. A statement-Describe answers
+  `ParameterDescription` + `NoData`; a portal-Describe (or an Execute with no
+  preceding portal-Describe) emits the `RowDescription` — matching real
+  Postgres, which sends the output schema from Execute when no portal-Describe
+  preceded it.
+- **`Terminate` (`X`)**, **`ErrorResponse` (`E`)** with SQLSTATE,
+  **`EmptyQueryResponse` (`I`)**, **`NoData` (`n`)**.
+- **Per-connection transactions**; `ReadyForQuery` status `I`/`T`/`E` (idle /
+  in-txn / aborted-txn — the latter gates further statements on `ROLLBACK`,
+  matching real Postgres). `BEGIN`/`COMMIT`/`ROLLBACK` map to the engine's
+  transaction control; a disconnect rolls back the open txn (buffered writes
+  were never flushed).
+
+### Not supported (documented limits)
+
+- **SSL/TLS, GSSAPI, SCRAM/password auth** (no auth). `CancelRequest` is
+  parsed but not wired to the cooperative cancel (`cancel` op) yet — a future
+  PR can map `(pid, secret)` to the connection's pending cancel event.
+- **`COPY`, `LISTEN`/`NOTIFY`, portal scroll, binary result format (text
+  only), binary parameter format (text only).** A client requesting binary
+  results/params gets an error.
+- **Result rows are capped at `--pg-max-rows`** (the same cap as the
+  WebSocket front); the PG protocol has no truncation signal, so the cap is
+  silent. Raise `--pg-max-rows` for full exports.
+- **Parameter type inference** uses the Parse param OIDs; an unknown OID (`0`)
+  renders the param as a quoted string literal and lets the engine coerce.
+- **`SELECT` without `FROM`** is not supported by the engine (a parameterized
+  `SELECT $1` must reference a table, e.g. `SELECT $1 AS x FROM t LIMIT 1`).
