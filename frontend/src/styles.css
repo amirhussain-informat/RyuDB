@@ -152,6 +152,27 @@ button.primary:hover:not(:disabled) { background: #6dd1ff; }
   padding: 6px 10px; color: var(--fg-dim); text-transform: uppercase; font-size: 11px;
 }
 .sidebar-head button { padding: 2px 6px; }
+.head-actions { display: flex; gap: 4px; }
+.sample.drop { color: var(--fg-dim); }
+.sample.drop:hover { color: var(--err); }
+
+/* data-load wizard modal */
+.load-modal {
+  width: min(560px, 92vw); background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5); overflow: hidden;
+}
+.load-body { padding: 8px 14px 14px; display: flex; flex-direction: column; gap: 4px; }
+.load-hint { color: var(--fg-dim); font-size: 11px; margin: 4px 0 8px; }
+.load-hint code { background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; }
+.load-label { color: var(--fg-dim); font-size: 11px; margin-top: 4px; }
+.load-input {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 3px; padding: 5px 8px; font-family: monospace; font-size: 12px;
+  outline: none;
+}
+.load-input:focus { border-color: var(--accent); }
+.load-error { color: var(--err); font-size: 12px; margin-top: 6px; }
+.load-actions { display: flex; gap: 6px; margin-top: 10px; }
 .table-list, .history-list, .col-list { list-style: none; margin: 0; padding: 0; }
 .table-row { display: flex; align-items: center; gap: 4px; padding: 3px 8px; }
 .table-row .caret { background: transparent; border: none; padding: 0 4px; color: var(--fg-dim); }

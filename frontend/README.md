@@ -68,7 +68,14 @@ does the GPU work; this is its client.
   fused C++ kernel — eligibility, not a guarantee).
 - **Catalog** — tables + row counts; expand a table for its columns; click a
   name to drop it into the editor; the `⤵` button runs `SELECT * … LIMIT 100`;
-  the `▮` button opens the **column profile** panel for that table.
+  the `▮` button opens the **column profile** panel for that table. The **+
+  Load** button opens the **data-load wizard**: give a table name + a parquet
+  path on the server filesystem (a file, a directory expanded to `*.parquet`,
+  or a glob) and it registers the table via `admin register` (the engine is
+  parquet-only and reads from the server's FS — there is no browser upload).
+  The per-table **✕** drops it via `admin drop` (unregisters; source files are
+  kept). Both refresh the catalog + the autocomplete schema. A `Load data from
+  parquet path` command-palette entry opens the wizard too.
 - **Column profile** — the `▮` button (per table in the Catalog sidebar) opens
   a panel of per-column statistics computed on the **GPU** by the server's
   `profile` op (one full scan; cuDF reductions + value_counts). Each column
