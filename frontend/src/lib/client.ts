@@ -136,15 +136,16 @@ export class RyuDBClient {
   }
 
   private handleText(frame: Response): void {
-    // A result meta is followed by its binary frame — defer resolving until the
-    // binary arrives. (Defensive: if a text frame sneaks in while awaiting a
-    // binary, the binary was lost — resolve the result with table=null.)
-    if (this.awaitingBin !== null && frame.op !== "result") {
+    // A `result` (Arrow IPC) or `export` (raw blob, e.g. Parquet) meta is
+    // followed by its binary frame — defer resolving until it arrives.
+    // (Defensive: if a text frame sneaks in while awaiting a binary, the binary
+    // was lost — resolve the pending result with a null payload.)
+    if (this.awaitingBin !== null && frame.op !== "result" && frame.op !== "export") {
       const { id, meta } = this.awaitingBin;
       this.awaitingBin = null;
-      this.resolve(id, { meta, table: null });
+      this.resolve(id, { meta, table: null, bytes: undefined });
     }
-    if (frame.op === "result") {
+    if (frame.op === "result" || frame.op === "export") {
       const id = String(frame.id);
       this.awaitingBin = { id, meta: frame };
       return;
@@ -158,6 +159,11 @@ export class RyuDBClient {
     const awaiting = this.awaitingBin;
     if (awaiting === null) return; // orphan binary, ignore
     this.awaitingBin = null;
+    if (awaiting.meta.op === "export") {
+      // Raw bytes (Parquet) — NOT Arrow IPC; keep as a blob for download.
+      this.resolve(awaiting.id, { meta: awaiting.meta, table: null, bytes: new Uint8Array(buf) });
+      return;
+    }
     const table = decodeIpc(buf);
     this.resolve(awaiting.id, { meta: awaiting.meta, table });
   }

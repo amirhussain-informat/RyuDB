@@ -32,7 +32,10 @@ does the GPU work; this is its client.
   and not pageable. **Download CSV / JSON / Arrow** serializes the full set: a
   cursor-backed result is paged from the cursor; a non-cursor (too-large) result
   re-runs with `max_rows = row_count`. A result above 1M rows asks for
-  confirmation first. **Copy** writes the displayed rows as TSV to the
+  confirmation first. **Download Parquet** uses a server-side `export` op
+  (apache-arrow 17 has no in-browser Parquet writer): the server runs the query
+  and streams the full result as one Parquet binary blob (bounded by
+  `--max-export-rows`, default 5M). **Copy** writes the displayed rows as TSV to the
   clipboard (pastes into Excel / Sheets); **click a cell** to copy its value.
   **Sort + filter** run in-browser on the loaded page (no server round-trip):
   click a column header to cycle ascending → descending → clear (a `▲`/`▼`

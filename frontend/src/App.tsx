@@ -339,7 +339,7 @@ export default function App() {
     }
   };
 
-  const download = async (format: "csv" | "json" | "arrow") => {
+  const download = async (format: "csv" | "json" | "arrow" | "parquet") => {
     const cur = result;
     if (!cur || cur.meta.op !== "result") return;
     const m = cur.meta as ResultMeta;
@@ -350,6 +350,19 @@ export default function App() {
     }
     setDownloading(true);
     try {
+      // Parquet has no in-browser writer for apache-arrow 17 — the server
+      // serializes the full result to Parquet (one export op + binary blob) and
+      // we save the raw bytes. No client-side paging needed.
+      if (format === "parquet") {
+        const res = await op({ id: "dl", op: "export", sql, format: "parquet" });
+        if (res.meta.op !== "export" || !res.bytes) {
+          setMessage("download: export failed");
+          setMainTab("message");
+          return;
+        }
+        downloadBlob("result.parquet", "application/vnd.apache.parquet", res.bytes);
+        return;
+      }
       let table = cur.table;
       if (m.truncated && table && table.numRows < m.row_count) {
         const cid = cursorRef.current;

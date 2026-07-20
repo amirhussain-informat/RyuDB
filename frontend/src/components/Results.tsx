@@ -7,7 +7,7 @@ import { copyText, tableToTSV, viewToTSV } from "../lib/csv";
 interface Props {
   meta: ResultMeta;
   table: Table | null;
-  onDownload: (format: "csv" | "json" | "arrow") => void;
+  onDownload: (format: "csv" | "json" | "arrow" | "parquet") => void;
   downloading: boolean;
   onLoadMore: () => void;
   hasMore: boolean;
@@ -253,6 +253,14 @@ export default function Results({ meta, table, onDownload, downloading,
           </button>
           <button className="dl" disabled={downloading} onClick={() => onDownload("arrow")}>
             Arrow
+          </button>
+          <button
+            className="dl"
+            disabled={downloading}
+            onClick={() => onDownload("parquet")}
+            title="Download the full result as Parquet (serialized server-side)"
+          >
+            Parquet
           </button>
         </span>
       </div>

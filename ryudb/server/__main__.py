@@ -57,6 +57,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="max rows a single result cursor will hold (a larger "
                          "result is served truncated without a cursor); default "
                          "1000000")
+    ap.add_argument("--max-export-rows", type=int,
+                    default=int(_env("RYUDB_MAX_EXPORT_ROWS", "5000000")),
+                    help="max rows a single export (Parquet) will serialize; a "
+                         "larger result errors out instead of OOMing; default "
+                         "5000000")
     ap.add_argument("--workers", type=int,
                     default=int(_env("RYUDB_WORKERS", "1")),
                     help="engine worker pool size. 1 (default) preserves the "
@@ -78,7 +83,8 @@ def main(argv: list[str] | None = None) -> int:
     server = Server(args.data, args.host, args.port, args.max_rows,
                     n_workers=args.workers,
                     max_cursors_per_conn=args.max_cursors_per_conn,
-                    max_cursor_rows=args.max_cursor_rows)
+                    max_cursor_rows=args.max_cursor_rows,
+                    max_export_rows=args.max_export_rows)
     pg = (PGServer(server, args.host, args.pg_port, args.pg_max_rows)
           if args.pg_port else None)
 
