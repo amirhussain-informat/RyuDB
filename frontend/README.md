@@ -73,9 +73,11 @@ parse error with position — the same wire path the browser uses.
 
 ## Notes / Phase 1 limits
 
-- Monaco loads from the CDN bundled into `@monaco-editor/react` by default (the
-  dev/build needs internet at runtime). Bundling `monaco-editor` locally is a
-  later option.
+- Monaco is bundled locally from the `monaco-editor` package (a SQL-only subset:
+  the editor API + editor contributions + the SQL tokenizer, wired in
+  `src/monaco.ts`), so the worksheet works fully offline — no CDN fetch at
+  runtime. `@monaco-editor/react`'s loader is configured with the local
+  instance, which short-circuits its default CDN path.
 - The server is single-logical-session (transaction state is shared across
   connections). `Cancel` drops pending requests and raises `CancelledByUser` at
   the next plan-node boundary of a running request — a single long cuDF call
