@@ -48,6 +48,27 @@ python -c "import cudf; print(cudf.__version__)"
 nvidia-smi   # should show the RTX 3090
 ```
 
+## Install
+
+RyuDB is a normal Python package (`pyproject.toml`, console scripts
+`ryudb` / `ryudb-server`). It is installed from source into the conda env
+that already provides cuDF + nvcc:
+
+```bash
+conda activate ryudb
+pip install .                    # editable: pip install -e .
+ryudb build                     # compile the C++/CUDA fused kernel (nvcc + pybind11)
+```
+
+`ryudb build` (a.k.a. `python -m ryudb.kernels.build`) compiles
+`ryudb/kernels/fused.cu` + `pqpages.cpp` to `fused.so` next to the sources,
+linking `libnvcomp` (GPU Snappy) with an rpath to `$CONDA_PREFIX/lib`. The
+kernel sources ship in the wheel (`package-data`), so the build works from a
+non-editable install too. The fused kernel is **optional** — if it is absent or
+stale (a source newer than the binary), the executor falls back to the
+Numba/cuDF paths, so `ryudb build` is never required for correctness, only for
+the fused star-join+aggregate hot path.
+
 ## Usage
 
 ```bash
@@ -69,14 +90,18 @@ SELECT l_returnflag, sum(l_quantity) AS qty
 
 ## Server
 
-`ryudb-server` runs the engine as a WebSocket server (custom JSON + Arrow IPC
-protocol) so a frontend — or any client — can drive RyuDB over the wire. One
-`Engine` behind a single worker thread serializes all access; results come back
-as Arrow IPC for zero-copy handoff to a dataframe UI.
+`ryudb-server` runs the engine as a server with **two** wire fronts sharing one
+`Engine` behind a single worker thread (all access serializes):
+
+- a **WebSocket** front (custom JSON + Arrow IPC) for the frontend / any client —
+  results come back as Arrow IPC for zero-copy handoff to a dataframe UI; and
+- an optional **Postgres v3 wire** front (`--pg-port`) so real drivers — `psql`,
+  `psycopg`, `pg8000`, `asyncpg`, JDBC — connect to the same engine.
 
 ```bash
-ryudb-server --data ./data --host 127.0.0.1 --port 5430
-# env overrides: RYUDB_DATA / RYUDB_HOST / RYUDB_PORT / RYUDB_MAX_ROWS / RYUDB_LOG_LEVEL
+ryudb-server --data ./data --host 127.0.0.1 --port 5430 --pg-port 5432
+# env overrides: RYUDB_DATA / RYUDB_HOST / RYUDB_PORT / RYUDB_MAX_ROWS /
+#                RYUDB_PG_PORT / RYUDB_PG_MAX_ROWS / RYUDB_LOG_LEVEL
 ```
 
 Ops: `sql`, `explain` (structured plan tree with a `fused` badge for the
@@ -84,12 +109,17 @@ star-join+aggregate shape), `catalog`, `table`, `sample`, `admin`
 (register/drop/rename/alter/checkpoint/snapshot/restore/clear_cache), `cancel`
 (drops pending requests), `history`. Parse errors carry a `position`; results
 cap at `--max-rows` rows (the true `row_count` is always reported). See
-[`ryudb/server/PROTOCOL.md`](ryudb/server/PROTOCOL.md) for the full wire format.
+[`ryudb/server/PROTOCOL.md`](ryudb/server/PROTOCOL.md) for the full wire format
+(both fronts).
 
-**Phase 1 limitations:** single logical session (transaction state is shared
-across connections — fine for a local single-user console); `cancel` drops only
-pending (not-yet-started) requests, in-flight queries run to completion; binds
-to `127.0.0.1` with no auth (local console, not for exposing on a network).
+**Per-connection transactions (MVCC isolation):** each connection owns its own
+in-flight transaction with a frozen snapshot — a commit on another connection
+is invisible until this one commits (read-your-writes within a txn; a disconnect
+rolls back the open txn). `checkpoint` / `restore` are refused while any
+connection has an open txn. **Cooperative in-flight cancel:** `cancel` drops
+pending requests and raises `CancelledByUser` at the next plan-node boundary of
+an in-flight request (a single long cuDF call is not mid-call interruptible).
+Binds to `127.0.0.1` with no auth (local console, not for exposing on a network).
 
 ## SQL subset (Phase 1)
 

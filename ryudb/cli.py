@@ -5,6 +5,7 @@ Usage:
   ryudb -d <data_dir>        # use a different data directory
   ryudb -e "SELECT ..."      # run a single SQL statement and exit
   ryudb -f script.sql        # run a SQL script and exit
+  ryudb build                # compile the C++/CUDA fused kernel (nvcc + pybind11)
 
 REPL dot-commands:
   :tables        list registered tables
@@ -43,6 +44,13 @@ _CREATE_RE = re.compile(
 
 
 def main(argv: list[str] | None = None) -> int:
+    # ``ryudb build`` compiles the C++/CUDA fused kernel (nvcc + pybind11) and
+    # does not need a data dir / engine, so dispatch it before the REPL parser
+    # (which constructs a Catalog + Engine unconditionally).
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] in ("build", "build-kernels"):
+        return _build_kernels(raw[1:])
+
     parser = argparse.ArgumentParser(prog="ryudb", description="RyuDB GPU SQL REPL")
     parser.add_argument("-d", "--data", default="./data", help="data directory")
     parser.add_argument("-e", "--exec", dest="exec_sql", help="run a SQL statement and exit")
@@ -58,6 +66,33 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.file) as fh:
             return _run_script(engine, fh.read())
     return _repl(engine, catalog)
+
+
+def _build_kernels(argv: list[str]) -> int:
+    """``ryudb build`` — compile the optional C++/CUDA fused kernel.
+
+    Wraps ``ryudb.kernels.build`` (nvcc + pybind11 + libnvcomp). The kernel is
+    optional: without it the executor falls back to the Numba/cuDF paths, so a
+    build failure is a clear message, not a crash. Requires the ``ryudb`` conda
+    env (nvcc + a host compiler + libnvcomp headers/libs)."""
+    if argv and argv[0] in ("-h", "--help"):
+        print("usage: ryudb build\n\n"
+              "Compile the C++/CUDA fused kernel (fused.so) with nvcc.\n"
+              "Requires the ryudb conda env (nvcc + host compiler + libnvcomp).\n"
+              "The kernel is optional; without it the executor uses cuDF.")
+        return 0
+    try:
+        from .kernels.build import build
+    except ImportError as exc:
+        print(f"error: cannot import build module: {exc}", file=sys.stderr)
+        return 1
+    try:
+        out = build()
+    except SystemExit as exc:  # build.py raises SystemExit on a missing tool
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"built {out}")
+    return 0
 
 
 def _run_script(engine: Engine, text: str) -> int:
