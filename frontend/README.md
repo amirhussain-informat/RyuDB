@@ -107,8 +107,14 @@ does the GPU work; this is its client.
   (primary key, NOT NULL, UNIQUE, defaults — stored, not enforced), the source
   parquet paths, a best-effort reconstructed registration DDL (copyable), and a
   rename control. All from the `table` op + `admin rename` — no server change.
-- **History** — the server-side query ring buffer; click an entry to reload
-  its SQL.
+- **History** — the server-side query ring buffer with Snowsight-style
+  filtering: a **SQL text filter** (case-insensitive substring), a **kind**
+  filter (all / select / write / export / fetch / control / cancelled / other),
+  and a **sort** (newest / oldest / slowest / most rows). Each entry shows a
+  timestamp, a colored kind badge, row count, and duration; click an entry to
+  reload its SQL into the editor. The buffer is bounded (default 500) so
+  filtering + sorting run client-side. The `history` op now carries a `ts`
+  (epoch-seconds session timestamp) on every entry.
 
 ## Develop
 

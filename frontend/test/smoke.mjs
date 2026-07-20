@@ -235,6 +235,13 @@ check("cleanup drop uploaded", upDrop.meta.op === "ok" && upDrop.meta.detail?.dr
 const upBad = await callUpload(ws, { id: "upbad", op: "upload", name: "li_bad", format: "csv" }, upBytes);
 check("upload bad format errors", upBad.meta.op === "error" && upBad.meta.kind === "protocol", JSON.stringify(upBad.meta));
 
+// 12. history op: the ring buffer records invocations with a ts + kind.
+const hist = await call(ws, { id: "h", op: "history" });
+check("history op", hist.meta.op === "history" && Array.isArray(hist.meta.entries), JSON.stringify(hist.meta));
+const selectEntries = (hist.meta.entries ?? []).filter((e) => e.kind === "select");
+check("history records selects", selectEntries.length > 0, JSON.stringify(hist.meta.entries?.map((e) => e.kind)));
+check("history entries carry ts", (hist.meta.entries ?? []).every((e) => typeof e.ts === "number"), JSON.stringify(hist.meta.entries?.[0]));
+
 ws.close();
 if (failures === 0) {
   console.log("SMOKE OK");

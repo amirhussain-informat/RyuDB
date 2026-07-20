@@ -354,8 +354,11 @@ then a normal result, not `cancelled`).
 {"id": "...", "op": "history"}
 ```
 → `{"op": "history", "entries": [{"id": ..., "sql": ..., "duration_ms": ...,
-"rows": N, "kind": "select|write|control|cancelled|other"}]}` — the server-side
-ring buffer (default 500 entries).
+"rows": N, "kind": "select|write|export|fetch|control|cancelled|other",
+"ts": 1721554234.7}]}` — the server-side ring buffer (default 500 entries).
+`ts` is the wall-clock epoch seconds when the entry was recorded (process-local,
+not persisted — a session timestamp) so the UI can order entries by time and show
+when each query ran.
 
 ## Concurrency
 
