@@ -84,6 +84,9 @@ parse error with position — the same wire path the browser uses.
 
 ## Notes / Phase 1 limits
 
+- A **dark/light theme** toggle in the toolbar (☀/☾) switches the whole UI and
+  the Monaco editor chrome; the choice persists to `localStorage` and defaults
+  to the OS color-scheme preference on first run.
 - Monaco is bundled locally from the `monaco-editor` package (a SQL-only subset:
   the editor API + editor contributions + the SQL tokenizer, wired in
   `src/monaco.ts`), so the worksheet works fully offline — no CDN fetch at
