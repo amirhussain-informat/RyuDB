@@ -8,6 +8,7 @@ import SqlEditor, { type EditorHandle } from "./components/Editor";
 import WorksheetTabs from "./components/WorksheetTabs";
 import CommandPalette, { type Command } from "./components/CommandPalette";
 import ShortcutsHelp from "./components/ShortcutsHelp";
+import SearchModal from "./components/SearchModal";
 import Results from "./components/Results";
 import Explain from "./components/Explain";
 import Catalog from "./components/Catalog";
@@ -85,6 +86,7 @@ export default function App() {
   const [sidebar, setSidebar] = useState<"catalog" | "history">("catalog");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
 
   // Apply a stored View to the live state slots.
   const setView = (v: View) => {
@@ -142,20 +144,25 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Global keyboard shortcuts: Cmd/Ctrl+K toggles the command palette; `?`
-  // (when not typing) opens the shortcuts help; Escape closes both.
+  // Global keyboard shortcuts: Cmd/Ctrl+K toggles the command palette;
+  // Cmd/Ctrl+Shift+F opens global object search; `?` (when not typing) opens
+  // the shortcuts help; Escape closes any open overlay.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
       if (mod && (e.key === "k" || e.key === "K")) {
         e.preventDefault();
         setPaletteOpen((o) => !o);
+      } else if (mod && e.shiftKey && (e.key === "f" || e.key === "F")) {
+        e.preventDefault();
+        setSearchOpen(true);
       } else if (e.key === "?" && !isTypingTarget(e.target)) {
         e.preventDefault();
         setShortcutsOpen(true);
       } else if (e.key === "Escape") {
         setPaletteOpen(false);
         setShortcutsOpen(false);
+        setSearchOpen(false);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -394,6 +401,10 @@ export default function App() {
     { id: "cancel", label: "Cancel running query", group: "Query", disabled: !running, run: cancel },
     { id: "connect", label: "Connect", group: "Session", disabled: connected, run: () => connect(DEFAULT_URL) },
     { id: "disconnect", label: "Disconnect", group: "Session", disabled: !connected, run: disconnect },
+    {
+      id: "search", label: "Search tables, columns, history", hint: "Ctrl/Cmd+Shift+F",
+      group: "Search", disabled: !connected, run: () => setSearchOpen(true),
+    },
     { id: "new-ws", label: "New worksheet", hint: "+", group: "Worksheets", run: create },
     {
       id: "close-ws", label: "Close current worksheet", group: "Worksheets",
@@ -496,6 +507,16 @@ export default function App() {
       </div>
       <CommandPalette open={paletteOpen} commands={commands} onClose={() => setPaletteOpen(false)} />
       <ShortcutsHelp open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+      <SearchModal
+        open={searchOpen}
+        connected={connected}
+        fetchCatalog={fetchCatalog}
+        fetchHistory={fetchHistory}
+        onClose={() => setSearchOpen(false)}
+        onPickTable={(name) => editorRef.current?.insert(name)}
+        onPickColumn={(_table, col) => editorRef.current?.insert(col)}
+        onPickHistory={(s) => active && updateSql(active.id, s)}
+      />
     </div>
   );
 }
