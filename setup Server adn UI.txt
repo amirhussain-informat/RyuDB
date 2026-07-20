@@ -1,0 +1,52 @@
+Here are the step-by-step commands to run the RyuDB server and web UI. Run these in WSL2 (NVIDIA-Workbench).
+
+  1. Start the server (shell 1)
+
+  source ~/miniconda3/etc/profile.d/conda.sh
+  conda activate ryudb
+  cd ~/RyuDB
+  ryudb-server --data ./data --host 127.0.0.1 --port 5430 --pg-port 5432
+
+  Leave it running. Env overrides if needed: RYUDB_DATA, RYUDB_HOST, RYUDB_PORT, RYUDB_PG_PORT, RYUDB_MAX_ROWS.
+
+  2. Register a table to query (shell 2, same ryudb env)
+
+  source ~/miniconda3/etc/profile.d/conda.sh
+  conda activate ryudb
+  cd ~/RyuDB
+  ryudb -e "CREATE TABLE lineitem FROM './data/tpch-sf0.1/lineitem/*.parquet'"
+  ryudb -e "SELECT count(*) FROM lineitem"   # sanity check
+
+  Adjust the parquet path to wherever your lineitem lives.
+
+  3. Start the web frontend (shell 3, separate Node env)
+
+  source ~/miniconda3/etc/profile.d/conda.sh
+  # one-time only:
+  conda create -c conda-forge -n ryudb-fe nodejs -y
+  conda activate ryudb-fe
+  cd ~/RyuDB/frontend
+  npm install      # one-time / after dependency changes
+  npm run dev      # prints http://localhost:5173/
+
+  4. Run queries in the browser
+
+  1. Open http://localhost:5173/.
+  2. Set the connection to ws://127.0.0.1:5430 and click Connect.
+  3. Type SQL in the Monaco editor, e.g.:
+  SELECT l_returnflag, sum(l_quantity) AS qty
+    FROM lineitem
+   WHERE l_shipdate <= date '1998-09-02'
+   GROUP BY l_returnflag
+   ORDER BY l_returnflag;
+  4. Ctrl/Cmd+Enter (or Run) to execute. Results render in an Arrow grid; Load more pages the rest via the server cursor (up to 1M rows). Explain shows the plan; Download exports CSV/Arrow.
+
+  Notes
+
+  - Bind is 127.0.0.1, no auth/TLS — local console only, don't expose the ports.
+  - To free a stuck port: fuser -k 5430/tcp (not pkill -f, which can kill your shell).
+  - PG-wire alternative once the server is up: psql -h 127.0.0.1 -p 5432 -U ryudb ryudb.
+  - A table must be registered before the worksheet returns results.
+
+  One heads-up given what just merged: the server now needs the fixed __main__.py (the asyncio.run bug fix from PR #67) to start cleanly when --pg-port is set — that's already on master, so a fresh checkout
+  is fine, but if you're on an older branch the server would crash on startup with a coroutine was expected, got <_GatheringFuture>.
