@@ -87,6 +87,10 @@ parse error with position — the same wire path the browser uses.
 - A **dark/light theme** toggle in the toolbar (☀/☾) switches the whole UI and
   the Monaco editor chrome; the choice persists to `localStorage` and defaults
   to the OS color-scheme preference on first run.
+- A **command palette** (`Ctrl/Cmd+K`) fuzzy-filters every action — run /
+  explain / cancel, connect / disconnect, new / close / switch worksheet,
+  toggle theme, open a sidebar, show shortcuts. `?` opens a keyboard-shortcuts
+  help modal.
 - Monaco is bundled locally from the `monaco-editor` package (a SQL-only subset:
   the editor API + editor contributions + the SQL tokenizer, wired in
   `src/monaco.ts`), so the worksheet works fully offline — no CDN fetch at

@@ -6,6 +6,8 @@ import { useTheme } from "./hooks/useTheme";
 import Toolbar from "./components/Toolbar";
 import SqlEditor, { type EditorHandle } from "./components/Editor";
 import WorksheetTabs from "./components/WorksheetTabs";
+import CommandPalette, { type Command } from "./components/CommandPalette";
+import ShortcutsHelp from "./components/ShortcutsHelp";
 import Results from "./components/Results";
 import Explain from "./components/Explain";
 import Catalog from "./components/Catalog";
@@ -43,6 +45,18 @@ const EMPTY_VIEW: View = {
   result: null, plan: null, message: null, error: null, mainTab: "results", cursorId: null,
 };
 
+/** True if keyboard focus is in a text-entry surface (so global letter-key
+ * shortcuts like `?` should not fire). Monaco renders a contenteditable-ish
+ * tree under `.monaco-editor`. */
+function isTypingTarget(t: EventTarget | null): boolean {
+  const el = t as HTMLElement | null;
+  if (!el) return false;
+  if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") return true;
+  if (el.isContentEditable) return true;
+  if (el.closest && el.closest(".monaco-editor")) return true;
+  return false;
+}
+
 export default function App() {
   const { status, connect, disconnect, op } = useServer();
   const editorRef = useRef<EditorHandle>(null);
@@ -69,6 +83,8 @@ export default function App() {
   const [mainTab, setMainTab] = useState<MainTab>("results");
   const [cursorId, setCursorId] = useState<string | null>(null);
   const [sidebar, setSidebar] = useState<"catalog" | "history">("catalog");
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
   // Apply a stored View to the live state slots.
   const setView = (v: View) => {
@@ -124,6 +140,26 @@ export default function App() {
   useEffect(() => {
     return () => closeCursorNow(cursorRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Global keyboard shortcuts: Cmd/Ctrl+K toggles the command palette; `?`
+  // (when not typing) opens the shortcuts help; Escape closes both.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        setPaletteOpen((o) => !o);
+      } else if (e.key === "?" && !isTypingTarget(e.target)) {
+        e.preventDefault();
+        setShortcutsOpen(true);
+      } else if (e.key === "Escape") {
+        setPaletteOpen(false);
+        setShortcutsOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   const sql = active?.sql ?? "";
@@ -350,6 +386,29 @@ export default function App() {
     !!result && result.meta.op === "result" &&
     !!activeMeta && activeMeta.returned < activeMeta.row_count;
 
+  // Commands surfaced in the palette. Rebuilt each render so the closures see
+  // the latest state (running / connected / active id / worksheet list).
+  const commands: Command[] = [
+    { id: "run", label: "Run query", hint: "Ctrl/Cmd+Enter", group: "Query", disabled: !connected || running, run },
+    { id: "explain", label: "Explain plan", group: "Query", disabled: !connected || running, run: explain },
+    { id: "cancel", label: "Cancel running query", group: "Query", disabled: !running, run: cancel },
+    { id: "connect", label: "Connect", group: "Session", disabled: connected, run: () => connect(DEFAULT_URL) },
+    { id: "disconnect", label: "Disconnect", group: "Session", disabled: !connected, run: disconnect },
+    { id: "new-ws", label: "New worksheet", hint: "+", group: "Worksheets", run: create },
+    {
+      id: "close-ws", label: "Close current worksheet", group: "Worksheets",
+      disabled: worksheets.length <= 1, run: () => closeTab(activeId),
+    },
+    ...worksheets.map((w) => ({
+      id: "go-" + w.id, label: `Go to ${w.name}`, group: "Worksheets",
+      disabled: w.id === activeId, run: () => switchTab(w.id),
+    })),
+    { id: "theme", label: "Toggle dark / light theme", group: "View", run: toggleTheme },
+    { id: "sidebar-catalog", label: "Open Catalog sidebar", group: "View", disabled: sidebar === "catalog", run: () => setSidebar("catalog") },
+    { id: "sidebar-history", label: "Open History sidebar", group: "View", disabled: sidebar === "history", run: () => setSidebar("history") },
+    { id: "shortcuts", label: "Show keyboard shortcuts", hint: "?", group: "Help", run: () => setShortcutsOpen(true) },
+  ];
+
   return (
     <div className="app">
       <Toolbar
@@ -435,6 +494,8 @@ export default function App() {
           </div>
         </main>
       </div>
+      <CommandPalette open={paletteOpen} commands={commands} onClose={() => setPaletteOpen(false)} />
+      <ShortcutsHelp open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
     </div>
   );
 }
