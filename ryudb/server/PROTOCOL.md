@@ -29,9 +29,10 @@ frames. The transport is plain WebSocket (no subprotocol). Two frame kinds:
   arrives).
 
 `ryudb-server` listens on `127.0.0.1:5430` by default (`--host`/`--port`, or the
-`RYUDB_HOST`/`RYUDB_PORT` env vars). `max_size` is unbounded, so large result
-sets are streamed in a single binary frame (capped at `--max-rows` rows; see
-`truncated`).
+`RYUDB_HOST`/`RYUDB_PORT` env vars). `max_size` is unbounded. A `sql`/`sample`
+result is sent as one binary frame capped at `--max-rows` rows (see `truncated`);
+a `sql` request with `cursor: true` freezes the full result as a server-side
+cursor and pages the rest via `fetch` (see *Result cursors* below).
 
 ## Request frame
 
@@ -51,9 +52,9 @@ The response `op` tells the client what to expect next:
 
 | op          | follows?         | meaning |
 |-------------|------------------|---------|
-| `result`    | 1 binary frame   | a SELECT/sample returned rows |
+| `result`    | 1 binary frame   | a SELECT/sample returned rows (first page of a cursor, or a `fetch` page) |
 | `write`     | nothing          | an INSERT/UPDATE/DELETE/MERGE; `rows_affected` |
-| `ok`        | nothing          | a control statement (BEGIN/COMMIT/...) or admin op succeeded |
+| `ok`        | nothing          | a control statement (BEGIN/COMMIT/...), admin op, or `close` succeeded |
 | `plan`      | nothing          | EXPLAIN tree (`tree`) |
 | `catalog`   | nothing          | `tables` list |
 | `table`     | nothing          | one table's schema (`columns`, `constraints`, ...) |
@@ -78,6 +79,23 @@ Immediately followed by one binary frame: an Arrow IPC **stream**
 `pyarrow.ipc.open_stream(bytes).read_all()`. `row_count` is the true total;
 `returned` is the rows in the binary frame (≤ `max_rows`); `truncated` is true
 when `row_count > returned`. `columns` describes the schema in the binary frame.
+
+When the `result` is the first page of a cursor (a `sql` request with
+`cursor: true`), the meta also carries:
+
+```json
+{"id": "q1", "op": "result", "...": "...",
+ "cursor_id": "0e3f...hex", "offset": 0}
+```
+
+`cursor_id` identifies the server-side cursor holding the full result; `offset`
+is the zero-based row offset of the first row in this binary frame. Page the
+rest with `fetch`; drop the cursor with `close`. `truncated` doubles as "has
+more" (`row_count > returned + offset`). A `sql` request with `cursor: true`
+whose result exceeds `--max-cursor-rows` is **not** given a cursor — the server
+falls back to a plain truncated result and adds `"cursor": false, "reason":
+"too_large"` so the client does not retry with a cursor (the rest is not
+pageable; use a narrower query or `LIMIT`).
 
 ### `write`
 
@@ -116,11 +134,42 @@ Admin ops add a `detail` object, e.g. `{"registered": "lineitem"}`,
 ### `sql`
 
 ```json
-{"id": "...", "op": "sql", "sql": "<statement>", "max_rows": 200000}
+{"id": "...", "op": "sql", "sql": "<statement>", "max_rows": 200000,
+ "cursor": true}
 ```
 `max_rows` is optional (defaults to the server's `--max-rows`); caps the rows in
-the binary result. Returns `result`+binary, `write`, or `ok` (control / DDL /
-CREATE-FROM). Failed statements return `error`.
+the binary result. `cursor` is optional (default `false`); when `true` the
+SELECT's full result is frozen as a server-side cursor (host memory) and the
+first `max_rows` rows are returned as a `result` carrying `cursor_id` + `offset`
+— page the rest with `fetch`, drop it with `close`. A result larger than
+`--max-cursor-rows` falls back to a plain truncated result (`cursor: false,
+reason: "too_large"`). `cursor` only affects SELECTs; it is ignored for
+writes/DDL (which return `write`/`ok` as usual). Returns `result`+binary,
+`write`, or `ok` (control / DDL / CREATE-FROM). Failed statements return
+`error`.
+
+### `fetch`
+
+```json
+{"id": "...", "op": "fetch", "cursor_id": "<id>", "offset": 1000,
+ "limit": 1000}
+```
+Page a cursor opened by a `sql` request with `cursor: true`. Returns a
+`result`+binary frame: `cursor_id` + `offset` (the offset of the first row in
+this frame), `row_count` = the cursor's full size, `returned` = rows in this
+slice, `truncated` = `offset + returned < row_count`. `offset` defaults to 0;
+`limit` defaults to the server's `--max-rows`. An unknown or closed `cursor_id`
+(a cursor belongs to its connection, so a different connection's id is unknown)
+returns `error` (`kind: protocol`).
+
+### `close`
+
+```json
+{"id": "...", "op": "close", "cursor_id": "<id>"}
+```
+Drop a result cursor, freeing its host-memory table. Returns `ok`. Idempotent:
+an unknown `cursor_id` (already closed, or auto-closed on a prior disconnect)
+still returns `ok`. Cursors are also auto-closed when their connection closes.
 
 ### `explain`
 
@@ -255,7 +304,27 @@ requests in flight. They run on the engine worker pool (default 1 worker;
 
 A per-connection send lock keeps each `result`'s meta+binary frames atomic, so
 a binary IPC frame is always immediately preceded by its own meta frame on the
-wire.
+wire. The same lock glues a `fetch` page's meta+binary pair.
+
+## Result cursors (paged browsing)
+
+A `sql` request with `cursor: true` runs the query once and freezes the full
+result as a server-side **cursor** — a host-memory `pyarrow.Table` (the GPU
+frame is freed once the result is copied to host). The first `max_rows` rows are
+returned as a `result` carrying `cursor_id` + `offset: 0`; the rest are paged
+with `fetch`, and the cursor is dropped with `close` (or auto-closed when the
+connection closes). A cursor's frozen snapshot is independent of the engine and
+GPU, so pages are always consistent with the first page (no row-shifting between
+pages from a concurrent write) and paging re-executes nothing on the GPU.
+
+Cursors are **per-connection**: a `cursor_id` is only valid on the connection
+that opened it; a `fetch`/`close` from another connection reads as unknown.
+Bounds: `--max-cursor-rows` (default `1_000_000`) — a larger result is not given
+a cursor (served truncated with `cursor: false, reason: "too_large"`, the rest
+not pageable); `--max-cursors-per-conn` (default `16`) — opening more raises an
+`error` (close one first). Each cursor holds its full result in host RAM for its
+lifetime, so prefer `close` when done and avoid cursors on results you only need
+the head of.
 
 ## Limitations (Phase 1)
 
@@ -281,9 +350,13 @@ wire.
 - **Local single-user.** Binds to `127.0.0.1` by default; no auth. The `sample`
   op interpolates a validated identifier into SQL; `sql`/`admin` trust the
   client (appropriate for a local console, not for exposing on a network).
-- **One binary frame per result.** No chunked streaming of huge results; rows
-  beyond `max_rows` are truncated (the true `row_count` is reported; a future
-  export/fetch op can page them).
+- **One binary frame per result page.** A `sql`/`sample`/`fetch` result is one
+  binary frame capped at `--max-rows` (or `limit`) rows; the true `row_count` is
+  reported and `truncated` flags more. A `sql` request with `cursor: true` pages
+  the rest via `fetch` (see *Result cursors*); without a cursor, rows beyond
+  `max_rows` are simply truncated. No chunked streaming of a single response as
+  multiple Arrow batches (the `frame_count` field is reserved for that future
+  option).
 
 ## Postgres wire front (`--pg-port`)
 
@@ -343,7 +416,10 @@ psql "host=127.0.0.1 port=5432 user=ryudb dbname=ryudb"
   results/params gets an error.
 - **Result rows are capped at `--pg-max-rows`** (the same cap as the
   WebSocket front); the PG protocol has no truncation signal, so the cap is
-  silent. Raise `--pg-max-rows` for full exports.
+  silent. Raise `--pg-max-rows` for full exports. The WebSocket front's
+  `cursor`/`fetch`/`close` paging ops are **not** exposed over PG (real PG
+  `DECLARE CURSOR`/`FETCH` is a follow-up); PG clients page by re-querying with
+  `LIMIT`/`OFFSET`.
 - **Parameter type inference** uses the Parse param OIDs; an unknown OID (`0`)
   renders the param as a quoted string literal and lets the engine coerce.
 - **`SELECT` without `FROM`** is not supported by the engine (a parameterized

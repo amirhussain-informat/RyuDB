@@ -141,11 +141,13 @@ ryudb-server --data ./data --host 127.0.0.1 --port 5430 --pg-port 5432
 #                RYUDB_PG_PORT / RYUDB_PG_MAX_ROWS / RYUDB_LOG_LEVEL
 ```
 
-Ops: `sql`, `explain` (structured plan tree with a `fused` badge for the
-star-join+aggregate shape), `catalog`, `table`, `sample`, `admin`
-(register/drop/rename/alter/checkpoint/snapshot/restore/clear_cache), `cancel`
-(drops pending requests), `history`. Parse errors carry a `position`; results
-cap at `--max-rows` rows (the true `row_count` is always reported). See
+Ops: `sql`, `fetch`, `close` (page a result cursor — `sql` with `cursor: true`
+freezes the full result and pages the rest), `explain` (structured plan tree
+with a `fused` badge for the star-join+aggregate shape), `catalog`, `table`,
+`sample`, `admin` (register/drop/rename/alter/checkpoint/snapshot/restore/
+clear_cache), `cancel` (drops pending requests), `history`. Parse errors carry a
+`position`; results cap at `--max-rows` rows (the true `row_count` is always
+reported; page beyond the cap with a cursor). See
 [`ryudb/server/PROTOCOL.md`](ryudb/server/PROTOCOL.md) for the full wire format
 (both fronts).
 

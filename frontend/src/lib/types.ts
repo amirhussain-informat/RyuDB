@@ -27,6 +27,19 @@ export interface SqlRequest {
   op: "sql";
   sql: string;
   max_rows?: number;
+  cursor?: boolean;
+}
+export interface FetchRequest {
+  id: RequestId;
+  op: "fetch";
+  cursor_id: string;
+  offset?: number;
+  limit?: number;
+}
+export interface CloseRequest {
+  id: RequestId;
+  op: "close";
+  cursor_id: string;
 }
 export interface ExplainRequest {
   id: RequestId;
@@ -65,6 +78,8 @@ export interface HistoryRequest {
 }
 export type Request =
   | SqlRequest
+  | FetchRequest
+  | CloseRequest
   | ExplainRequest
   | CatalogRequest
   | TableRequest
@@ -84,6 +99,15 @@ export interface ResultMeta {
   truncated: boolean;
   duration_ms: number;
   frame_count: number;
+  // Present when this result is the first page of a cursor (a `sql` request
+  // with `cursor: true`) or a `fetch` page. `truncated` doubles as "has more".
+  cursor_id?: string;
+  offset?: number;
+  // Present when a `cursor: true` request's result exceeded --max-cursor-rows
+  // and was served as a plain truncated result (no cursor; the rest is not
+  // pageable).
+  cursor?: boolean;
+  reason?: string;
 }
 export interface WriteResp {
   id: RequestId;

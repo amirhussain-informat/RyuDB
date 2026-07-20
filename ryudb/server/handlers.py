@@ -7,7 +7,11 @@ classify-fault loop shared by all ops that touch the engine or catalog.
 
 Op set (Phase 1):
   sql      run a statement (SELECT -> Arrow result; write -> rows_affected;
-           txn/snapshot/restore/CREATE-FROM -> ok)
+           txn/snapshot/restore/CREATE-FROM -> ok). With ``cursor: true`` the
+           SELECT's full result is frozen as a server-side cursor and the first
+           page is returned (the rest via ``fetch``).
+  fetch    page a result cursor (cursor_id + offset + limit -> Arrow slice)
+  close    drop a result cursor (idempotent)
   explain  structured plan tree (parse+optimize -> JSON)
   catalog  list tables + row counts + columns
   table    one table's columns/types/constraints/paths/row_count
@@ -117,6 +121,41 @@ async def _send_result(ws, rid: Any, df, max_rows: int, duration_ms: float,
     server.record_history(rid, sql, duration_ms, total, "select")
 
 
+async def _send_arrow(ws, rid: Any, table, total: int, offset: int,
+                      truncated: bool, duration_ms: float, server,
+                      cursor_id: str | None = None,
+                      cursor_fallback: bool = False) -> None:
+    """Serialize a pyarrow Table slice as a JSON ``result`` meta + one Arrow IPC
+    binary frame under the per-connection send lock. ``row_count`` is the true
+    total (the cursor's full size or the uncapped result size); ``returned`` is
+    the rows in ``table`` (the slice actually sent). When ``cursor_id`` is set
+    the meta also carries ``cursor_id`` + ``offset`` so the client can issue
+    follow-up ``fetch`` ops. ``cursor_fallback`` marks a cursor request that
+    exceeded ``--max-cursor-rows`` and was served as a plain truncated result
+    (``cursor: false, reason: "too_large"``) so the client does not retry."""
+    meta: dict[str, Any] = {
+        "id": rid, "op": "result",
+        "columns": column_meta(table),
+        "row_count": total, "returned": table.num_rows,
+        "truncated": truncated, "duration_ms": round(duration_ms, 3),
+        "frame_count": 1,
+    }
+    if cursor_id is not None:
+        meta["cursor_id"] = cursor_id
+        meta["offset"] = offset
+    elif cursor_fallback:
+        meta["cursor"] = False
+        meta["reason"] = "too_large"
+    lock = getattr(ws, "_ryudb_send_lock", None)
+    if lock is not None:
+        async with lock:
+            await ws.send(dumps_json(meta))
+            await ws.send(table_to_ipc(table))
+    else:
+        await ws.send(dumps_json(meta))
+        await ws.send(table_to_ipc(table))
+
+
 # --------------------------------------------------------------------------- #
 # dispatch
 # --------------------------------------------------------------------------- #
@@ -127,6 +166,10 @@ async def handle_request(req: dict[str, Any], ws, server) -> None:
     try:
         if op == "sql":
             await _op_sql(req, ws, server)
+        elif op == "fetch":
+            await _op_fetch(req, ws, server)
+        elif op == "close":
+            await _op_close(req, ws, server)
         elif op == "explain":
             await _op_explain(req, ws, server)
         elif op == "catalog":
@@ -162,6 +205,7 @@ async def _op_sql(req, ws, server) -> None:
     max_rows = req.get("max_rows", server.max_rows)
     if not isinstance(max_rows, int) or max_rows <= 0:
         raise ProtocolError("max_rows must be a positive int")
+    want_cursor = bool(req.get("cursor", False))
     # Route through server.run_sql so the connection's transaction is loaded as
     # the engine's current txn for this call (per-connection MVCC isolation).
     def run():
@@ -171,7 +215,27 @@ async def _op_sql(req, ws, server) -> None:
         server.record_history(rid, sql, 0.0, 0, "cancelled")
         return
     if isinstance(result, (cudf.DataFrame, pd.DataFrame)):
-        await _send_result(ws, rid, result, max_rows, dur, sql, server)
+        if want_cursor:
+            # Freeze the full result as a host-memory pa.Table and register a
+            # cursor; the first page (max_rows rows) is sent now, the rest via
+            # ``fetch``. The GPU frame is freed once df_to_arrow copies to host.
+            full = df_to_arrow(result)
+            total = full.num_rows
+            if total > server.max_cursor_rows:
+                # Too large to hold as a cursor — serve as a plain truncated
+                # result and tell the client not to retry with a cursor.
+                page = full.slice(0, max_rows)
+                await _send_arrow(ws, rid, page, total, 0, total > page.num_rows,
+                                  dur, server, cursor_fallback=True)
+                server.record_history(rid, sql, dur, total, "select")
+                return
+            cursor_id = server.open_cursor(ws, full, sql)
+            page = full.slice(0, max_rows)
+            await _send_arrow(ws, rid, page, total, 0, total > page.num_rows,
+                              dur, server, cursor_id=cursor_id)
+            server.record_history(rid, sql, dur, total, "select")
+        else:
+            await _send_result(ws, rid, result, max_rows, dur, sql, server)
     elif isinstance(result, int):
         await _send_json(ws, {"id": rid, "op": "write", "rows_affected": result,
                               "duration_ms": round(dur, 3)})
@@ -183,6 +247,40 @@ async def _op_sql(req, ws, server) -> None:
         await _send_json(ws, {"id": rid, "op": "ok", "detail": str(result),
                               "duration_ms": round(dur, 3)})
         server.record_history(rid, sql, dur, 0, "other")
+
+
+async def _op_fetch(req, ws, server) -> None:
+    """Page a result cursor opened by a ``sql`` request with ``cursor: true``.
+    Slices the frozen host-memory pa.Table at [offset, offset+limit) and sends it
+    as a ``result`` meta (with ``cursor_id``/``offset``) + binary frame."""
+    rid = req.get("id")
+    cursor_id = _require(req, "cursor_id", str)
+    offset = req.get("offset", 0)
+    if not isinstance(offset, int) or offset < 0:
+        raise ProtocolError("fetch 'offset' must be a non-negative int")
+    limit = req.get("limit", server.max_rows)
+    if not isinstance(limit, int) or limit <= 0:
+        raise ProtocolError("fetch 'limit' must be a positive int")
+    cur = server.get_cursor(ws, cursor_id)
+    if cur is None:
+        raise ProtocolError(f"unknown cursor {cursor_id!r}")
+    total = cur["total"]
+    end = min(offset + limit, total)
+    page = cur["table"].slice(offset, end - offset) if end > offset else \
+        cur["table"].slice(offset, 0)
+    await _send_arrow(ws, rid, page, total, offset, end < total, 0.0, server,
+                      cursor_id=cursor_id)
+    server.record_history(rid, cur["sql"], 0.0, page.num_rows, "fetch")
+
+
+async def _op_close(req, ws, server) -> None:
+    """Drop a result cursor. Idempotent: an unknown cursor id still returns
+    ``ok`` (it may have been closed already, or auto-closed on a prior
+    disconnect)."""
+    rid = req.get("id")
+    cursor_id = _require(req, "cursor_id", str)
+    server.close_cursor(ws, cursor_id)
+    await _send_json(ws, {"id": rid, "op": "ok"})
 
 
 async def _op_explain(req, ws, server) -> None:

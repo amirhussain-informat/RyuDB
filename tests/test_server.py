@@ -243,6 +243,225 @@ def test_select_truncation_caps_rows(srv):
     assert _ipc_table(bins).shape[0] == 100
 
 
+# --------------------------------------------------------------------------- #
+# result cursors (paged browsing)
+# --------------------------------------------------------------------------- #
+
+_CURSOR_SQL = "SELECT l_orderkey, l_quantity, l_returnflag FROM lineitem"
+
+
+def _sorted_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Sort by all columns for order-insensitive comparison (mirrors the
+    conftest assert_same idea)."""
+    return df.sort_values(list(df.columns)).reset_index(drop=True)
+
+
+def test_sql_cursor_first_page(srv):
+    """sql with cursor:true freezes the full result; the first page carries a
+    cursor_id + offset:0 and is capped at max_rows."""
+    port, server, ref, _ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta, bins = await _call(
+                ws, {"id": "q", "op": "sql", "sql": _CURSOR_SQL,
+                     "max_rows": 100, "cursor": True}, want_bin=True)
+        return meta, bins
+    meta, bins = _run(client())
+    assert meta["op"] == "result"
+    assert "cursor_id" in meta and isinstance(meta["cursor_id"], str)
+    assert meta["offset"] == 0
+    assert meta["row_count"] >= 500
+    assert meta["returned"] == 100
+    assert meta["truncated"] is True
+    assert _ipc_table(bins).shape[0] == 100
+
+
+def test_fetch_pages_reassemble(srv):
+    """First page + fetch pages reassemble to the full result, matching the
+    in-process engine."""
+    port, server, ref, _ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            first, bins0 = await _call(
+                ws, {"id": "q", "op": "sql", "sql": _CURSOR_SQL,
+                     "max_rows": 100, "cursor": True}, want_bin=True)
+            cid = first["cursor_id"]
+            frames = [ipc.open_stream(bins0[0]).read_all()]
+            off = first["returned"]
+            total = first["row_count"]
+            i = 0
+            while off < total:
+                m, b = await _call(
+                    ws, {"id": f"f{i}", "op": "fetch", "cursor_id": cid,
+                         "offset": off, "limit": 100}, want_bin=True)
+                assert m["op"] == "result" and m["cursor_id"] == cid
+                assert m["offset"] == off
+                frames.append(ipc.open_stream(b[0]).read_all())
+                off += m["returned"]
+                i += 1
+                assert m["returned"] > 0  # progress
+            assert off == total
+            return frames
+    frames = _run(client())
+    import pyarrow as pa
+    full = pa.concat_tables(frames).to_pandas()
+    exp = ref.sql(_CURSOR_SQL).to_pandas()
+    pd.testing.assert_frame_equal(_sorted_df(full), _sorted_df(exp), check_like=True)
+
+
+def test_fetch_offset_window(srv):
+    """fetch offset 250 limit 50 returns exactly rows [250:300] of the cursor."""
+    port, server, ref, _ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            first, bins0 = await _call(
+                ws, {"id": "q", "op": "sql", "sql": _CURSOR_SQL,
+                     "max_rows": 500, "cursor": True}, want_bin=True)
+            cid = first["cursor_id"]
+            m, b = await _call(
+                ws, {"id": "f", "op": "fetch", "cursor_id": cid,
+                     "offset": 250, "limit": 50}, want_bin=True)
+            full = ipc.open_stream(bins0[0]).read_all()
+            window = ipc.open_stream(b[0]).read_all()
+        return first, m, full, window
+    first, m, full, window = _run(client())
+    assert first["row_count"] >= 500
+    assert m["returned"] == 50
+    assert m["offset"] == 250
+    pd.testing.assert_frame_equal(
+        window.to_pandas().reset_index(drop=True),
+        full.slice(250, 50).to_pandas().reset_index(drop=True),
+        check_like=True,
+    )
+
+
+def test_cursor_per_connection_isolation(srv):
+    """A cursor opened on conn A is unknown on conn B (cursors are
+    per-connection)."""
+    port, server, ref, _ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as a, \
+                   websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as b:
+            first, _ = await _call(
+                a, {"id": "q", "op": "sql", "sql": _CURSOR_SQL,
+                    "max_rows": 50, "cursor": True}, want_bin=True)
+            err, _ = await _call(
+                b, {"id": "f", "op": "fetch", "cursor_id": first["cursor_id"],
+                    "offset": 0, "limit": 10}, want_bin=False)
+        return first, err
+    first, err = _run(client())
+    assert first["op"] == "result" and "cursor_id" in first
+    assert err["op"] == "error"
+    assert err["kind"] == "protocol"
+    assert "unknown cursor" in err["message"]
+
+
+def test_close_cursor_then_fetch_errors(srv):
+    port, server, ref, _ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            first, _ = await _call(
+                ws, {"id": "q", "op": "sql", "sql": _CURSOR_SQL,
+                     "max_rows": 50, "cursor": True}, want_bin=True)
+            cid = first["cursor_id"]
+            ok, _ = await _call(ws, {"id": "c", "op": "close", "cursor_id": cid})
+            err, _ = await _call(
+                ws, {"id": "f", "op": "fetch", "cursor_id": cid,
+                     "offset": 0, "limit": 10}, want_bin=False)
+        return ok, err
+    ok, err = _run(client())
+    assert ok["op"] == "ok"
+    assert err["op"] == "error" and "unknown cursor" in err["message"]
+
+
+def test_close_unknown_cursor_is_ok(srv):
+    """close is idempotent: an unknown cursor id still returns ok."""
+    port, *_ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            ok, _ = await _call(ws, {"id": "c", "op": "close",
+                                     "cursor_id": "never-existed"})
+        return ok
+    ok = _run(client())
+    assert ok["op"] == "ok"
+
+
+def test_fetch_unknown_cursor_errors(srv):
+    port, *_ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            err, _ = await _call(
+                ws, {"id": "f", "op": "fetch", "cursor_id": "nope",
+                     "offset": 0, "limit": 10}, want_bin=False)
+        return err
+    err = _run(client())
+    assert err["op"] == "error" and "unknown cursor" in err["message"]
+
+
+def test_non_cursor_sql_unchanged(srv):
+    """sql without cursor has no cursor_id and behaves exactly as before."""
+    port, server, ref, _ = srv
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta, bins = await _call(
+                ws, {"id": "q", "op": "sql", "sql": "SELECT * FROM lineitem"},
+                want_bin=True)
+        return meta, bins
+    meta, bins = _run(client())
+    assert meta["op"] == "result"
+    assert "cursor_id" not in meta
+    assert "offset" not in meta
+    assert meta["returned"] == 100
+    assert meta["truncated"] is True
+    assert _ipc_table(bins).shape[0] == 100
+
+
+def test_cursor_max_per_conn(srv):
+    """Opening more than max_cursors_per_conn cursors on one connection errors."""
+    port, server, ref, _ = srv
+    limit = server.max_cursors_per_conn
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            ids = []
+            for i in range(limit):
+                m, _ = await _call(
+                    ws, {"id": f"o{i}", "op": "sql", "sql": _CURSOR_SQL,
+                         "max_rows": 1, "cursor": True}, want_bin=True)
+                assert m["op"] == "result"
+                ids.append(m["cursor_id"])
+            err, _ = await _call(
+                ws, {"id": "oX", "op": "sql", "sql": _CURSOR_SQL,
+                     "max_rows": 1, "cursor": True}, want_bin=False)
+        return ids, err
+    ids, err = _run(client())
+    assert len(ids) == limit and len(set(ids)) == limit
+    assert err["op"] == "error" and "too many open cursors" in err["message"]
+
+
+def test_cursor_too_large_falls_back(srv):
+    """A cursor request whose result exceeds max_cursor_rows is served as a
+    plain truncated result with cursor:false, reason:too_large (no cursor)."""
+    port, server, ref, _ = srv
+    server.max_cursor_rows = 50  # lineitem has 500 rows -> exceeds the cap
+    try:
+        async def client():
+            async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+                meta, bins = await _call(
+                    ws, {"id": "q", "op": "sql", "sql": "SELECT * FROM lineitem",
+                         "max_rows": 100, "cursor": True}, want_bin=True)
+            return meta, bins
+        meta, bins = _run(client())
+    finally:
+        server.max_cursor_rows = 1_000_000
+    assert meta["op"] == "result"
+    assert "cursor_id" not in meta
+    assert meta.get("cursor") is False
+    assert meta.get("reason") == "too_large"
+    assert meta["row_count"] >= 500
+    assert meta["returned"] == 100
+    assert meta["truncated"] is True
+
+
 def test_insert_write_then_count(srv, tmp_path):
     """INSERT over the wire returns rows_affected, and the row lands. Uses a
     throwaway table registered on the fly so the shared ``lineitem`` row count

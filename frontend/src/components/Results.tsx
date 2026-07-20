@@ -8,6 +8,9 @@ interface Props {
   table: Table | null;
   onDownload: (format: "csv" | "arrow") => void;
   downloading: boolean;
+  onLoadMore: () => void;
+  hasMore: boolean;
+  loadingMore: boolean;
 }
 
 const ROW_HEIGHT = 24;
@@ -27,9 +30,12 @@ function formatCell(v: unknown): string {
 }
 
 /** Renders an Arrow Table as a header + a virtualized row grid. The server caps
- * rows at `max_rows`; `meta.row_count` is the true total and `meta.truncated`
- * flags whether the displayed `meta.returned` rows are a subset. */
-export default function Results({ meta, table, onDownload, downloading }: Props) {
+ * the first page at `max_rows`; `meta.row_count` is the true total. When
+ * `hasMore` is set the result is cursor-backed and a "Load more" button pages
+ * the next slice (growing `meta.returned`); otherwise `meta.truncated` marks a
+ * non-pageable truncated result. */
+export default function Results({ meta, table, onDownload, downloading,
+                                  onLoadMore, hasMore, loadingMore }: Props) {
   const columns = meta.columns;
   const colArrays = useMemo(() => {
     if (!table) return [];
@@ -50,10 +56,15 @@ export default function Results({ meta, table, onDownload, downloading }: Props)
     <div className="results">
       <div className="results-meta">
         <span>{meta.row_count} row{meta.row_count === 1 ? "" : "s"}</span>
-        {meta.truncated && (
+        {(hasMore || meta.truncated) && (
           <span className="truncated">
-            (showing first {meta.returned} of {meta.row_count})
+            (showing {meta.returned} of {meta.row_count})
           </span>
+        )}
+        {hasMore && (
+          <button className="dl" disabled={loadingMore} onClick={onLoadMore}>
+            {loadingMore ? "Loading…" : "Load more"}
+          </button>
         )}
         <span className="dur">{meta.duration_ms.toFixed(1)} ms</span>
         <span className="dl-group">
