@@ -703,6 +703,13 @@ export default function App() {
     await fetchAdmin("rename", { old: oldName, new: newName });
     refreshAfterDdl();
   };
+  // Alter a table's constraints (set/clear PK, toggle NOT NULL, add UNIQUE) via
+  // the `admin alter` op; the engine enforces PK/UNIQUE on INSERT. The table
+  // detail panel re-fetches the `table` op itself; this refreshes the Catalog
+  // sidebar (constraints don't change the column list, but row-count / metadata
+  // stays honest after DDL).
+  const handleAlter = (args: Record<string, unknown>) =>
+    fetchAdmin("alter", args);
   // Client-side pre-check cap for browser uploads (the server enforces its
   // own --max-upload-bytes; this matches the default and avoids a 1009 close
   // for obviously-too-large files). The upload op writes the parquet to
@@ -1111,6 +1118,7 @@ export default function App() {
         name={detailName}
         fetchTable={fetchTable}
         onRename={handleRename}
+        onAlter={handleAlter}
         onClose={() => setDetailName(null)}
       />
       <PinWidgetModal

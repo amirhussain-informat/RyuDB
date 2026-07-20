@@ -216,8 +216,27 @@ button.primary:hover:not(:disabled) { background: #6dd1ff; }
 .detail-cols th { text-align: left; color: var(--fg-dim); font-weight: 400; padding: 2px 8px 2px 0; }
 .detail-cols td { padding: 2px 8px 2px 0; font-family: monospace; }
 .detail-cols td.col-type { color: var(--fg-dim); }
-.detail-constraints { font-size: 12px; display: flex; flex-direction: column; gap: 3px; }
+.detail-constraints { font-size: 12px; display: flex; flex-direction: column; gap: 6px; }
 .detail-constraints label { color: var(--fg-dim); display: inline-block; min-width: 92px; }
+.detail-constraints .con-row { display: flex; align-items: center; gap: 8px; }
+.detail-constraints .con-val { font-family: monospace; color: var(--fg); flex: 1; }
+.detail-constraints .con-pick {
+  display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center;
+  padding-left: 100px;
+}
+.detail-constraints .con-chip {
+  display: inline-flex; align-items: center; gap: 4px; min-width: 0;
+  padding: 1px 6px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg); font-family: monospace; font-size: 11px; color: var(--fg);
+  max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.detail-constraints .con-chip input { margin: 0; }
+.detail-constraints .con-act {
+  padding: 1px 8px; font-size: 11px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--fg); border-radius: 3px; cursor: pointer;
+}
+.detail-constraints .con-act:disabled { opacity: 0.4; cursor: default; }
+.detail-constraints .con-hint { color: var(--fg-dim); font-size: 11px; opacity: 0.8; }
 .detail-paths { list-style: none; margin: 0; padding: 0; font-family: monospace; font-size: 11px; max-height: 120px; overflow-y: auto; }
 .detail-paths li { padding: 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--fg-dim); }
 .detail-ddl {
