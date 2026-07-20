@@ -676,11 +676,67 @@ MULTI_KEY_FACT_INT_WHERE_DIM = """
      ORDER BY l_orderkey, l_suppkey
 """
 
-# Group keys spanning fact + a dim (full Q3 shape) -> defer (PR #37).
-MULTI_KEY_SPAN_DEFERS = """
+# Group keys spanning fact + a dim (full Q3 shape). PR #37 composes them: the
+# host factorises the fact key(s) and the dim key(s) into two stride-combined
+# codes, the kernel forms g = fcode*n_dim_combos + dim_part, and the read-out
+# two-level decodes the fact-part (g // n_dim_combos) and dim-part
+# (g % n_dim_combos). 1-stage chain: fact key on lineitem + dim key on orders.
+MULTI_KEY_SPAN_FACT_DIM = """
     SELECT l_orderkey, o_shippriority, sum(l_quantity) AS sq
       FROM lineitem
       JOIN orders ON l_orderkey = o_orderkey
+     GROUP BY l_orderkey, o_shippriority
+     ORDER BY l_orderkey, o_shippriority
+"""
+
+# Spanning + a dim predicate that pares the joined rows (the WHERE folds into
+# the dim HT build, so the fused path still fires). Same spanning shape, fewer
+# groups after the o_custkey < 500 filter on the orders dim.
+MULTI_KEY_SPAN_FACT_DIM_WHERE = """
+    SELECT l_orderkey, o_shippriority, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders ON l_orderkey = o_orderkey
+     WHERE o_custkey < 500
+     GROUP BY l_orderkey, o_shippriority
+     ORDER BY l_orderkey, o_shippriority
+"""
+
+# Multi-stage spanning: fact key on lineitem + dim key on the TERMINUS dim
+# (customer) of a 2-stage chain (lineitem -> orders -> customer). The dim-part
+# code is the chain tail (the last dim's payload); the fact-part code is bound
+# as a fact col. A STRING dim key exercises the dim-side factorise on a
+# non-numeric column (c_mktsegment), the Q3 c_mktsegment shape.
+MULTI_KEY_SPAN_FACT_TERM_STRING = """
+    SELECT l_orderkey, c_mktsegment, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders   ON l_orderkey = o_orderkey
+      JOIN customer ON o_custkey = c_custkey
+     GROUP BY l_orderkey, c_mktsegment
+     ORDER BY l_orderkey, c_mktsegment
+"""
+
+# Multi-stage spanning + a dim predicate on the MIDDLE dim (orders) -- a fact
+# row whose orders row is filtered out misses -> inner drop. The fused path
+# filters the orders HT pre-build and still fires.
+MULTI_KEY_SPAN_FACT_TERM_WHERE_MIDDLE = """
+    SELECT l_orderkey, c_mktsegment, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders   ON l_orderkey = o_orderkey
+      JOIN customer ON o_custkey = c_custkey
+     WHERE o_custkey < 1000
+     GROUP BY l_orderkey, c_mktsegment
+     ORDER BY l_orderkey, c_mktsegment
+"""
+
+# Spanning where the dim key lives on a MIDDLE dim (orders) of a 2-stage chain
+# -> the chain only carries the LAST dim's payload, so a middle-dim group key is
+# unreachable -> defer to cuDF (the path requires dim keys on the terminus when
+# spanning). The fallback matches DuckDB.
+MULTI_KEY_SPAN_MIDDLE_DIM_DEFERS = """
+    SELECT l_orderkey, o_shippriority, sum(l_quantity) AS sq, count(*) AS n
+      FROM lineitem
+      JOIN orders   ON l_orderkey = o_orderkey
+      JOIN customer ON o_custkey = c_custkey
      GROUP BY l_orderkey, o_shippriority
      ORDER BY l_orderkey, o_shippriority
 """
@@ -712,16 +768,36 @@ def test_join_multi_key_fires_and_matches(hcj_engine, hcj_duck, sql):
     _match(hcj_engine.sql(sql), hcj_duck.execute(sql).fetchdf())
 
 
-def test_join_multi_key_span_defers_and_matches(hcj_engine, hcj_duck):
-    """Group keys spanning fact + a dim (the full Q3 shape) defer to cuDF (PR #37
-    composes them); the fallback matches DuckDB."""
+@pytest.mark.parametrize("sql", [MULTI_KEY_SPAN_FACT_DIM,
+                                 MULTI_KEY_SPAN_FACT_DIM_WHERE,
+                                 MULTI_KEY_SPAN_FACT_TERM_STRING,
+                                 MULTI_KEY_SPAN_FACT_TERM_WHERE_MIDDLE])
+def test_join_multi_key_span_fires_and_matches(hcj_engine, hcj_duck, sql):
+    """Group keys spanning fact + a dim (the full Q3 shape) fire the fused join
+    path: the host factorises the fact key(s) and the dim key(s) into two
+    stride-combined codes, the kernel forms g = fcode*n_dim_combos + dim_part,
+    and the read-out two-level decodes each side -- and matches DuckDB. Covers
+    the 1-stage and multi-stage (terminus-dim, incl. a string dim key) shapes,
+    with and without a folded dim predicate."""
     if not CPP:
         pytest.skip("C++ fused kernel not built")
     assert fused.fused_join_aggregate(
-        _agg_node(MULTI_KEY_SPAN_DEFERS, hcj_engine), hcj_engine) is None, (
-        "a fact+dim multi-key group-from-join should defer to cuDF (PR #37)")
-    _match(hcj_engine.sql(MULTI_KEY_SPAN_DEFERS),
-           hcj_duck.execute(MULTI_KEY_SPAN_DEFERS).fetchdf())
+        _agg_node(sql, hcj_engine), hcj_engine) is not None, (
+        f"a fact+dim multi-key group-from-join should hit the fused join path: {sql!r}")
+    _match(hcj_engine.sql(sql), hcj_duck.execute(sql).fetchdf())
+
+
+def test_join_multi_key_span_middle_dim_defers_and_matches(hcj_engine, hcj_duck):
+    """Spanning with the dim key on a MIDDLE dim (not the chain terminus) defers
+    to cuDF -- the chain only carries the last dim's payload, so a middle-dim
+    group key is unreachable. The cuDF fallback matches DuckDB."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    assert fused.fused_join_aggregate(
+        _agg_node(MULTI_KEY_SPAN_MIDDLE_DIM_DEFERS, hcj_engine), hcj_engine) is None, (
+        "a fact+middle-dim multi-key group-from-join should defer to cuDF")
+    _match(hcj_engine.sql(MULTI_KEY_SPAN_MIDDLE_DIM_DEFERS),
+           hcj_duck.execute(MULTI_KEY_SPAN_MIDDLE_DIM_DEFERS).fetchdf())
 
 
 def test_join_multi_key_left_defers_and_matches(hcj_engine, hcj_duck):
@@ -754,3 +830,24 @@ def test_join_multi_key_dispatch_fires(hcj_engine, hcj_duck, monkeypatch):
     got = hcj_engine.sql(MULTI_KEY_DIM_WHERE_FACT)
     assert calls["n"] == 1, "a multi-key group-from-join should dispatch once"
     _match(got, hcj_duck.execute(MULTI_KEY_DIM_WHERE_FACT).fetchdf())
+
+
+def test_join_multi_key_span_dispatch_fires(hcj_engine, hcj_duck, monkeypatch):
+    """engine.sql dispatches a spanning (fact+dim) multi-key group-from-join to
+    the fused path (not cuDF): patch ryudb.exec.executor.fused_join_aggregate
+    with a counter, assert one call, and match DuckDB (executor-module-patching
+    gotcha)."""
+    if not CPP:
+        pytest.skip("C++ fused kernel not built")
+    calls = {"n": 0}
+    orig = ex_mod.fused_join_aggregate
+
+    def wrap(node, engine, _o=orig):
+        r = _o(node, engine)
+        calls["n"] += 1
+        return r
+
+    monkeypatch.setattr(ex_mod, "fused_join_aggregate", wrap)
+    got = hcj_engine.sql(MULTI_KEY_SPAN_FACT_DIM)
+    assert calls["n"] == 1, "a spanning multi-key group-from-join should dispatch once"
+    _match(got, hcj_duck.execute(MULTI_KEY_SPAN_FACT_DIM).fetchdf())
