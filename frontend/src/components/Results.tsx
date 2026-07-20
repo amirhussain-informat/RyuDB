@@ -101,16 +101,20 @@ export default function Results({ meta, table, onDownload, downloading,
   const [copyAllState, setCopyAllState] = useState<"idle" | "ok" | "err">("idle");
   // Per-column pixel widths; defaults to DEF_COL_W and resets per result.
   const [colWidths, setColWidths] = useState<number[]>([]);
+  // Display order of the columns as a permutation of original column indices
+  // (drag a header to reorder). Resets to identity per result.
+  const [colOrder, setColOrder] = useState<number[]>([]);
 
-  // Reset sort + filter + column widths whenever a new result lands (new
-  // columns identity). A different column set would leave colWidths mis-sized,
-  // so it is reset here too.
+  // Reset sort + filter + column widths + order whenever a new result lands
+  // (new columns identity). A different column set would leave colWidths
+  // mis-sized and colOrder pointing at stale indices, so both reset here.
   useEffect(() => {
     setSortCol(null);
     setSortDir(null);
     setFilters([]);
     setShowFilters(false);
     setColWidths(columns.map(() => DEF_COL_W));
+    setColOrder(columns.map((_, i) => i));
   }, [columns]);
 
   // `view` is the list of source-row indices after filtering + sorting; the
@@ -158,12 +162,13 @@ export default function Results({ meta, table, onDownload, downloading,
   };
   const copyAll = () => {
     if (!table) return;
-    const unfiltered = view.length === meta.returned && !filters.some((f) => f && f.trim()) && sortCol == null;
+    const unfiltered =
+      view.length === meta.returned && !filters.some((f) => f && f.trim()) && sortCol == null && !reordered;
     const tsv = unfiltered
       ? tableToTSV(table.slice(0, meta.returned))
       : viewToTSV(
-          columns.map((c) => c.name),
-          colVecs.map((v) => (v ?? { get: () => null })),
+          order.map((origCi) => columns[origCi].name),
+          order.map((origCi) => colVecs[origCi] ?? { get: () => null }),
           view,
         );
     void copyText(tsv).then((ok) => {
@@ -195,6 +200,11 @@ export default function Results({ meta, table, onDownload, downloading,
     colWidths.length === columns.length ? colWidths : columns.map(() => DEF_COL_W);
   const gridTemplate = widths.map((w) => `${w}px`).join(" ");
   const gridWidth = widths.reduce((a, b) => a + b, 0);
+  // `order[dispIdx] = origCi` — the columns render in this order. Falls back to
+  // identity until the reset effect catches up. `reordered` flags whether the
+  // display order differs from the original (drives Copy to use the remapped view).
+  const order = colOrder.length === columns.length ? colOrder : columns.map((_, i) => i);
+  const reordered = order.some((o, i) => o !== i);
 
   // Column resize: a drag started on a header border updates colWidths[ci].
   // The window listeners are installed once (mounted) and are no-ops unless a
@@ -230,17 +240,34 @@ export default function Results({ meta, table, onDownload, downloading,
     dragRef.current = { ci, startX: e.clientX, startW: widths[ci], wsLen: widths.length };
     document.body.style.cursor = "col-resize";
   };
+
+  // Column reorder via HTML5 drag on a header cell. dragstart records the
+  // source display position; drop on another header moves that column. Sort +
+  // filter keep operating on ORIGINAL column indices, so reorder is purely a
+  // display-layer remap — only the render order (and Copy) change.
+  const dragFrom = useRef<number | null>(null);
+  const onDropCol = (toDisp: number) => {
+    const from = dragFrom.current;
+    dragFrom.current = null;
+    if (from == null || from === toDisp) return;
+    setColOrder(() => {
+      const next = order.slice();
+      const [moved] = next.splice(from, 1);
+      next.splice(toDisp, 0, moved);
+      return next;
+    });
+  };
   const Row = ({ index, style }: { index: number; style: React.CSSProperties }) => {
     const r = view[index];
     return (
       <div className="grid-row" style={{ ...style, gridTemplateColumns: gridTemplate }}>
-        {colArrays.map((_, ci) => {
-          const key = `${r}:${ci}`;
-          const val = formatCell(cellVal(ci, r));
+        {order.map((origCi) => {
+          const key = `${r}:${origCi}`;
+          const val = formatCell(cellVal(origCi, r));
           return (
             <div
               className={"grid-cell" + (copiedKey === key ? " copied" : "")}
-              key={ci}
+              key={origCi}
               title={`${val}  (click to copy)`}
               onClick={() => copyCell(key, val)}
             >
@@ -311,21 +338,35 @@ export default function Results({ meta, table, onDownload, downloading,
       </div>
       <div className="grid-scroll">
         <div className="grid-header" style={{ gridTemplateColumns: gridTemplate, width: gridWidth }}>
-          {columns.map((c, ci) => {
-            const active = sortCol === ci;
+          {order.map((origCi, dispIdx) => {
+            const c = columns[origCi];
+            const active = sortCol === origCi;
             const arrow = active ? (sortDir === "asc" ? " ▲" : " ▼") : "";
             return (
               <div
                 className={"grid-cell grid-head" + (active ? " sorted" : "")}
                 key={c.name}
-                title={`${c.type} — click to sort, drag the right edge to resize`}
-                onClick={() => cycleSort(ci)}
+                title={`${c.type} — click to sort, drag to reorder, drag the right edge to resize`}
+                draggable
+                onDragStart={(e) => {
+                  dragFrom.current = dispIdx;
+                  e.dataTransfer.effectAllowed = "move";
+                }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  onDropCol(dispIdx);
+                }}
+                onClick={() => cycleSort(origCi)}
               >
                 <span className="col-name-h">{c.name}{arrow}</span>
                 <span className="col-type">{c.type}</span>
                 <span
                   className="col-resize"
-                  onMouseDown={(e) => startResize(ci, e)}
+                  onMouseDown={(e) => startResize(origCi, e)}
                   onClick={(e) => e.stopPropagation()}
                   title="Drag to resize"
                 />
@@ -335,23 +376,26 @@ export default function Results({ meta, table, onDownload, downloading,
         </div>
         {showFilters && table && meta.returned > 0 && (
           <div className="grid-filter" style={{ gridTemplateColumns: gridTemplate, width: gridWidth }}>
-            {columns.map((c, ci) => (
-              <input
-                key={c.name}
-                className="filter-input"
-                type="text"
-                value={filters[ci] ?? ""}
-                onChange={(e) =>
-                  setFilters((fs) => {
-                    const next = fs.slice();
-                    next[ci] = e.target.value;
-                    return next;
-                  })
-                }
-                placeholder={`filter ${c.name}`}
-                title={`Case-insensitive substring filter on ${c.name}`}
-              />
-            ))}
+            {order.map((origCi) => {
+              const c = columns[origCi];
+              return (
+                <input
+                  key={c.name}
+                  className="filter-input"
+                  type="text"
+                  value={filters[origCi] ?? ""}
+                  onChange={(e) =>
+                    setFilters((fs) => {
+                      const next = fs.slice();
+                      next[origCi] = e.target.value;
+                      return next;
+                    })
+                  }
+                  placeholder={`filter ${c.name}`}
+                  title={`Case-insensitive substring filter on ${c.name}`}
+                />
+              );
+            })}
           </div>
         )}
         {table && meta.returned > 0 ? (
