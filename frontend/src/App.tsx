@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { tableToIPC, Table } from "apache-arrow";
 import { useServer } from "./hooks/useServer";
 import { useWorksheets } from "./hooks/useWorksheets";
@@ -23,6 +23,8 @@ import History from "./components/History";
 import Dashboards from "./components/Dashboards";
 import DashboardModal from "./components/DashboardModal";
 import PinWidgetModal from "./components/PinWidgetModal";
+import AskModal from "./components/AskModal";
+import type { NlTable } from "./lib/nlSql";
 import { tableToCSV, tableToJSON, downloadBlob } from "./lib/csv";
 import { serializeBundle, serializeOne, parseImportFile, worksheetFileName } from "./lib/worksheetTransfer";
 import type {
@@ -148,6 +150,7 @@ export default function App() {
   const [sidebar, setSidebar] = useState<"catalog" | "history" | "dashboards">("catalog");
   const [dashboardOpenId, setDashboardOpenId] = useState<string | null>(null);
   const [pinSpec, setPinSpec] = useState<ChartSpec | null>(null);
+  const [askOpen, setAskOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -303,6 +306,9 @@ export default function App() {
       } else if (mod && e.shiftKey && (e.key === "h" || e.key === "H")) {
         e.preventDefault();
         setHistoryOpen(true);
+      } else if (mod && (e.key === "i" || e.key === "I")) {
+        e.preventDefault();
+        setAskOpen(true);
       } else if (e.key === "?" && !isTypingTarget(e.target)) {
         e.preventDefault();
         setShortcutsOpen(true);
@@ -314,6 +320,7 @@ export default function App() {
         setProfileName(null);
         setPinSpec(null);
         setDashboardOpenId(null);
+        setAskOpen(false);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -724,6 +731,16 @@ export default function App() {
   };
 
   const connected = status === "open";
+
+  // The autocomplete schema (Map<table, typed columns>) as the NlTable[] the
+  // NL->SQL recognizer consumes. Rebuilt when the schema changes (connect/DDL).
+  const nlTables: NlTable[] = useMemo(
+    () => Array.from(schema.entries()).map(([name, cols]) => ({
+      name,
+      columns: cols.map((c) => ({ name: c.name, type: c.type })),
+    })),
+    [schema],
+  );
   const activeMeta = result?.meta as ResultMeta | undefined;
   const hasMore =
     !!cursorId &&
@@ -795,6 +812,10 @@ export default function App() {
     { id: "theme", label: "Toggle dark / light theme", group: "View", run: toggleTheme },
     { id: "sidebar-catalog", label: "Open Catalog sidebar", group: "View", disabled: sidebar === "catalog", run: () => setSidebar("catalog") },
     { id: "load-data", label: "Load data from parquet path", group: "Data", disabled: status !== "open", run: () => setLoadOpen(true) },
+    {
+      id: "ask", label: "Ask (NL → SQL)", hint: "Ctrl/Cmd+I", group: "Query",
+      disabled: !connected || nlTables.length === 0, run: () => setAskOpen(true),
+    },
     { id: "sidebar-history", label: "Open History sidebar", group: "View", disabled: sidebar === "history", run: () => setSidebar("history") },
     { id: "shortcuts", label: "Show keyboard shortcuts", hint: "?", group: "Help", run: () => setShortcutsOpen(true) },
   ];
@@ -1015,6 +1036,12 @@ export default function App() {
         fetchWidget={fetchWidget}
         onClose={() => setDashboardOpenId(null)}
         onRemoveWidget={handleRemoveWidget}
+      />
+      <AskModal
+        open={askOpen}
+        tables={nlTables}
+        onClose={() => setAskOpen(false)}
+        onAccept={(sql) => active && updateSql(active.id, sql)}
       />
     </div>
   );

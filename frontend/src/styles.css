@@ -508,3 +508,19 @@ button.dl { padding: 2px 8px; font-size: 11px; }
   margin: 4px; font-size: 11px; white-space: pre-wrap; word-break: break-word;
   align-self: center; width: 100%;
 }
+
+/* NL -> SQL assistant */
+.ask-modal { width: min(620px, 92vw); }
+.ask-input { width: 100%; box-sizing: border-box; }
+.ask-result { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.ask-template { color: var(--fg-dim); font-size: 11px; }
+.ask-template code {
+  font-family: monospace; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 3px; padding: 0 4px;
+}
+.ask-sql {
+  margin: 0; background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 8px 10px; font-family: monospace; font-size: 12px; white-space: pre-wrap;
+  word-break: break-word;
+}
+.ask-empty { margin-top: 8px; }
