@@ -82,8 +82,10 @@ parse error with position — the same wire path the browser uses.
   `src/monaco.ts`), so the worksheet works fully offline — no CDN fetch at
   runtime. `@monaco-editor/react`'s loader is configured with the local
   instance, which short-circuits its default CDN path.
-- The server is single-logical-session (transaction state is shared across
-  connections). `Cancel` drops pending requests and raises `CancelledByUser` at
+- The server gives each connection its own transaction (per-connection MVCC
+  isolation): `BEGIN` captures a frozen snapshot, so a commit on another
+  connection is invisible until this one `COMMIT`s; a disconnect rolls back the
+  open txn. `Cancel` drops pending requests and raises `CancelledByUser` at
   the next plan-node boundary of a running request — a single long cuDF call
   (a big groupby, a cold read) is not interruptible mid-call. See the server's
   `PROTOCOL.md` limits.

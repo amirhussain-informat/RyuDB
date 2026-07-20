@@ -162,7 +162,11 @@ async def _op_sql(req, ws, server) -> None:
     max_rows = req.get("max_rows", server.max_rows)
     if not isinstance(max_rows, int) or max_rows <= 0:
         raise ProtocolError("max_rows must be a positive int")
-    ok, result, dur = await _cancellable(server, ws, rid, server.engine.sql, sql)
+    # Route through server.run_sql so the connection's transaction is loaded as
+    # the engine's current txn for this call (per-connection MVCC isolation).
+    def run():
+        return server.run_sql(ws, sql)
+    ok, result, dur = await _cancellable(server, ws, rid, run)
     if not ok:
         server.record_history(rid, sql, 0.0, 0, "cancelled")
         return
@@ -249,7 +253,11 @@ async def _op_sample(req, ws, server) -> None:
         return
     sql = f"SELECT * FROM {name} LIMIT {n}"
     max_rows = server.max_rows
-    ok, result, dur = await _cancellable(server, ws, rid, server.engine.sql, sql)
+    # A sample is a read; route through run_sql so it respects an open txn on
+    # this connection (sees the txn's snapshot + read-your-writes buffer).
+    def run():
+        return server.run_sql(ws, sql)
+    ok, result, dur = await _cancellable(server, ws, rid, run)
     if not ok:
         return
     if isinstance(result, (cudf.DataFrame, pd.DataFrame)):
@@ -291,11 +299,25 @@ def _run_admin(server, action: str, args: dict[str, Any]) -> dict[str, Any]:
     if action == "alter":
         return _run_alter(cat, args)
     if action == "checkpoint":
+        # Checkpoint folds the committed delta into the base and clears the
+        # delta; base rows are snapshot-agnostic (_ins_ts=0), so a live txn
+        # whose snapshot predates the checkpointed commits would suddenly see
+        # them. Refuse while any connection has an open txn.
+        if server.has_open_txn():
+            raise RuntimeError("cannot checkpoint while a transaction is open "
+                               "(COMMIT/ROLLBACK on all connections first)")
         return {"tables": eng.checkpoint()}
     if action == "snapshot":
         eng.snapshot(_arg(args, "name", str))
         return {"snapshot": True}
     if action == "restore":
+        # Restore rewinds the global commit counter and discards delta tail;
+        # a live txn's snapshot would be invalidated. Refuse while any txn is
+        # open (the engine's own _txn check can't see other connections' txns
+        # in the server, where _txn is a transient per-request pointer).
+        if server.has_open_txn():
+            raise RuntimeError("cannot restore while a transaction is open "
+                               "(COMMIT/ROLLBACK on all connections first)")
         if "name" in args:
             eng.restore(_arg(args, "name", str))
             return {"restored": True}

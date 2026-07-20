@@ -169,9 +169,9 @@ into SQL. Returns `result`+binary.
 | `drop`        | `table`                                    | `{"dropped": true}` |
 | `rename`      | `old`, `new`                               | `{"renamed": true}` |
 | `alter`       | `table`, `kind`, … (below)                 | `{"set": <kind>}` |
-| `checkpoint`  | —                                          | `{"tables": {<table>: <rows flushed>}}` |
+| `checkpoint`  | —                                          | `{"tables": {<table>: <rows flushed>}}` (refused while any connection has an open txn) |
 | `snapshot`    | `name`                                     | `{"snapshot": true}` |
-| `restore`     | `name` *or* `ts` (int)                     | `{"restored": true}` / `{"restored_to": <ts>}` |
+| `restore`     | `name` *or* `ts` (int)                     | `{"restored": true}` / `{"restored_to": <ts>}` (refused while any connection has an open txn) |
 | `clear_cache` | `which`: `"scan"`/`"code"`/`"both"`        | `{"cleared": <which>}` |
 
 `alter` `kind`s: `pk` (`cols`), `notnull`/`notnull_off` (`col`), `unique`
@@ -227,11 +227,20 @@ wire.
 
 ## Limitations (Phase 1)
 
-- **Single logical session.** There is one `Engine`, so transaction state
-  (`BEGIN`/`COMMIT`, snapshots, restore points) is shared across *all*
-  connections. `BEGIN` on one connection and `COMMIT` on another interleave.
-  Fine for a local single-user console; multi-session isolation is a later
-  phase.
+- **Per-connection transactions (MVCC isolation).** Each connection owns its
+  own in-flight transaction. `BEGIN` captures a frozen `snapshot_ts` (the
+  engine's commit counter); reads see committed batches at-or-before that ts
+  plus the txn's own buffered writes (read-your-writes). A commit on another
+  connection after this `BEGIN` is therefore invisible until this txn
+  `COMMIT`s. The engine's `_txn` is a transient per-request pointer (loaded
+  from the connection's txn before each `sql`/`sample` call, read back after),
+  so `BEGIN` on connection B no longer fails while connection A has an open
+  txn. A disconnect rolls back the connection's open txn (its buffered writes
+  were never flushed to the delta/WAL, so dropping them is the rollback).
+  Snapshots (`CREATE SNAPSHOT`) and the commit counter remain global
+  (single-writer, serialized through the worker). `checkpoint` and
+  `restore`/`restore_to` are refused while *any* connection has an open txn —
+  they rewrite history globally and would invalidate live snapshots.
 - **Cooperative in-flight cancel.** `cancel` drops pending requests and raises
   `CancelledByUser` at the next plan-node boundary of an in-flight request. A
   single long cuDF call (a big groupby, a cold parquet read) is *not*
