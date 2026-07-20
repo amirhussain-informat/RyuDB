@@ -253,8 +253,10 @@ class Server:
                      self.host, self.port, self.data_dir)
             log.info("per-connection transactions (MVCC isolation); cancel drops "
                      "pending requests and raises CancelledByUser at the next node "
-                     "boundary of an in-flight request (a single long cuDF call is "
-                     "not mid-call interruptible)")
+                     "boundary of an in-flight request, and at the inner loops of "
+                     "long nodes (multi-aggregate/multi-window/per-row-window/"
+                     "checkpoint) -- a single long cuDF kernel is the one remaining "
+                     "un-interruptible case")
             await asyncio.Future()  # run forever
 
     def stop(self) -> None:

@@ -57,3 +57,95 @@ def test_explain_returns_string(engine):
     plan = engine.explain("SELECT count(*) FROM lineitem")
     assert isinstance(plan, str)
     assert "Aggregate" in plan
+
+
+# --------------------------------------------------------------------------- #
+# finer-grained cooperative cancel (PR #98)
+# --------------------------------------------------------------------------- #
+
+class _FlipEvent:
+    """A stand-in for ``threading.Event`` whose ``is_set()`` returns False for
+    the first ``skip`` calls then True forever after, counting how many times
+    it was polled. Used to prove a cancel that flips *partway through* a long
+    inner loop is honored before the node completes — i.e. the loop-level
+    cancel check fires, not just the per-node boundary check.
+
+    With only the per-node boundary check, a plan like Scan -> Project runs
+    exactly 2 ``is_set()`` polls; a ``skip`` > 2 would never trip and the query
+    would complete normally. The finer-grained loop checks add one poll per
+    loop iteration, so the event flips mid-loop and ``CancelledByUser`` raises
+    — and ``n_polls`` ends up > 2 (the boundary count), proving the loop-level
+    checks ran."""
+
+    def __init__(self, skip: int) -> None:
+        self._skip = skip
+        self.n_polls = 0
+
+    def is_set(self) -> bool:
+        self.n_polls += 1
+        return self.n_polls > self._skip
+
+    def set(self) -> None:  # noqa: D401 -- satisfy any isinstance/attr checks
+        self._skip = -1
+
+
+def test_cancel_mid_project_loop(engine):
+    """A wide Project (30 distinct arithmetic columns) runs a 30-iteration
+    ``eval_expr`` loop; a flip-after-5 cancel raises mid-loop, and the poll
+    count (>2 boundary checks) proves the per-column loop check fired."""
+    from ryudb.exec.executor import CancelledByUser
+
+    cols = ", ".join(f"l_quantity + {i} AS x{i}" for i in range(30))
+    sql = f"SELECT {cols} FROM lineitem"
+    # Control: without a cancel event the query completes and returns 30 cols.
+    assert engine.cancel_event is None
+    out = engine.sql(sql)
+    assert len(out.columns) == 30
+
+    ev = _FlipEvent(skip=5)
+    engine.cancel_event = ev  # type: ignore[assignment]
+    try:
+        with pytest.raises(CancelledByUser):
+            engine.sql(sql)
+    finally:
+        engine.cancel_event = None
+    # 2 node-boundary polls (Project, Scan) + the per-column loop polls; >2
+    # proves the loop-level check fired, and <32 (boundary + 30 cols) proves it
+    # raised before completing the loop.
+    assert 2 < ev.n_polls < 32
+
+
+def test_cancel_mid_scalar_global_agg_loop(engine):
+    """A no-WHERE/no-GROUP-BY global aggregate with many aggregates runs the
+    ``_scalar_global_agg`` per-aggregate reduction loop; a mid-loop cancel
+    raises before the node completes (loop-level check, not just boundary)."""
+    from ryudb.exec.executor import CancelledByUser
+
+    funcs = ["sum", "avg", "min", "max"]
+    cols = []
+    for i in range(30):
+        f = funcs[i % 4]
+        c = "l_quantity" if i % 2 == 0 else "l_extendedprice"
+        cols.append(f"{f}({c}) AS a{i}")
+    sql = f"SELECT {', '.join(cols)} FROM lineitem"
+    # No cancel -> completes, one row.
+    assert engine.sql(sql).shape[0] == 1
+
+    ev = _FlipEvent(skip=5)
+    engine.cancel_event = ev  # type: ignore[assignment]
+    try:
+        with pytest.raises(CancelledByUser):
+            engine.sql(sql)
+    finally:
+        engine.cancel_event = None
+    assert 2 < ev.n_polls < 32
+
+
+def test_cancel_event_none_is_noop(engine):
+    """Sanity: ``cancel_event`` left at None (the CLI/in-process default) never
+    raises — the ``None`` check short-circuits every poll. A many-aggregate
+    query runs to completion."""
+    assert engine.cancel_event is None
+    cols = ", ".join(f"sum(l_quantity) AS a{i}" for i in range(20))
+    out = engine.sql(f"SELECT {cols} FROM lineitem")
+    assert out.shape[0] == 1 and len(out.columns) == 20

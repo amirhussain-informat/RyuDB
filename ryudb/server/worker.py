@@ -25,10 +25,15 @@ the call and drops the item if set (pending cancel -- only reachable when every
 worker is busy, i.e. the pool is full). For a request already in flight, the
 same event is published to ``engine.cancel_event`` (this worker's per-thread
 slot) for the duration of the call, so the executor raises ``CancelledByUser``
-at the next plan-node boundary (cooperative in-flight cancel). A single long
-cuDF call (a big groupby, a cold parquet read) is still not interruptible
-mid-call -- cancel fires at the next node boundary; that is the one remaining
-limit (full preemption would need subprocess isolation).
+at the next plan-node boundary (cooperative in-flight cancel) AND, for finer
+granularity, at the top of the inner loops of long nodes (multi-aggregate,
+multi-window-function, the per-row window-running host loop, per-table
+checkpoint) -- narrowing the un-interruptible window from a whole node down to a
+single cuDF call for those cases. A *single* long cuDF/CUDA call (a cold
+``cudf.read_parquet``, one big ``groupby.agg``, ``sort_values``, a join
+``merge``, or a fused C-extension kernel) is still not interruptible mid-call --
+cancel fires after the current kernel returns; that is the one remaining limit
+(full preemption of a single kernel would need subprocess isolation).
 
 Results/exceptions are delivered back to the asyncio loop with
 ``loop.call_soon_threadsafe`` (an asyncio.Future may only be resolved on the
