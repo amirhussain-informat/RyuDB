@@ -3,6 +3,7 @@ import { tableToIPC, Table } from "apache-arrow";
 import { useServer } from "./hooks/useServer";
 import { useWorksheets } from "./hooks/useWorksheets";
 import { useDashboards } from "./hooks/useDashboards";
+import { useNotebooks } from "./hooks/useNotebooks";
 import { useTheme } from "./hooks/useTheme";
 import { useVersions, type Snapshot } from "./hooks/useVersions";
 import Toolbar from "./components/Toolbar";
@@ -25,12 +26,14 @@ import DashboardModal from "./components/DashboardModal";
 import PinWidgetModal from "./components/PinWidgetModal";
 import AskModal from "./components/AskModal";
 import DiffModal, { type DiffSource } from "./components/DiffModal";
+import Notebooks from "./components/Notebooks";
+import NotebookModal from "./components/NotebookModal";
 import type { NlTable } from "./lib/nlSql";
 import { tableToCSV, tableToJSON, downloadBlob } from "./lib/csv";
 import { serializeBundle, serializeOne, parseImportFile, worksheetFileName } from "./lib/worksheetTransfer";
 import type {
-  CatalogResp, CatalogTable, ChartSpec, ErrorResp, HistoryEntry, PlanNode,
-  ProfileResp, ResultMeta, Result, TableResp,
+  CatalogResp, CatalogTable, ChartSpec, ErrorResp, HistoryEntry, Notebook,
+  PlanNode, ProfileResp, PyResp, ResultMeta, Result, TableResp,
 } from "./lib/types";
 
 const DEFAULT_URL = "ws://127.0.0.1:5430";
@@ -113,6 +116,10 @@ export default function App() {
   const cursorRef = useRef<string | null>(null);
   const { worksheets, activeId, active, setActive, create, rename, close, updateSql, importWorksheets } = useWorksheets();
   const { dashboards, create: createDashboard, rename: renameDashboard, remove: removeDashboard, addWidget, removeWidget } = useDashboards();
+  const {
+    notebooks, create: createNotebook, rename: renameNotebook, remove: removeNotebook,
+    addCell, updateCell, removeCell, moveCell,
+  } = useNotebooks();
   const { theme, toggle: toggleTheme } = useTheme();
   const { versions, capture, remove, clear, gc } = useVersions();
 
@@ -148,11 +155,12 @@ export default function App() {
   const [loadOpen, setLoadOpen] = useState(false);
   const [catalogNonce, setCatalogNonce] = useState(0);
   const [detailName, setDetailName] = useState<string | null>(null);
-  const [sidebar, setSidebar] = useState<"catalog" | "history" | "dashboards">("catalog");
+  const [sidebar, setSidebar] = useState<"catalog" | "history" | "dashboards" | "notebooks">("catalog");
   const [dashboardOpenId, setDashboardOpenId] = useState<string | null>(null);
   const [pinSpec, setPinSpec] = useState<ChartSpec | null>(null);
   const [askOpen, setAskOpen] = useState(false);
   const [diffOpen, setDiffOpen] = useState(false);
+  const [notebookOpenId, setNotebookOpenId] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -314,6 +322,9 @@ export default function App() {
       } else if (mod && e.shiftKey && (e.key === "d" || e.key === "D")) {
         e.preventDefault();
         setDiffOpen(true);
+      } else if (mod && e.shiftKey && (e.key === "n" || e.key === "N")) {
+        e.preventDefault();
+        setSidebar("notebooks");
       } else if (e.key === "?" && !isTypingTarget(e.target)) {
         e.preventDefault();
         setShortcutsOpen(true);
@@ -327,6 +338,7 @@ export default function App() {
         setDashboardOpenId(null);
         setAskOpen(false);
         setDiffOpen(false);
+        setNotebookOpenId(null);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -736,6 +748,37 @@ export default function App() {
     setDashboardOpenId(did);
   };
 
+  // --- Notebooks --------------------------------------------------------- //
+  // A notebook is an ordered list of SQL / Python cells. A SQL cell runs
+  // through the `sql` op (a mini result table); a Python cell runs through the
+  // `py` op with an injected `sql()` helper (stdout + result repr / traceback).
+  // Only cell SOURCES are persisted; outputs are re-run, never stored.
+  const fetchNotebookSql = async (cellSql: string): Promise<Result | null> => {
+    try {
+      return await op({ id: "nb", op: "sql", sql: cellSql, max_rows: WIDGET_ROWS });
+    } catch {
+      return null;
+    }
+  };
+  const runPy = async (code: string): Promise<PyResp | null> => {
+    try {
+      const res = await op({ id: "nb", op: "py", code });
+      return res.meta.op === "py" ? (res.meta as PyResp) : null;
+    } catch {
+      return null;
+    }
+  };
+  const openNotebook = (id: string) => setNotebookOpenId(id);
+  const handleCreateNotebook = () => {
+    const id = createNotebook("");
+    setNotebookOpenId(id);
+    setSidebar("notebooks");
+  };
+  const activeNotebook: Notebook | null = useMemo(
+    () => notebooks.find((n) => n.id === notebookOpenId) ?? null,
+    [notebooks, notebookOpenId],
+  );
+
   const connected = status === "open";
 
   // The autocomplete schema (Map<table, typed columns>) as the NlTable[] the
@@ -829,6 +872,18 @@ export default function App() {
       id: "dash-" + d.id, label: `Open dashboard ${d.name}`, group: "Dashboards",
       run: () => openDashboard(d.id),
     })),
+    {
+      id: "sidebar-notebooks", label: "Open Notebooks sidebar", hint: "Ctrl/Cmd+Shift+N", group: "View",
+      disabled: sidebar === "notebooks", run: () => setSidebar("notebooks"),
+    },
+    {
+      id: "new-notebook", label: "New notebook", group: "Notebooks",
+      run: handleCreateNotebook,
+    },
+    ...notebooks.map((n) => ({
+      id: "nb-" + n.id, label: `Open notebook ${n.name}`, group: "Notebooks",
+      run: () => openNotebook(n.id),
+    })),
     ...worksheets.map((w) => ({
       id: "go-" + w.id, label: `Go to ${w.name}`, group: "Worksheets",
       disabled: w.id === activeId, run: () => switchTab(w.id),
@@ -868,6 +923,7 @@ export default function App() {
             <button className={sidebar === "catalog" ? "active" : ""} onClick={() => setSidebar("catalog")}>Catalog</button>
             <button className={sidebar === "history" ? "active" : ""} onClick={() => setSidebar("history")}>History</button>
             <button className={sidebar === "dashboards" ? "active" : ""} onClick={() => setSidebar("dashboards")}>Dashboards</button>
+            <button className={sidebar === "notebooks" ? "active" : ""} onClick={() => setSidebar("notebooks")}>Notebooks</button>
           </div>
           {sidebar === "catalog" ? (
             <Catalog
@@ -888,13 +944,21 @@ export default function App() {
               onPick={(s) => active && updateSql(active.id, s)}
               status={status}
             />
-          ) : (
+          ) : sidebar === "dashboards" ? (
             <Dashboards
               dashboards={dashboards}
               onOpen={openDashboard}
               onCreate={handleCreateDashboard}
               onRename={renameDashboard}
               onRemove={removeDashboard}
+            />
+          ) : (
+            <Notebooks
+              notebooks={notebooks}
+              onOpen={openNotebook}
+              onCreate={handleCreateNotebook}
+              onRename={renameNotebook}
+              onRemove={removeNotebook}
             />
           )}
         </aside>
@@ -1075,6 +1139,18 @@ export default function App() {
         open={diffOpen}
         sources={diffSources}
         onClose={() => setDiffOpen(false)}
+      />
+      <NotebookModal
+        open={notebookOpenId !== null}
+        notebook={activeNotebook}
+        connected={connected}
+        fetchSql={fetchNotebookSql}
+        runPy={runPy}
+        onAddCell={(type) => notebookOpenId && addCell(notebookOpenId, type)}
+        onUpdateCell={(cellId, patch) => notebookOpenId && updateCell(notebookOpenId, cellId, patch)}
+        onRemoveCell={(cellId) => notebookOpenId && removeCell(notebookOpenId, cellId)}
+        onMoveCell={(cellId, delta) => notebookOpenId && moveCell(notebookOpenId, cellId, delta)}
+        onClose={() => setNotebookOpenId(null)}
       />
     </div>
   );

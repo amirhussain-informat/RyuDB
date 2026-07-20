@@ -98,6 +98,13 @@ export interface UploadRequest {
   name: string;
   format?: "parquet";
 }
+/** Run a Python notebook cell on the worker; a `sql()` helper + `pd`/`cudf`
+ *  are injected. Text-only response (no binary frame). */
+export interface PyRequest {
+  id: RequestId;
+  op: "py";
+  code: string;
+}
 export type Request =
   | SqlRequest
   | FetchRequest
@@ -111,7 +118,8 @@ export type Request =
   | HistoryRequest
   | ProfileRequest
   | ExportRequest
-  | UploadRequest;
+  | UploadRequest
+  | PyRequest;
 
 // ---- responses ----
 
@@ -231,6 +239,17 @@ export interface CancelledResp {
   id: RequestId;
   op: "cancelled";
 }
+/** A Python notebook cell's result. `result` is the repr() of an expression
+ *  cell (null for a statement block); `error` carries the formatted traceback
+ *  when the cell raised (still a `py` frame, not an `error` frame). */
+export interface PyResp {
+  id: RequestId;
+  op: "py";
+  stdout: string;
+  result: string | null;
+  error: string | null;
+  duration_ms: number;
+}
 export interface ErrorPosition {
   line: number;
   col: number;
@@ -253,6 +272,7 @@ export type Response =
   | ProfileResp
   | ExportResp
   | CancelledResp
+  | PyResp
   | ErrorResp;
 
 // A parsed result (meta + decoded Arrow table). `table` is null for non-result
@@ -284,4 +304,22 @@ export interface Dashboard {
   id: string;
   name: string;
   widgets: DashboardWidget[];
+}
+
+// ---- notebooks (client-only, persisted to localStorage) ----
+// A SQL+Python notebook: an ordered list of cells. A `sql` cell runs a
+// statement through the `sql` op and shows a mini result table; a `python`
+// cell runs through the `py` op (with an injected `sql()` helper) and shows
+// captured stdout + a result repr (+ traceback on error). Cell outputs are
+// transient (not persisted) — only the cell sources are saved.
+export type NotebookCellType = "sql" | "python";
+export interface NotebookCell {
+  id: string;
+  type: NotebookCellType;
+  code: string;
+}
+export interface Notebook {
+  id: string;
+  name: string;
+  cells: NotebookCell[];
 }

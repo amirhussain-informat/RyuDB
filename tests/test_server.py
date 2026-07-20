@@ -1472,3 +1472,152 @@ def test_upload_too_large_errors(srv):
         server.max_upload_bytes = 256 * 1024 * 1024
     assert meta["op"] == "error", meta
     assert "too large" in meta["message"], meta
+
+
+# --------------------------------------------------------------------------- #
+# python notebook cells (the `py` op)
+# --------------------------------------------------------------------------- #
+
+def test_py_expression_returns_repr(srv):
+    """A bare expression cell is ``eval``ed and its repr is returned; no
+    binary frame follows (a `py` response is text-only)."""
+    port, _server, _ref, _ = srv
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta, bins = await _call(ws, {"id": "p1", "op": "py",
+                                          "code": "1 + 2 * 3"}, want_bin=False)
+        return meta, bins
+    meta, bins = _run(client())
+
+    assert meta["op"] == "py"
+    assert bins == []  # text-only response, no Arrow frame
+    assert meta["stdout"] == ""
+    assert meta["result"] == "7"
+    assert meta["error"] is None
+    assert meta["duration_ms"] >= 0
+
+
+def test_py_exec_captures_stdout(srv):
+    """A statement block cell is ``exec``ed; captured stdout is returned and
+    ``result`` is None (only expressions produce a result)."""
+    port, _server, _ref, _ = srv
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta, _ = await _call(ws, {"id": "p2", "op": "py",
+                                       "code": "print('hello', 1+1)\nx=40\nprint(x+2)"},
+                                  want_bin=False)
+        return meta
+    meta = _run(client())
+
+    assert meta["op"] == "py"
+    assert meta["stdout"] == "hello 2\n42\n"
+    assert meta["result"] is None
+    assert meta["error"] is None
+
+
+def test_py_sql_helper_returns_pandas(srv):
+    """The injected ``sql()`` helper runs through the connection's txn and
+    returns a pandas DataFrame for SELECTs (cuDF copied to host)."""
+    port, _server, _ref, _ = srv
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta, _ = await _call(
+                ws, {"id": "p3", "op": "py",
+                     "code": ("df = sql('SELECT l_returnflag, count(*) AS c "
+                              "FROM lineitem GROUP BY l_returnflag "
+                              "ORDER BY l_returnflag')\n"
+                              "print(type(df).__name__, df.shape[0])\n"
+                              "print(','.join(df['l_returnflag'].astype(str)))")},
+                want_bin=False)
+        return meta
+    meta = _run(client())
+
+    assert meta["op"] == "py", meta
+    assert meta["error"] is None, meta
+    # the helper returns a pandas (not cudf) DataFrame; lineitem has 3 flags
+    out = meta["stdout"].splitlines()
+    assert out[0].startswith("DataFrame"), out
+    assert out[0].endswith(" 3"), out
+    assert out[1] == "A,N,R", out
+
+
+def test_py_sql_write_returns_rows_affected(srv):
+    """A write via ``sql()`` returns the int rows-affected, not a DataFrame."""
+    port, server, _ref, _ = srv
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            # open a txn, insert, and return the affected count to the cell
+            meta, _ = await _call(
+                ws, {"id": "p4", "op": "py",
+                     "code": ("sql('BEGIN')\n"
+                              "n = sql('INSERT INTO lineitem "
+                              "(l_orderkey,l_quantity,l_extendedprice,"
+                              "l_returnflag) VALUES (999,1,1.0,\\'N\\')')\n"
+                              "sql('ROLLBACK')\n"
+                              "print('rows', n)")},
+                want_bin=False)
+        return meta
+    meta = _run(client())
+
+    assert meta["op"] == "py", meta
+    assert meta["error"] is None, meta
+    assert meta["stdout"] == "rows 1\n", meta
+
+
+def test_py_exec_error_surfaces_traceback(srv):
+    """A cell that raises is NOT an error frame; the traceback travels in the
+    ``error`` field so the notebook UI can render it inline next to the cell."""
+    port, _server, _ref, _ = srv
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta, _ = await _call(
+                ws, {"id": "p5", "op": "py",
+                     "code": "x = [1,2,3]\nprint(x[10])"},
+                want_bin=False)
+        return meta
+    meta = _run(client())
+
+    assert meta["op"] == "py", meta
+    assert meta["result"] is None
+    assert meta["error"] is not None
+    assert "IndexError" in meta["error"], meta["error"]
+
+
+def test_py_requires_code(srv):
+    """A `py` request with no/empty `code` is a protocol error."""
+    port, _server, _ref, _ = srv
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta, _ = await _call(ws, {"id": "p6", "op": "py", "code": ""},
+                                  want_bin=False)
+        return meta
+    meta = _run(client())
+
+    assert meta["op"] == "error"
+    assert meta["kind"] == "protocol"
+    assert "code" in meta["message"]
+
+
+def test_py_can_use_cudf_directly(srv):
+    """``cudf`` is injected into the namespace, so a cell can build a GPU frame
+    directly (not just via ``sql()``) and return its repr."""
+    port, _server, _ref, _ = srv
+
+    async def client():
+        async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            meta, _ = await _call(
+                ws, {"id": "p7", "op": "py",
+                     "code": "cudf.DataFrame({'a':[1,2,3]})['a'].sum()"},
+                want_bin=False)
+        return meta
+    meta = _run(client())
+
+    assert meta["op"] == "py", meta
+    assert meta["error"] is None, meta
+    assert meta["result"].endswith("(6)"), meta  # cudf sum -> np.int64(6)

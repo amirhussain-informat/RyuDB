@@ -9,6 +9,7 @@ const SHORTCUTS: { key: string; desc: string }[] = [
   { key: "Ctrl/Cmd + Shift + H", desc: "Show the worksheet's version history" },
   { key: "Ctrl/Cmd + I", desc: "Ask (NL → SQL)" },
   { key: "Ctrl/Cmd + Shift + D", desc: "Compare SQL (diff)" },
+  { key: "Ctrl/Cmd + Shift + N", desc: "Open the Notebooks sidebar" },
   { key: "Ctrl/Cmd + Enter", desc: "Run the current query (in the editor)" },
   { key: "?", desc: "Show this keyboard-shortcuts help" },
   { key: "Esc", desc: "Close the palette / this help" },

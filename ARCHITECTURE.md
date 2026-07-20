@@ -159,7 +159,9 @@ governance/masking, billing/budgets, replication.
   reorder/copy + chart tab + GPU-instant column profiling + multi-result tabs +
   JSON/Parquet export), Phase 2 (object explorer + data-loading wizard +
   schema-aware autocomplete), Phase 3 (visual GPU-kernel-aware query profile +
-  filterable history + dashboards), Phase 4 (NL→SQL assistant, notebooks).
+  filterable history + dashboards), Phase 4 (NL→SQL assistant, SQL compare
+  diff, SQL+Python notebooks — a server `py` op runs a cell on the worker with
+  an injected `sql()` helper returning pandas).
 
 ---
 
