@@ -1,10 +1,13 @@
 import { useState } from "react";
 import type { ConnStatus } from "../lib/client";
+import type { Theme } from "../hooks/useTheme";
 
 interface Props {
   url: string;
   status: ConnStatus;
   running: boolean;
+  theme: Theme;
+  onToggleTheme: () => void;
   onConnect: (url: string) => void;
   onDisconnect: () => void;
   onRun: () => void;
@@ -21,7 +24,8 @@ const STATUS_LABEL: Record<ConnStatus, string> = {
 };
 
 export default function Toolbar({
-  url, status, running, onConnect, onDisconnect, onRun, onExplain, onCancel,
+  url, status, running, theme, onToggleTheme,
+  onConnect, onDisconnect, onRun, onExplain, onCancel,
 }: Props) {
   const [field, setField] = useState(url);
   const connected = status === "open";
@@ -49,6 +53,13 @@ export default function Toolbar({
         </button>
         <button onClick={onExplain} disabled={!connected || running}>Explain</button>
         {running && <button onClick={onCancel}>Cancel</button>}
+        <button
+          className="theme-toggle"
+          onClick={onToggleTheme}
+          title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+        >
+          {theme === "dark" ? "☀" : "☾"}
+        </button>
       </div>
     </div>
   );

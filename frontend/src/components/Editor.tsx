@@ -13,6 +13,8 @@ interface Props {
   value: string;
   onChange: (v: string) => void;
   onRun: () => void;
+  /** Monaco theme id; switches the editor chrome between dark and light. */
+  theme?: string;
 }
 
 const PARSE_OWNER = "ryudb-parse";
@@ -20,7 +22,7 @@ const PARSE_OWNER = "ryudb-parse";
 /** Monaco-based SQL editor. Ctrl/Cmd+Enter runs the current statement; a parse
  * error from the server is underlined as a squiggle at the reported position. */
 const SqlEditor = forwardRef<EditorHandle, Props>(function SqlEditor(
-  { value, onChange, onRun },
+  { value, onChange, onRun, theme = "vs-dark" },
   ref,
 ) {
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
@@ -77,7 +79,7 @@ const SqlEditor = forwardRef<EditorHandle, Props>(function SqlEditor(
     <Editor
       height="100%"
       defaultLanguage="sql"
-      theme="vs-dark"
+      theme={theme}
       value={value}
       onChange={(v) => onChange(v ?? "")}
       onMount={onMount}

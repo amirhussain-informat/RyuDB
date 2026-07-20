@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { tableToIPC, Table } from "apache-arrow";
 import { useServer } from "./hooks/useServer";
 import { useWorksheets } from "./hooks/useWorksheets";
+import { useTheme } from "./hooks/useTheme";
 import Toolbar from "./components/Toolbar";
 import SqlEditor, { type EditorHandle } from "./components/Editor";
 import WorksheetTabs from "./components/WorksheetTabs";
@@ -50,6 +51,7 @@ export default function App() {
   // in a ref so the unmount/disconnect cleanup can close it without stale state.
   const cursorRef = useRef<string | null>(null);
   const { worksheets, activeId, active, setActive, create, rename, close, updateSql } = useWorksheets();
+  const { theme, toggle: toggleTheme } = useTheme();
 
   // Per-worksheet view state (in-memory). Switching a tab saves the view of the
   // tab being left and restores (or initializes) the view of the new tab.
@@ -354,6 +356,8 @@ export default function App() {
         url={DEFAULT_URL}
         status={status}
         running={running}
+        theme={theme}
+        onToggleTheme={toggleTheme}
         onConnect={connect}
         onDisconnect={disconnect}
         onRun={run}
@@ -398,6 +402,7 @@ export default function App() {
                 value={sql}
                 onChange={(v) => active && updateSql(active.id, v)}
                 onRun={run}
+                theme={theme === "dark" ? "vs-dark" : "vs"}
               />
             </div>
           </div>
