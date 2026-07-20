@@ -9,6 +9,11 @@ present in the ``ryudb`` conda env and the conda host compiler
 decompression (Phase 5 cold reader). The resulting extension is loaded by
 ``ryudb.kernels``; if it is absent, the executor falls back to the Numba/cuDF
 paths, so building is never required for correctness.
+
+``RYUDB_CUDA_ARCH`` selects the target compute capability: a single value
+(e.g. ``sm_86``, the default — RTX 3090) or a comma-list (e.g.
+``sm_80,sm_86,sm_89,sm_90``) to build a fat binary for several GPUs (used by
+the Docker image). ``ryudb build`` (the CLI wrapper) passes this through.
 """
 
 from __future__ import annotations
@@ -57,6 +62,29 @@ def _conda_prefix() -> str:
     return pre
 
 
+def _gencode_args() -> list[str]:
+    """nvcc compute-capability flags from ``RYUDB_CUDA_ARCH`` (default ``sm_86``).
+
+    A single value (``sm_86``) -> ``-arch sm_86`` (the historical default; the
+    dev box is an RTX 3090 = sm_86). A comma-list (``sm_80,sm_86,sm_89,sm_90``)
+    -> one ``-gencode arch=compute_NN,code=sm_NN`` per arch, producing a fat
+    binary that runs on all of them (used by the Docker image so one build
+    serves a range of GPUs). ``sm_NN`` and ``compute_NN`` both accepted; the
+    number is what matters.
+    """
+    raw = os.environ.get("RYUDB_CUDA_ARCH", "sm_86")
+    archs = [a.strip() for a in raw.split(",") if a.strip()]
+    if not archs:
+        archs = ["sm_86"]
+    if len(archs) == 1:
+        return ["-arch", archs[0]]
+    args: list[str] = []
+    for a in archs:
+        cc = a.removeprefix("sm_").removeprefix("compute_")
+        args += ["-gencode", f"arch=compute_{cc},code=sm_{cc}"]
+    return args
+
+
 def build() -> Path:
     import pybind11
     import sysconfig
@@ -90,7 +118,7 @@ def build() -> Path:
     # -rpath to CONDA_PREFIX/lib so fused.so finds libnvcomp at import time
     # without relying on LD_LIBRARY_PATH.
     cmd = [
-        nvcc, "-O3", "-arch=sm_86", "-std=c++17",
+        nvcc, "-O3", *_gencode_args(), "-std=c++17",
         "-shared", "-Xcompiler", "-fPIC",
     ] + (["-DRYUDB_SCAN_PROFILE"] if os.environ.get("RYUDB_SCAN_PROFILE") else []) + [
         "-ccbin", ccbin,

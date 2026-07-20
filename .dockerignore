@@ -1,0 +1,49 @@
+# Keep the build context small and the image clean. Everything here is excluded
+# from the `COPY . /build/ryudb` step in docker/Dockerfile. NOTE: docker/env.yml
+# and docker/entrypoint.sh are COPYed explicitly by the Dockerfile, so they must
+# NOT be excluded here — only the docker/ subtree is left in the context. The
+# kernel SOURCES (fused.cu, pqpages.cpp, pqpages.h) are NOT excluded — they ship
+# via package-data and `ryudb build` compiles them in the image. Any prebuilt
+# fused.so IS excluded (we rebuild for the target arch in the image).
+
+.git
+.github
+.gitignore
+
+# Large / generated data — mounted as a volume at runtime, never baked in.
+data/
+bench/tpch/data
+bench/clickbench/data
+*.parquet
+*.duckdb
+*.db
+*.db-wal
+*.db-shm
+
+# Python build artifacts.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.eggs
+*.egg-info
+build/
+dist/
+.venv
+venv/
+
+# Compiled kernel artifacts (rebuilt in the image for the target arch).
+**/*.so
+**/*.o
+
+# Frontend build artifacts (not part of the server image).
+frontend/node_modules
+frontend/dist
+frontend/.next
+
+# Scratch notes (keep README.md + docker/README.md for the package + docs).
+*.txt
+resume.txt
+docs/
