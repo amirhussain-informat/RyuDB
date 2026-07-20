@@ -13,6 +13,7 @@ import SearchModal from "./components/SearchModal";
 import VersionHistory from "./components/VersionHistory";
 import ProfileModal from "./components/ProfileModal";
 import LoadDataModal from "./components/LoadDataModal";
+import TableDetailModal from "./components/TableDetailModal";
 import Results from "./components/Results";
 import Chart from "./components/Chart";
 import Explain from "./components/Explain";
@@ -134,6 +135,7 @@ export default function App() {
   // Data-load wizard open state + a catalog refresh signal bumped after DDL.
   const [loadOpen, setLoadOpen] = useState(false);
   const [catalogNonce, setCatalogNonce] = useState(0);
+  const [detailName, setDetailName] = useState<string | null>(null);
   const [sidebar, setSidebar] = useState<"catalog" | "history">("catalog");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -622,6 +624,10 @@ export default function App() {
       setMainTab("message");
     }
   };
+  const handleRename = async (oldName: string, newName: string) => {
+    await fetchAdmin("rename", { old: oldName, new: newName });
+    refreshAfterDdl();
+  };
 
   const connected = status === "open";
   const activeMeta = result?.meta as ResultMeta | undefined;
@@ -697,6 +703,7 @@ export default function App() {
               onInsert={(t) => editorRef.current?.insert(t)}
               onSample={sample}
               onProfile={(name) => setProfileName(name)}
+              onDetail={(name) => setDetailName(name)}
               onLoad={() => setLoadOpen(true)}
               onDrop={handleDrop}
               status={status}
@@ -840,6 +847,13 @@ export default function App() {
         open={loadOpen}
         onSubmit={handleLoad}
         onClose={() => setLoadOpen(false)}
+      />
+      <TableDetailModal
+        open={detailName !== null}
+        name={detailName}
+        fetchTable={fetchTable}
+        onRename={handleRename}
+        onClose={() => setDetailName(null)}
       />
     </div>
   );
