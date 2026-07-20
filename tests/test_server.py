@@ -14,7 +14,9 @@ background thread) and drive it with a ``websockets`` client, then assert:
     classified ``runtime``; protocol mistakes (bad JSON, unknown op, binary
     frame) are rejected;
   * cancel — a request still pending in the worker queue is dropped on cancel;
-    an in-flight query runs to completion (no engine cancel hook in v1);
+    a request already in flight raises ``CancelledByUser`` at the next
+    plan-node boundary and resolves ``cancelled`` (cooperative: a single long
+    cuDF call is not mid-call interruptible);
   * explain — the structured plan tree marks an Aggregate-over-Join as
     ``fused=True`` and Aggregate-over-Scan as ``fused=False``;
   * admin / catalog / table / sample / history ops.
@@ -429,6 +431,68 @@ def test_cancel_pending_request(srv):
     assert got["q1"]["op"] == "result"          # ran to completion
     assert got["q2"]["op"] == "cancelled"       # dropped while pending
     assert "q2" in got["cx"]["detail"]["cancelled"]
+
+
+def test_cancel_inflight_request(srv):
+    """Block the worker INSIDE the first scan of a running query; cancel it
+    mid-flight; release the scan -> the next plan-node boundary (the join's
+    right-input _exec) sees the set cancel event and raises CancelledByUser, so
+    the in-flight request resolves ``cancelled`` (cooperative in-flight cancel).
+    Uses raw sends + a single recv stream (two concurrent ws.recv() calls on one
+    connection are not allowed)."""
+    port, server, ref, _ = srv
+    hold = threading.Event()
+    started = threading.Event()
+    orig = server.engine._scan  # bound method (class _scan bound to the instance)
+
+    first = [True]
+
+    def blocking_scan(table, columns):
+        # Patched onto the instance dict, so self._scan(a, b) calls this with no
+        # bound self -> signature is (table, columns); orig is the bound original.
+        if first[0]:
+            first[0] = False
+            started.set()
+            hold.wait(5)  # hold the worker mid-query until the test releases it
+        return orig(table, columns)
+    server.engine._scan = blocking_scan
+    try:
+        async def client():
+            async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+                # Self-join on lineitem: two scans. The plan is
+                # Limit -> Project -> Join -> Scan(a), Scan(b). The first scan
+                # blocks; after release the join's right-input _exec hits the
+                # cancel check and raises CancelledByUser before the join runs.
+                await ws.send(json.dumps({"id": "q1", "op": "sql", "sql":
+                    "SELECT a.l_orderkey FROM lineitem a JOIN lineitem b "
+                    "ON a.l_orderkey = b.l_orderkey LIMIT 5"}))
+                assert started.wait(2), "q1 did not start (first scan never ran)"
+                await ws.send(json.dumps({"id": "cx", "op": "cancel",
+                                          "targets": ["q1"]}))
+                got: dict[str, dict] = {}
+                released = False
+                while len(got) < 2:
+                    m = await asyncio.wait_for(ws.recv(), timeout=20)
+                    if isinstance(m, (bytes, bytearray)):
+                        continue  # a result would be a bug here; ignore defensively
+                    d = json.loads(m)
+                    rid = d.get("id")
+                    if rid in ("q1", "cx"):
+                        got[rid] = d
+                    # The cx ok frame is sent only after cancel_pending() set
+                    # q1's event; once it arrives it is safe to release the
+                    # blocked scan -- the engine's next _exec boundary will see
+                    # the set event and raise CancelledByUser.
+                    if rid == "cx" and not released:
+                        hold.set()
+                        released = True
+                return got
+        got = _run(client())
+    finally:
+        server.engine._scan = orig
+    assert got["cx"]["op"] == "ok"
+    assert "q1" in got["cx"]["detail"]["cancelled"]
+    assert got["q1"]["op"] == "cancelled"   # raised CancelledByUser mid-flight
 
 
 def test_cancel_unknown_target(srv):

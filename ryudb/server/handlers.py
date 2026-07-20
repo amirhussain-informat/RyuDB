@@ -14,7 +14,8 @@ Op set (Phase 1):
   sample   SELECT * FROM <t> LIMIT n  (validated table name)
   admin    drop / rename / alter / register / checkpoint / snapshot / restore /
            clear_cache
-  cancel   drop pending requests on this connection (in-flight run to completion)
+  cancel   drop pending requests on this connection, or raise CancelledByUser
+           at the next plan-node boundary of a request already in flight
   history  recent sql invocations (server-side ring buffer)
 """
 
@@ -37,6 +38,7 @@ from .protocol import (
     table_to_ipc,
 )
 from .worker import Cancelled
+from ..exec.executor import CancelledByUser
 
 
 # --------------------------------------------------------------------------- #
@@ -72,7 +74,10 @@ async def _cancellable(server, ws, rid: Any, fn, *args) -> tuple[bool, Any, floa
     server.register_pending(ws, rid, cancel)
     try:
         result = await fut
-    except Cancelled:
+    except (Cancelled, CancelledByUser):
+        # Cancelled: dropped while pending (never started). CancelledByUser:
+        # raised at a plan-node boundary of a request already in flight. Both
+        # surface to the client as the same `cancelled` frame.
         await _send_json(ws, {"id": rid, "op": "cancelled"})
         return False, None, 0.0
     except BaseException as exc:  # noqa: BLE001 -- classify + surface
@@ -356,7 +361,8 @@ async def _op_cancel(req, ws, server) -> None:
     await _send_json(ws, {
         "id": rid, "op": "ok",
         "detail": {"cancelled": cancelled, "not_found": not_found},
-        "note": "pending requests are dropped; in-flight queries run to completion",
+        "note": "pending requests are dropped; in-flight requests raise "
+                "CancelledByUser at the next plan-node boundary",
     })
 
 

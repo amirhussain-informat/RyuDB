@@ -40,7 +40,7 @@ The response `op` tells the client what to expect next:
 | `catalog`   | nothing          | `tables` list |
 | `table`     | nothing          | one table's schema (`columns`, `constraints`, ...) |
 | `history`   | nothing          | `entries` ring buffer |
-| `cancelled` | nothing          | this request was dropped while pending |
+| `cancelled` | nothing          | dropped while pending, or `CancelledByUser` at a node boundary |
 | `error`     | nothing          | something failed; `kind` + `message` (+ `position`) |
 
 Every response echoes the request `id` (except server-initiated protocol errors
@@ -182,14 +182,22 @@ into SQL. Returns `result`+binary.
 ```json
 {"id": "cx", "op": "cancel", "targets": ["q2"]}
 ```
-Drops requests that are still **pending** (queued, not yet started by the
-worker). Returns `{"op": "ok", "detail": {"cancelled": ["q2"],
-"not_found": [...]}}`. A target in `not_found` had already started, already
-completed, or never existed — indistinguishable, and honest: that request's own
-response tells the client what happened.
+Cancels requests on this connection. Returns `{"op": "ok", "detail":
+{"cancelled": ["q2"], "not_found": [...]}}`.
 
-**In-flight queries are not cancellable** (v1 has no engine cancel hook): a
-request already running on the GPU runs to completion. See *Limitations*.
+- **Pending** (queued, not yet started by the worker): dropped on dequeue →
+  the request resolves with a `cancelled` frame.
+- **In-flight** (already running): the engine raises `CancelledByUser` at the
+  next **plan-node boundary** → the request resolves with a `cancelled` frame.
+  This is cooperative: a single long cuDF call (a big groupby, a cold parquet
+  read) is *not* interruptible mid-call — cancel fires after the current node
+  finishes. See *Limitations*.
+
+A target in `not_found` had already completed or never existed —
+indistinguishable, and honest: that request's own response tells the client
+what happened. There is an inherent race: a target reported in `cancelled` may
+have already passed its last node and finished normally (its own response is
+then a normal result, not `cancelled`).
 
 ### `history`
 
@@ -224,9 +232,11 @@ wire.
   connections. `BEGIN` on one connection and `COMMIT` on another interleave.
   Fine for a local single-user console; multi-session isolation is a later
   phase.
-- **No in-flight cancel.** `cancel` drops only pending (not-yet-started)
-  requests; a running query completes. A future engine cancel hook would make
-  in-flight cancellation possible.
+- **Cooperative in-flight cancel.** `cancel` drops pending requests and raises
+  `CancelledByUser` at the next plan-node boundary of an in-flight request. A
+  single long cuDF call (a big groupby, a cold parquet read) is *not*
+  interruptible mid-call — cancel fires after the current node finishes. Full
+  preemption would need subprocess isolation.
 - **Local single-user.** Binds to `127.0.0.1` by default; no auth. The `sample`
   op interpolates a validated identifier into SQL; `sql`/`admin` trust the
   client (appropriate for a local console, not for exposing on a network).
