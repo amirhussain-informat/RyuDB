@@ -31,15 +31,30 @@ Supported
     raises ``CancelledByUser`` at the next plan-node boundary of an in-flight
     one, surfaced as ErrorResponse 57014. Cancel of an idle backend is a no-op.
     A CancelRequest gets no response (the client just closes).
+  - SQL cursors (``DECLARE``/``FETCH``/``MOVE``/``CLOSE``), layered on the
+    shared per-connection cursor store (``Server.open_cursor``/``get_cursor``/
+    ``close_cursor``). ``DECLARE CURSOR FOR <select>`` runs the query once and
+    freezes the full ``pa.Table``; ``FETCH``/``MOVE`` page it with the full
+    Postgres scroll-direction grammar (NEXT/PRIOR/FIRST/LAST/FORWARD/BACKWARD
+    [n|ALL]/ABSOLUTE n/RELATIVE n). ``FETCH`` emits rows directly, bypassing
+    ``--pg-max-rows``, so a driver can page a result larger than the cap
+    (``psql``'s ``\\set FETCH_COUNT``, driver named cursors). ``WITH HOLD`` is
+    rejected (0A000); all cursors are WITHOUT HOLD and close on
+    COMMIT/ROLLBACK and disconnect. Cursor errors carry real SQLSTATEs (34000
+    invalid_cursor_name, 42P03 duplicate_cursor, 42P11
+    invalid_cursor_definition, 54000 program_limit_exceeded).
 
 Not supported (documented limits)
   - SSL/TLS, GSSAPI, SCRAM/password auth (no auth).
-  - ``COPY``, ``LISTEN``/``NOTIFY``, portal scroll, binary result format
-    (text only), binary param format (text only). A client requesting binary
-    results/params gets an error.
-  - Result rows are capped at ``max_rows`` (the same cap as the WebSocket
-    front); the PG protocol has no truncation signal, so the cap is silent
-    (documented). Raise ``--max-rows`` / ``--pg-max-rows`` for full exports.
+  - ``COPY``, ``LISTEN``/``NOTIFY``, binary result format (text only), binary
+    param format (text only). A client requesting binary results/params gets
+    an error.
+  - ``WITH HOLD`` cursors (holdable past COMMIT); every cursor is WITHOUT HOLD
+    and closes at the transaction boundary.
+  - A plain ``SELECT`` is capped at ``max_rows`` (the same cap as the
+    WebSocket front); the PG protocol has no truncation signal, so the cap is
+    silent (documented). Raise ``--pg-max-rows`` for full exports, or page
+    past it with ``DECLARE CURSOR``/``FETCH`` (bypasses the cap per FETCH).
   - Parameter type inference uses the Parse param OIDs; an unknown OID (0)
     renders the param as a quoted string literal and lets the engine coerce.
 """
@@ -51,6 +66,7 @@ import datetime
 import logging
 import math
 import os
+import re
 import secrets
 import struct
 from decimal import Decimal
@@ -61,11 +77,22 @@ import sqlglot
 from sqlglot import exp
 
 from .errors import classify
-from .protocol import df_to_arrow
+from .protocol import ProtocolError, df_to_arrow
 from .worker import Cancelled
 from ..exec.executor import CancelledByUser
 
 log = logging.getLogger("ryudb.server.pgwire")
+
+
+class PGError(Exception):
+    """A wire-level error with an explicit SQLSTATE (e.g. ``34000`` for an
+    invalid cursor name). Raised from the cursor statement handlers so the
+    v3 ErrorResponse carries a meaningful code rather than the catch-all
+    ``XX000`` the runtime classifier falls back to."""
+
+    def __init__(self, sqlstate: str, message: str) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
 
 # --------------------------------------------------------------------------- #
 # Postgres type OIDs (only the ones we emit)
@@ -356,6 +383,14 @@ class PGConn:
         # and idempotent, so caching the Describe result is safe).
         self._portal_cache: dict[str, Any] = {}
         self._cancel: Any = None
+        # PG SQL cursors (DECLARE/FETCH/MOVE/CLOSE), layered over the shared
+        # per-connection cursor store (``ws._ryudb_cursors``, owned by the WS
+        # Server). Maps the user's cursor name -> (server_cursor_id, offset),
+        # where ``offset`` is the 0-based number of rows already consumed and
+        # the server cursor holds the frozen full-result ``pa.Table``. All
+        # WITH HOLD cursors are rejected, so every entry is closed on
+        # COMMIT/ROLLBACK and on disconnect (matching Postgres WITHOUT HOLD).
+        self.cursors: dict[str, tuple[str, int]] = {}
 
     # -- low-level send --
     async def _send(self, data: bytes) -> None:
@@ -440,8 +475,12 @@ class PGConn:
                     self.failed = True
                 await self._send(_ready(self._status()))
             except Exception as exc:  # noqa: BLE001 -- surface as ErrorResponse
-                kind, message, _ = classify(exc)
-                await self._send(_error("ERROR", _sqlstate(kind), message))
+                sqlstate = getattr(exc, "sqlstate", None)
+                if sqlstate:
+                    await self._send(_error("ERROR", sqlstate, str(exc)))
+                else:
+                    kind, message, _ = classify(exc)
+                    await self._send(_error("ERROR", _sqlstate(kind), message))
                 if self.in_txn:
                     self.failed = True
                 await self._send(_ready(self._status()))
@@ -464,6 +503,8 @@ class PGConn:
         # DataRow precede the CommandComplete of a SELECT.
         for stmt in _split_statements(sql):
             if not await self._gate(stmt):
+                continue
+            if await self._try_cursor_stmt(stmt):
                 continue
             result = await self._exec(stmt)
             await self._emit_result(stmt, result, describe=True)
@@ -565,6 +606,12 @@ class PGConn:
         cached = self._portal_cache.pop(portal, None)
         if not await self._gate(sql):
             return
+        full = _substitute_params(sql, params, oids)
+        # FETCH/MOVE/CLOSE/DECLARE as an extended-protocol portal: handle as a
+        # cursor statement (Execute's max-rows caps the FETCH count) and skip
+        # the normal emit path.
+        if await self._try_cursor_stmt(full, maxrows=maxrows):
+            return
         if cached is not None:
             # A portal-Describe already ran the query and sent its
             # RowDescription; reuse the result so we don't execute twice, and
@@ -572,7 +619,6 @@ class PGConn:
             result = cached
             emit_desc = False
         else:
-            full = _substitute_params(sql, params, oids)
             if not full.strip():
                 await self._send(_msg(b"I", b""))  # EmptyQueryResponse
                 return
@@ -616,6 +662,10 @@ class PGConn:
         # ROLLBACK ends the (possibly aborted) txn -> clear the abort gate.
         if _first_keyword(sql) == "ROLLBACK":
             self.failed = False
+        # COMMIT/ROLLBACK close every WITHOUT HOLD cursor (we reject WITH HOLD
+        # at DECLARE, so all PG cursors are WITHOUT HOLD -> close them all).
+        if _first_keyword(sql) in ("COMMIT", "ROLLBACK"):
+            self._close_all_cursors()
 
     async def _gate(self, sql: str) -> bool:
         """Aborted-txn gate. Returns True if the statement may proceed; False
@@ -643,6 +693,249 @@ class PGConn:
             return res
         # cuDF / pandas DataFrame -> pyarrow Table (canonical path)
         return df_to_arrow(res)
+
+    # -- SQL cursors (DECLARE / FETCH / MOVE / CLOSE) --
+    # These layer Postgres DECLARE CURSOR semantics on the shared per-connection
+    # cursor store (``Server.open_cursor`` / ``get_cursor`` / ``close_cursor``),
+    # which holds the frozen full-result ``pa.Table``. The PG layer adds only
+    # the user-facing name and a scroll offset. FETCH/MOVE emit rows directly
+    # (bypassing ``_emit_result``) so a client can page past ``--pg-max-rows``:
+    # the cap is a per-Response limit, not a per-cursor limit.
+
+    async def _try_cursor_stmt(self, sql: str, maxrows: int = 0) -> bool:
+        """Dispatch a DECLARE/FETCH/MOVE/CLOSE statement. Returns True if the
+        statement was a cursor statement (and its own frames were sent); False
+        if it was anything else (the caller runs the normal path). The aborted-
+        txn gate has already been applied by the caller."""
+        kw = _first_keyword(sql)
+        if kw == "DECLARE":
+            await self._declare(sql)
+        elif kw == "FETCH":
+            await self._fetch(sql, maxrows, move=False)
+        elif kw == "MOVE":
+            await self._fetch(sql, maxrows, move=True)
+        elif kw == "CLOSE":
+            await self._close_stmt(sql)
+        else:
+            return False
+        return True
+
+    def _close_all_cursors(self) -> None:
+        """Drop every PG cursor on this connection (and its underlying server
+        cursor). Called on COMMIT/ROLLBACK and disconnect — all our cursors are
+        WITHOUT HOLD, so they do not survive a transaction boundary."""
+        for cid, _ in self.cursors.values():
+            self.server.close_cursor(self, cid)
+        self.cursors.clear()
+
+    async def _declare(self, sql: str) -> None:
+        # DECLARE <name> [NO SCROLL|SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR <q>
+        rest = re.sub(r"^\s*DECLARE\s+", "", sql, count=1, flags=re.IGNORECASE)
+        m = re.match(r'\s*("(?:[^"]|"")"|`[^`]+`|\w+)\s*(.*)', rest, re.S)
+        if not m:
+            raise PGError("42601", "expected a cursor name after DECLARE")
+        name = m.group(1).strip('"`')
+        body = m.group(2)
+        if re.search(r"\bWITH\s+HOLD\b", body, re.IGNORECASE):
+            # Holdable cursors would have to survive COMMIT and keep their
+            # snapshot; RyuDB closes all cursors at the txn boundary, so the
+            # HOLD option is unsupported (SQLSTATE 0A000 feature_not_supported).
+            raise PGError("0A000", "WITH HOLD cursors are not supported")
+        mc = re.search(r"\bCURSOR\b", body, re.IGNORECASE)
+        if not mc:
+            raise PGError("42601", "expected CURSOR in DECLARE")
+        after = body[mc.end():]
+        mf = re.search(r"\bFOR\b", after, re.IGNORECASE)
+        if not mf:
+            raise PGError("42601", "expected FOR <query> in DECLARE CURSOR")
+        select_sql = after[mf.end():].strip()
+        if not select_sql:
+            raise PGError("42601", "expected a query after FOR in DECLARE CURSOR")
+        if name in self.cursors:
+            raise PGError("42P03", f'cursor "{name}" already exists')
+        result = await self._exec(select_sql)
+        if not hasattr(result, "num_rows"):
+            raise PGError("42P11", "DECLARE CURSOR requires a row-returning query")
+        try:
+            cid = self.server.open_cursor(self, result, select_sql)
+        except ProtocolError as exc:
+            # open_cursor raises ProtocolError at the per-connection cursor
+            # limit -> surface as program_limit_exceeded (54000).
+            raise PGError("54000", str(exc)) from exc
+        self.cursors[name] = (cid, 0)
+        await self._send(_command_complete("DECLARE CURSOR"))
+
+    def _parse_fetch(self, sql: str) -> tuple[str, int | None, str]:
+        """Parse ``FETCH``/``MOVE`` into (direction, count, cursor_name).
+        ``count`` is None for single-row / implicit-count directions; the caller
+        applies the Execute max-rows / default of 1."""
+        rest = re.sub(r"^\s*(FETCH|MOVE)\s+", "", sql, count=1, flags=re.IGNORECASE)
+        tokens = rest.split()
+        if not tokens:
+            raise PGError("42601", "expected a cursor name")
+        name = tokens[-1]
+        dir_tokens = tokens[:-1]
+        if dir_tokens and dir_tokens[-1].upper() in ("FROM", "IN"):
+            dir_tokens = dir_tokens[:-1]
+        if not dir_tokens:
+            return ("NEXT", None, name)
+        t0 = dir_tokens[0].upper()
+        if t0 in ("NEXT", "PRIOR", "FIRST", "LAST"):
+            if len(dir_tokens) != 1:
+                raise PGError("42601", f"bad {t0} direction")
+            return (t0, None, name)
+        if t0 == "ALL":
+            if len(dir_tokens) != 1:
+                raise PGError("42601", "bad ALL direction")
+            return ("FORWARD_ALL", None, name)
+        if t0 == "ABSOLUTE":
+            if len(dir_tokens) != 2:
+                raise PGError("42601", "expected ABSOLUTE <n>")
+            return ("ABSOLUTE", _to_int(dir_tokens[1], "ABSOLUTE"), name)
+        if t0 == "RELATIVE":
+            if len(dir_tokens) != 2:
+                raise PGError("42601", "expected RELATIVE <n>")
+            return ("RELATIVE", _to_int(dir_tokens[1], "RELATIVE"), name)
+        if t0 == "FORWARD":
+            if len(dir_tokens) == 1:
+                return ("FORWARD", None, name)
+            if dir_tokens[1].upper() == "ALL":
+                return ("FORWARD_ALL", None, name)
+            return ("FORWARD", _to_int(dir_tokens[1], "FORWARD"), name)
+        if t0 == "BACKWARD":
+            if len(dir_tokens) == 1:
+                return ("BACKWARD", None, name)
+            if dir_tokens[1].upper() == "ALL":
+                return ("BACKWARD_ALL", None, name)
+            return ("BACKWARD", _to_int(dir_tokens[1], "BACKWARD"), name)
+        # bare count: FETCH <n> FROM cur  (== FORWARD n)
+        return ("FORWARD", _to_int(dir_tokens[0], "FETCH count"), name)
+
+    async def _fetch(self, sql: str, maxrows: int, move: bool) -> None:
+        direction, count, name = self._parse_fetch(sql)
+        entry = self.cursors.get(name)
+        if entry is None:
+            raise PGError("34000", f'cursor "{name}" does not exist')
+        cid, offset = entry
+        cur = self.server.get_cursor(self, cid)
+        if cur is None:
+            # Closed out from under us (e.g. a concurrent CLOSE ALL over the
+            # v3 protocol can't happen — single loop — but be defensive).
+            self.cursors.pop(name, None)
+            raise PGError("34000", f'cursor "{name}" does not exist')
+        total = cur["total"]
+        # Resolve the effective row count: an implicit-count direction (NEXT /
+        # FORWARD / PRIOR / BACKWARD) uses the Execute max-rows when the driver
+        # supplied one (psql's FETCH_COUNT path binds a portal and sets it),
+        # else 1. An explicit count always wins.
+        start, length, new_offset, reverse = _cursor_window(
+            direction, count, offset, total, maxrows)
+        fetched = max(0, length)
+        if move:
+            self.cursors[name] = (cid, new_offset)
+            await self._send(_command_complete(f"MOVE {fetched}"))
+            return
+        # pyarrow Table.slice(offset, length) takes a LENGTH, not an end index.
+        page = cur["table"].slice(start, fetched)
+        if reverse and fetched:
+            # BACKWARD directions return rows in reverse (last first), matching
+            # Postgres scrollable-cursor semantics.
+            page = page.take(pa.array(list(range(fetched - 1, -1, -1))))
+        await self._send(_row_description(page))
+        for chunk in _data_rows(page):
+            await self._send(chunk)
+        self.cursors[name] = (cid, new_offset)
+        await self._send(_command_complete(f"FETCH {fetched}"))
+
+    async def _close_stmt(self, sql: str) -> None:
+        rest = re.sub(r"^\s*CLOSE\s+", "", sql, count=1, flags=re.IGNORECASE).strip()
+        if re.fullmatch(r"ALL", rest, re.IGNORECASE):
+            self._close_all_cursors()
+            await self._send(_command_complete("CLOSE ALL"))
+            return
+        m = re.match(r'\s*("(?:[^"]|"")"|`[^`]+`|\w+)\s*$', rest, re.S)
+        if not m:
+            raise PGError("42601", "expected a cursor name or ALL after CLOSE")
+        name = m.group(1).strip('"`')
+        entry = self.cursors.pop(name, None)
+        if entry is None:
+            # Real Postgres raises invalid_cursor_name (34000) for a CLOSE of
+            # a cursor that was never declared (or was already closed).
+            raise PGError("34000", f'cursor "{name}" does not exist')
+        self.server.close_cursor(self, entry[0])
+        await self._send(_command_complete("CLOSE CURSOR"))
+
+
+def _to_int(tok: str, what: str) -> int:
+    try:
+        return int(tok)
+    except ValueError:
+        raise PGError("42601", f"expected an integer count after {what}, got {tok!r}")
+
+
+def _cursor_window(direction: str, count: int | None, offset: int, total: int,
+                   maxrows: int) -> tuple[int, int, int, bool]:
+    """Compute the (start, length, new_offset, reverse) slice of a frozen cursor
+    result for a FETCH/MOVE direction. ``offset`` is the 0-based rows-already-
+    consumed position; positions are 1-based in Postgres (current = offset+1).
+    ``length`` is the number of rows in the page (pyarrow ``slice`` takes a
+    length, not an end). ``reverse`` requests the page be emitted last-row-first
+    (BACKWARD directions, matching Postgres scrollable-cursor semantics).
+
+    ``maxrows`` is the extended-protocol Execute row cap (0 = unlimited); it
+    caps the explicit count (and an implicit NEXT/FORWARD count of 1)."""
+    def cap(n: int) -> int:
+        return n if maxrows <= 0 else min(n, maxrows)
+
+    if direction in ("NEXT", "FORWARD") and count is None:
+        n = min(cap(1), total - offset)
+        return offset, n, offset + n, False
+    if direction in ("NEXT", "FORWARD"):
+        n = min(cap(count), total - offset)
+        return offset, n, offset + n, False
+    if direction == "FORWARD_ALL":
+        end = total if maxrows <= 0 else min(total, offset + maxrows)
+        return offset, end - offset, end, False
+    if direction in ("PRIOR", "BACKWARD") and count is None:
+        n = min(cap(1), offset)
+        return offset - n, n, offset - n, True
+    if direction in ("PRIOR", "BACKWARD"):
+        n = min(cap(count), offset)
+        return offset - n, n, offset - n, True
+    if direction == "BACKWARD_ALL":
+        start = offset if maxrows <= 0 else max(0, offset - maxrows)
+        return start, offset - start, start, True
+    if direction == "FIRST":
+        length = 1 if total > 0 else 0
+        length = min(length, total)
+        if maxrows > 0:
+            length = min(length, cap(1))
+        return 0, length, length, False
+    if direction == "LAST":
+        length = 1 if total > 0 else 0
+        if maxrows > 0:
+            length = min(length, cap(1))
+        start = max(0, total - length)
+        return start, length, total, False
+    if direction == "ABSOLUTE":
+        n = count
+        if n == 0:
+            pos = 0  # before the first row
+        elif n > 0:
+            pos = n
+        else:
+            pos = total + n + 1
+        if pos < 1 or pos > total:
+            new_off = max(0, min(total, pos))
+            return offset, 0, new_off, False
+        return pos - 1, 1, pos, False
+    if direction == "RELATIVE":
+        pos = offset + 1 + count  # 1-based current + count
+        if pos < 1 or pos > total:
+            new_off = max(0, min(total, pos - 1))
+            return offset, 0, new_off, False
+        return pos - 1, 1, pos, False
+    raise PGError("42601", f"unsupported cursor direction {direction!r}")
 
 
 def _split_statements(sql: str) -> list[str]:
@@ -766,6 +1059,11 @@ class PGServer:
             # disconnect path (PR #61).
             self._by_key.pop((conn.pid, conn.secret), None)
             self.server._conns.pop(id(conn), None)
+            # Close every PG cursor on this connection so the frozen
+            # result Tables are freed promptly (the cursor store lives on
+            # the conn object and would be GC'd, but explicit drop matches
+            # the WS front's disconnect cleanup and bounds host RAM).
+            conn._close_all_cursors()
             try:
                 writer.close()
                 await writer.wait_closed()
