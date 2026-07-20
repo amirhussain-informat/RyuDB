@@ -42,6 +42,12 @@ does the GPU work; this is its client.
   marks the active sort; NULLs sort last); toggle the **Filter** button for a
   per-column case-insensitive substring filter row. The grid and Copy reflect
   the sorted/filtered view; Download still pulls the full server result.
+  **Result history** — each successful SELECT run is kept as a tab in a strip
+  above the results (newest first, capped at 10); click a past tab to view that
+  result again, `×` to drop one, **Clear** to drop all. Download re-runs the
+  statement that produced the viewed tab (not the editor's current text). A past
+  tab shows its first page (its server cursor is freed on the next run); use
+  Download for the full set.
 - **Chart** — a **Chart** output tab (shown when a result is present) renders
   the loaded result rows as **bar / line / scatter** over hand-rolled SVG (no
   charting library — keeps the offline/no-CDN ethos). Pick the X and Y columns;

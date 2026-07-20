@@ -119,6 +119,33 @@ button.primary:hover:not(:disabled) { background: #6dd1ff; }
 .output-tabs button.active { color: var(--fg); border-bottom-color: var(--accent); }
 .output-body { flex: 1; overflow: auto; padding: 8px; }
 
+/* multi-result tabs: one strip per worksheet holding the current result + a
+ * capped history of past SELECT results (switch back without re-running). */
+.result-tabs {
+  display: flex; align-items: stretch; gap: 2px; padding: 3px 8px;
+  background: var(--bg-2); border-bottom: 1px solid var(--border);
+  overflow-x: auto; flex: none;
+}
+.rtab {
+  display: flex; align-items: center; gap: 6px; padding: 2px 8px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: 3px;
+  color: var(--fg-dim); font-size: 11px; white-space: nowrap; cursor: pointer;
+}
+.rtab:hover { color: var(--fg); border-color: var(--accent); }
+.rtab.active { color: var(--accent); border-color: var(--accent); cursor: default; }
+.rtab-label { overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
+.rtab-time { color: var(--fg-dim); }
+.rtab-close {
+  color: var(--fg-dim); cursor: pointer; padding: 0 2px; font-size: 13px;
+  line-height: 1; border-radius: 2px;
+}
+.rtab-close:hover { color: var(--err); background: var(--bg); }
+.rtab-clear {
+  margin-left: auto; background: none; border: none; color: var(--fg-dim);
+  cursor: pointer; padding: 2px 6px; font-size: 11px; flex: none;
+}
+.rtab-clear:hover { color: var(--err); }
+
 /* catalog / history */
 .sidebar-head {
   display: flex; justify-content: space-between; align-items: center;
