@@ -8,6 +8,10 @@ dist/
 .pytest_cache/
 .ruff_cache/
 
+# scratch commit/PR body files (created in the repo root, never tracked)
+.commit_msg_*.txt
+.pr_body_*.txt
+
 # nvcc+pybind11 build artifacts (built on demand: python -m ryudb.kernels.build)
 ryudb/kernels/fused.so
 ryudb/kernels/pqpages.o

@@ -607,10 +607,27 @@ def _run_admin(server, action: str, args: dict[str, Any]) -> dict[str, Any]:
             return {"registered": cat.register(_arg(args, "table", str),
                                                _arg(args, "path", str)).name}
         if action == "drop":
-            cat.drop_table(_arg(args, "table", str))
+            table = _arg(args, "table", str)
+            cat.drop_table(table)
+            # The engine caches a base-only scan frame + per-column factorize
+            # codes / PK facts keyed by table name; the catalog drop above does
+            # not touch them, so without this a SELECT on the dropped name would
+            # still hit `_scan_cache` and return the stale frame. Drop every
+            # cache entry for this table so it becomes unqueryable (the next
+            # scan would re-read the catalog first and fail). Same primitives
+            # checkpoint uses, under the same write lock.
+            eng._drop_scan_cache_for(table)
+            eng._invalidate_table_caches(table)
             return {"dropped": True}
         if action == "rename":
-            cat.rename_table(_arg(args, "old", str), _arg(args, "new", str))
+            old = _arg(args, "old", str)
+            cat.rename_table(old, _arg(args, "new", str))
+            # The old name's cached scan frame / code+pk indices linger after a
+            # catalog rename; drop them so a SELECT on the old name fails (it
+            # re-reads the catalog) instead of serving stale rows. The new name
+            # has no cache yet and re-scans fresh.
+            eng._drop_scan_cache_for(old)
+            eng._invalidate_table_caches(old)
             return {"renamed": True}
         if action == "alter":
             return _run_alter(cat, args)
