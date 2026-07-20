@@ -8,14 +8,23 @@ interface Props {
   onCreate: () => void;
   onClose: (id: string) => void;
   onRename: (id: string, name: string) => void;
+  /** Export the active worksheet as a .sql file (Git-friendly). */
+  onExportActive: () => void;
+  /** Export all worksheets as one .sql bundle. */
+  onExportAll: () => void;
+  /** Open the .sql file picker to import worksheets. */
+  onImport: () => void;
 }
 
 /** Tab bar for the worksheet list. Click to switch; double-click a name to
  * rename (Enter/blur commits, Escape cancels); × closes; + creates a new
- * worksheet after the active one. */
+ * worksheet after the active one. The trailing ⮚ group exports/imports
+ * worksheets as plain .sql (single or bundle) for Git-backed versioning. */
 export default function WorksheetTabs({
   worksheets, activeId, onSelect, onCreate, onClose, onRename,
+  onExportActive, onExportAll, onImport,
 }: Props) {
+  const [menuOpen, setMenuOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
 
@@ -72,6 +81,28 @@ export default function WorksheetTabs({
       <button className="ws-tab-add" title="New worksheet" onClick={onCreate}>
         +
       </button>
+      <div className="ws-actions">
+        <button
+          className="ws-actions-btn"
+          title="Export / import worksheets (.sql)"
+          onClick={(e) => { e.stopPropagation(); setMenuOpen((o) => !o); }}
+        >
+          ⮚
+        </button>
+        {menuOpen && (
+          <div className="ws-actions-menu" onClick={(e) => e.stopPropagation()}>
+            <button onClick={() => { setMenuOpen(false); onExportActive(); }}>
+              Export active as .sql
+            </button>
+            <button onClick={() => { setMenuOpen(false); onExportAll(); }}>
+              Export all as .sql bundle
+            </button>
+            <button onClick={() => { setMenuOpen(false); onImport(); }}>
+              Import from .sql…
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

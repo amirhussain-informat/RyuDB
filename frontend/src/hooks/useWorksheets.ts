@@ -97,5 +97,20 @@ export function useWorksheets() {
     }
   };
 
-  return { worksheets, activeId, active, setActive: setActiveId, create, rename, close, updateSql };
+  /** Import worksheet docs (from .sql files) as new worksheets appended after
+   *  the active one, each with a fresh id. Empty-doc lists are a no-op. Returns
+   *  the id of the first imported worksheet (or null). The caller has already
+   *  deduped names if it cares; names are taken verbatim from the docs. */
+  const importWorksheets = (docs: { name: string; sql: string }[]): string | null => {
+    if (docs.length === 0) return null;
+    const made: Worksheet[] = docs.map((d) => ({ id: uid(), name: d.name || "Imported", sql: d.sql, updatedAt: 0 }));
+    const idx = worksheets.findIndex((w) => w.id === activeId);
+    setWorksheets(
+      idx >= 0 ? [...worksheets.slice(0, idx + 1), ...made, ...worksheets.slice(idx + 1)] : [...worksheets, ...made],
+    );
+    setActiveId(made[0].id);
+    return made[0].id;
+  };
+
+  return { worksheets, activeId, active, setActive: setActiveId, create, rename, close, updateSql, importWorksheets };
 }

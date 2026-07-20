@@ -27,7 +27,15 @@ does the GPU work; this is its client.
   double-click a name to rename, `×` to close, `+` to create a new one.
   Worksheets (names + SQL + the active tab) persist to `localStorage`, so they
   survive a reload; each tab keeps its own last results/plan/message during a
-  session.
+  session. The **⮚** menu at the end of the tab strip (also command-palette
+  entries) exports/imports worksheets as plain `.sql` for **Git-backed
+  versioning**: export the active worksheet as a single `.sql` file, export all
+  as one `.sql` bundle (`-- @@worksheet: <name>` separators), or import one or
+  many `.sql` files (a bundle splits into sections; a plain file becomes one
+  worksheet named from its stem). The format is dependency-free and
+  git-diffable; round-trip preserves names + SQL (a line starting with
+  `-- @@worksheet:` is always a section separator — see
+  `test/worksheetTransfer_check.mjs`).
 - **Results** — the server's Arrow IPC binary frame is decoded with
   `apache-arrow` and rendered as a virtualized grid (`react-window`). The true
   `row_count` is shown. Each run opens a server-side **cursor** (`sql` with
@@ -151,6 +159,7 @@ npm run smoke      # node test/smoke.mjs — Arrow IPC round-trip vs a running s
 node test/csv_check.mjs   # src/lib/csv.ts serializer (null-aware CSV) — no server needed
 node test/autocomplete_check.mjs  # src/lib/autocomplete.ts suggestion logic — no server needed
 node test/planLayout_check.mjs  # src/lib/planLayout.ts graph geometry — no server needed
+node test/worksheetTransfer_check.mjs  # src/lib/worksheetTransfer.ts .sql bundle round-trip — no server needed
 ```
 
 `npm run smoke` needs a running `ryudb-server` with a registered `lineitem`; set
