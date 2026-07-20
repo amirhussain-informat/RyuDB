@@ -40,8 +40,10 @@ does the GPU work; this is its client.
   **Sort + filter** run in-browser on the loaded page (no server round-trip):
   click a column header to cycle ascending → descending → clear (a `▲`/`▼`
   marks the active sort; NULLs sort last); toggle the **Filter** button for a
-  per-column case-insensitive substring filter row. The grid and Copy reflect
-  the sorted/filtered view; Download still pulls the full server result.
+  per-column case-insensitive substring filter row. **Resize** a column by
+  dragging the right edge of its header (floor 40px); widths reset with each
+  new result. The grid and Copy reflect the sorted/filtered view; Download
+  still pulls the full server result.
   **Result history** — each successful SELECT run is kept as a tab in a strip
   above the results (newest first, capped at 10); click a past tab to view that
   result again, `×` to drop one, **Clear** to drop all. Download re-runs the

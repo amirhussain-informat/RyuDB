@@ -193,6 +193,12 @@ button.dl { padding: 2px 8px; font-size: 11px; }
 .grid-head { background: var(--bg-3); color: var(--fg); font-weight: 600; position: sticky; top: 0; cursor: pointer; user-select: none; }
 .grid-head:hover { background: var(--bg-2); }
 .grid-head.sorted { color: var(--accent); border-bottom: 2px solid var(--accent); }
+/* column resize handle: a thin grab strip on the header's right border */
+.col-resize {
+  position: absolute; top: 0; right: -3px; width: 6px; height: 100%;
+  cursor: col-resize; z-index: 1;
+}
+.col-resize:hover { background: var(--accent); }
 .col-name-h { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .col-type { color: var(--fg-dim); font-weight: 400; font-size: 10px; margin-left: 6px; }
 /* per-column substring filter row (toggled by the Filter button) */
