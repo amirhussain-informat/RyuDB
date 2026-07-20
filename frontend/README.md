@@ -158,6 +158,17 @@ does the GPU work; this is its client.
   recognizer is a local heuristic, honest about its limits (it is not a general
   NL→SQL model); it covers the common analytical asks over a known schema with
   no CDN/hosted-LLM dependency, matching the offline ethos.
+- **Compare SQL (diff)** — `Ctrl/Cmd+Shift+D` (or the command palette) opens a
+  side-by-side SQL compare. Pick a left + right source from the dropdowns —
+  every worksheet plus the active worksheet's saved version snapshots (the
+  common "what did I change?" compare) — and a line-level LCS diff (the pure
+  `lib/diff.ts`, unit-tested by `test/diff_check.mjs`) renders equal / added /
+  deleted lines with gutter line numbers on each side: added lines are blank on
+  the left and green on the right; deleted lines are red on the left and blank
+  on the right. A header summary shows `+added / −removed`. Whitespace is
+  significant (a re-indented line counts as a change) — right for SQL where
+  indentation can matter, and you see exactly what moved. Pure client-side — no
+  server op.
 
 ## Develop
 
@@ -197,6 +208,7 @@ node test/planLayout_check.mjs  # src/lib/planLayout.ts graph geometry — no se
 node test/worksheetTransfer_check.mjs  # src/lib/worksheetTransfer.ts .sql bundle round-trip — no server needed
 node test/chartRender_check.mjs  # src/lib/chartRender.ts bar/point geometry — no server needed
 node test/nlSql_check.mjs  # src/lib/nlSql.ts NL->SQL recognizer — no server needed
+node test/diff_check.mjs  # src/lib/diff.ts line-level LCS diff — no server needed
 ```
 
 `npm run smoke` needs a running `ryudb-server` with a registered `lineitem`; set

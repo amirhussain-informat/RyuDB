@@ -524,3 +524,41 @@ button.dl { padding: 2px 8px; font-size: 11px; }
   word-break: break-word;
 }
 .ask-empty { margin-top: 8px; }
+
+/* SQL compare (diff) modal */
+.diff-overlay { padding-top: 6vh; }
+.diff-modal {
+  width: min(1100px, 96vw); max-height: 88vh; background: var(--bg-2);
+  border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5); overflow: hidden; display: flex;
+  flex-direction: column;
+}
+.diff-head { padding: 8px 12px; }
+.diff-summary { display: flex; gap: 8px; font-family: monospace; font-size: 12px; }
+.diff-summary .diff-add { color: var(--ok, #4aa); }
+.diff-summary .diff-del { color: var(--err); }
+.diff-pickers {
+  display: flex; gap: 12px; padding: 6px 12px; border-bottom: 1px solid var(--border);
+  background: var(--bg-3);
+}
+.diff-pickers label { display: flex; align-items: center; gap: 6px; color: var(--fg-dim); font-size: 12px; flex: 1; }
+.diff-pickers select {
+  flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 3px; padding: 3px 6px; font-size: 12px;
+}
+.diff-body { overflow: auto; flex: 1; }
+.diff-cols { display: grid; grid-template-columns: 1fr 1fr; }
+.diff-col { font-family: monospace; font-size: 12px; white-space: pre; }
+.diff-col:first-child { border-right: 1px solid var(--border); }
+.diff-line { display: flex; }
+.diff-line .diff-gutter {
+  flex: none; width: 42px; text-align: right; padding-right: 8px;
+  color: var(--fg-dim); user-select: none; opacity: 0.6;
+}
+.diff-line .diff-text { white-space: pre-wrap; word-break: break-word; padding-right: 8px; }
+.diff-line.eq { background: transparent; }
+.diff-line.add { background: rgba(80, 200, 120, 0.16); }
+.diff-line.del { background: rgba(220, 90, 90, 0.16); }
+.diff-line.gap { background: var(--bg-3); opacity: 0.5; }
+.diff-line.add .diff-text { color: var(--ok, #4aa); }
+.diff-line.del .diff-text { color: var(--err); }

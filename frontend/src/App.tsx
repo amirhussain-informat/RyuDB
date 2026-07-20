@@ -24,6 +24,7 @@ import Dashboards from "./components/Dashboards";
 import DashboardModal from "./components/DashboardModal";
 import PinWidgetModal from "./components/PinWidgetModal";
 import AskModal from "./components/AskModal";
+import DiffModal, { type DiffSource } from "./components/DiffModal";
 import type { NlTable } from "./lib/nlSql";
 import { tableToCSV, tableToJSON, downloadBlob } from "./lib/csv";
 import { serializeBundle, serializeOne, parseImportFile, worksheetFileName } from "./lib/worksheetTransfer";
@@ -151,6 +152,7 @@ export default function App() {
   const [dashboardOpenId, setDashboardOpenId] = useState<string | null>(null);
   const [pinSpec, setPinSpec] = useState<ChartSpec | null>(null);
   const [askOpen, setAskOpen] = useState(false);
+  const [diffOpen, setDiffOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -309,6 +311,9 @@ export default function App() {
       } else if (mod && (e.key === "i" || e.key === "I")) {
         e.preventDefault();
         setAskOpen(true);
+      } else if (mod && e.shiftKey && (e.key === "d" || e.key === "D")) {
+        e.preventDefault();
+        setDiffOpen(true);
       } else if (e.key === "?" && !isTypingTarget(e.target)) {
         e.preventDefault();
         setShortcutsOpen(true);
@@ -321,6 +326,7 @@ export default function App() {
         setPinSpec(null);
         setDashboardOpenId(null);
         setAskOpen(false);
+        setDiffOpen(false);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -741,6 +747,24 @@ export default function App() {
     })),
     [schema],
   );
+
+  // SQL sources available to the compare (diff) view: every worksheet plus the
+  // active worksheet's saved version snapshots (the common "what did I change?"
+  // compare). Rebuilt when the worksheets / the active snapshot ring change.
+  const diffSources: DiffSource[] = useMemo(() => {
+    const src: DiffSource[] = worksheets.map((w) => ({
+      id: "ws:" + w.id, label: `Worksheet: ${w.name}`, sql: w.sql,
+    }));
+    if (active) {
+      const snaps = versions(active.id);
+      snaps.forEach((s, i) => src.push({
+        id: "snap:" + s.id,
+        label: `Snapshot ${snaps.length - i} · ${relTime(s.ts)} (${active.name})`,
+        sql: s.sql,
+      }));
+    }
+    return src;
+  }, [worksheets, active, versions]);
   const activeMeta = result?.meta as ResultMeta | undefined;
   const hasMore =
     !!cursorId &&
@@ -815,6 +839,10 @@ export default function App() {
     {
       id: "ask", label: "Ask (NL → SQL)", hint: "Ctrl/Cmd+I", group: "Query",
       disabled: !connected || nlTables.length === 0, run: () => setAskOpen(true),
+    },
+    {
+      id: "compare", label: "Compare SQL (diff)", hint: "Ctrl/Cmd+Shift+D", group: "Query",
+      disabled: diffSources.length < 2, run: () => setDiffOpen(true),
     },
     { id: "sidebar-history", label: "Open History sidebar", group: "View", disabled: sidebar === "history", run: () => setSidebar("history") },
     { id: "shortcuts", label: "Show keyboard shortcuts", hint: "?", group: "Help", run: () => setShortcutsOpen(true) },
@@ -1042,6 +1070,11 @@ export default function App() {
         tables={nlTables}
         onClose={() => setAskOpen(false)}
         onAccept={(sql) => active && updateSql(active.id, sql)}
+      />
+      <DiffModal
+        open={diffOpen}
+        sources={diffSources}
+        onClose={() => setDiffOpen(false)}
       />
     </div>
   );
