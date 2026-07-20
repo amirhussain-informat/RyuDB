@@ -64,6 +64,7 @@ The response `op` tells the client what to expect next:
 | `profile`   | nothing          | per-column GPU statistics (`columns` with null%/distinct/min/max/mean/stddev/histogram/top) |
 | `export`    | 1 binary frame   | a SELECT serialized as a binary file (Parquet); `format`/`row_count`/`byte_count` |
 | `history`   | nothing          | `entries` ring buffer |
+| `py`        | nothing          | a Python notebook cell ran; `stdout`/`result`/`error` (+ `duration_ms`) |
 | `cancelled` | nothing          | dropped while pending, or `CancelledByUser` at a node boundary |
 | `error`     | nothing          | something failed; `kind` + `message` (+ `position`) |
 
@@ -360,6 +361,38 @@ then a normal result, not `cancelled`).
 not persisted — a session timestamp) so the UI can order entries by time and show
 when each query ran.
 
+### `py`
+
+Run a Python notebook cell on the worker thread (so it serializes with other
+ops and the engine's read/write lock applies to any `sql()` it makes).
+
+```json
+{"id": "...", "op": "py", "code": "<python source>"}
+```
+→ `{"op": "py", "stdout": "...", "result": "...|null", "error": "...|null",
+"duration_ms": N}` (text-only — no binary frame follows).
+
+The cell runs in a fresh namespace with a `sql(s)` helper plus `pd` and `cudf`
+injected. `sql()` runs a statement through the connection's MVCC txn (exactly
+like a `sql` op) and returns a **pandas** DataFrame for SELECTs (cuDF is copied
+to host so the cell can use plain pandas/matplotlib-style APIs) or the int
+rows-affected / `null` for writes/control. A cell is `eval`ed if it is a single
+expression, else `exec`ed (chosen by `compile`); the expression's `repr()` is
+returned as `result` (a statement block leaves `result` null). Captured stdout
+is returned in `stdout`, capped at 64 KiB; `result` is capped at 4 KiB.
+
+A cell that raises is **not** an `error` frame — the formatted traceback travels
+in `error` (with `result` null) so the notebook UI can render it inline next to
+the cell. `py` ops are not recorded in the `history` ring buffer (notebook cells
+are not query-history entries; the `sql()` calls inside a cell go through the
+engine but bypass `record_history`).
+
+`py` is the execution backend for the web UI's **SQL+Python notebooks** (Phase 4):
+each Python cell is a self-contained script that calls `sql()` to read/write the
+database and `print()`s or returns a value. Cells are stateless across runs
+(every run starts a fresh namespace), so a cell that needs a variable from an
+earlier cell must re-derive it or re-run both.
+
 ## Concurrency
 
 Each request is dispatched as its own task, so one connection may have several
@@ -430,11 +463,15 @@ the head of.
 - **Cooperative in-flight cancel.** `cancel` drops pending requests and raises
   `CancelledByUser` at the next plan-node boundary of an in-flight request. A
   single long cuDF call (a big groupby, a cold parquet read) is *not*
-  interruptible mid-call — cancel fires after the current node finishes. Full
+  interruptible mid-call — cancel fires after the current node finishes. A
+  `py` cell with a long pure-Python loop is likewise not interruptible mid-call
+  (cancel fires after the cell — and any `sql()` it makes — returns). Full
   preemption would need subprocess isolation.
 - **Local single-user.** Binds to `127.0.0.1` by default; no auth. The `sample`
   op interpolates a validated identifier into SQL; `sql`/`admin` trust the
-  client (appropriate for a local console, not for exposing on a network).
+  client, and `py` runs arbitrary Python (filesystem/subprocess access) in the
+  server process (appropriate for a local console, not for exposing on a
+  network).
 - **One binary frame per result page.** A `sql`/`sample`/`fetch` result is one
   binary frame capped at `--max-rows` (or `limit`) rows; the true `row_count` is
   reported and `truncated` flags more. A `sql` request with `cursor: true` pages

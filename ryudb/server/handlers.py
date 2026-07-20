@@ -26,6 +26,9 @@ Op set (Phase 1):
   cancel   drop pending requests on this connection, or raise CancelledByUser
            at the next plan-node boundary of a request already in flight
   history  recent sql invocations (server-side ring buffer)
+  py       run a Python notebook cell on the worker; a ``sql()`` helper runs
+           statements through the connection's MVCC txn; stdout + result repr
+           (+ traceback on error) returned in a ``py`` text frame
 """
 
 from __future__ import annotations
@@ -223,6 +226,8 @@ async def handle_request(req: dict[str, Any], ws, server) -> None:
             await _op_cancel(req, ws, server)
         elif op == "history":
             await _op_history(req, ws, server)
+        elif op == "py":
+            await _op_py(req, ws, server)
         else:
             raise ProtocolError(f"unknown op {op!r}")
     except ProtocolError as exc:
@@ -648,6 +653,105 @@ def _run_admin(server, action: str, args: dict[str, Any]) -> dict[str, Any]:
                 eng.clear_code_cache()
             return {"cleared": which}
         raise ProtocolError(f"unknown admin action {action!r}")
+
+
+# --------------------------------------------------------------------------- #
+# python notebook cell op
+# --------------------------------------------------------------------------- #
+
+def _trunc(s: str, n: int) -> str:
+    """Truncate a captured string to ``n`` chars with a trailing ellipsis so a
+    runaway ``print`` loop or a giant repr can't OOM the connection."""
+    if len(s) <= n:
+        return s
+    return s[:n] + f"\n…<truncated {len(s) - n} chars>"
+
+
+def _py_sql(server, ws, s):
+    """The ``sql`` helper exposed to a notebook cell. Runs a statement through
+    the same per-connection txn context as a normal ``sql`` op and returns a
+    pandas DataFrame for SELECTs (cuDF is copied to host so the cell can use
+    plain pandas/matplotlib-style APIs) or the int rows-affected / None for
+    writes. Called on the worker thread, so ``server.run_sql`` loads the
+    connection's txn into the engine's per-thread ``_txn`` exactly like
+    ``_op_sql``."""
+    if not isinstance(s, str):
+        raise TypeError("sql() expects a SQL string")
+    res = server.run_sql(ws, s)
+    if isinstance(res, cudf.DataFrame):
+        return res.to_pandas()
+    return res  # pandas DataFrame, int rows-affected, or None
+
+
+def _run_py(server, ws, code: str) -> dict[str, Any]:
+    """Execute a Python notebook cell in a fresh namespace and return its
+    captured stdout + result repr (+ traceback on error). A single ``sql``
+    helper plus ``pd``/``cudf`` are injected. A cell is either an expression
+    (``eval``) or a statement block (``exec``); ``compile`` in ``eval`` mode
+    first and fall back to ``exec`` on ``SyntaxError`` so both shapes work.
+    Runs on the worker thread so the engine read/write lock + per-thread txn
+    used by ``sql()`` behave as in ``_op_sql``. Pure-Python loops are not
+    interruptible mid-call (same caveat as a long cuDF call)."""
+    import builtins
+    import contextlib
+    import io
+    import traceback
+
+    buf = io.StringIO()
+    ns: dict[str, Any] = {
+        "__name__": "__main__",
+        "__builtins__": builtins.__dict__,
+        "sql": lambda s: _py_sql(server, ws, s),
+        "pd": pd,
+        "cudf": cudf,
+    }
+    result_val: Any = None
+    try:
+        try:
+            code_obj = compile(code, "<notebook>", "eval")
+        except SyntaxError:
+            code_obj = compile(code, "<notebook>", "exec")
+            with contextlib.redirect_stdout(buf):
+                exec(code_obj, ns)  # noqa: S102 -- intentional notebook exec
+        else:
+            with contextlib.redirect_stdout(buf):
+                result_val = eval(code_obj, ns)  # noqa: S307 -- intentional
+    except BaseException:  # noqa: BLE001 -- capture + surface as `error`
+        return {"stdout": _trunc(buf.getvalue(), 65536),
+                "result": None,
+                "error": _trunc(traceback.format_exc(), 65536)}
+    result_repr: str | None = None
+    if result_val is not None:
+        try:
+            result_repr = _trunc(repr(result_val), 4096)
+        except BaseException as exc:  # noqa: BLE001 -- a broken __repr__
+            result_repr = f"<unreprable result: {exc!r}>"
+    return {"stdout": _trunc(buf.getvalue(), 65536),
+            "result": result_repr,
+            "error": None}
+
+
+async def _op_py(req, ws, server) -> None:
+    """Run a Python notebook cell on the worker thread and send back a ``py``
+    text frame with captured stdout + result repr + any traceback. The
+    ``sql()`` helper inside the cell goes through ``server.run_sql`` so it uses
+    the connection's MVCC txn and serializes with other ops. A cell that raises
+    is NOT an error frame — the traceback travels in ``error`` so the notebook
+    UI can show it inline next to the cell."""
+    rid = req.get("id")
+    code = _require(req, "code", str)
+
+    def run():
+        return _run_py(server, ws, code)
+
+    ok, payload, dur = await _cancellable(server, ws, rid, run)
+    if not ok:
+        return
+    await _send_json(ws, {"id": rid, "op": "py",
+                         "stdout": payload["stdout"],
+                         "result": payload["result"],
+                         "error": payload["error"],
+                         "duration_ms": round(dur, 3)})
 
 
 async def _op_upload(req, payload: bytes, ws, server) -> None:

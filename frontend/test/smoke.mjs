@@ -242,6 +242,27 @@ const selectEntries = (hist.meta.entries ?? []).filter((e) => e.kind === "select
 check("history records selects", selectEntries.length > 0, JSON.stringify(hist.meta.entries?.map((e) => e.kind)));
 check("history entries carry ts", (hist.meta.entries ?? []).every((e) => typeof e.ts === "number"), JSON.stringify(hist.meta.entries?.[0]));
 
+// 13. py op: a Python notebook cell with an injected sql() helper. An
+//     expression cell returns its repr; a statement cell captures stdout; a
+//     cell that raises surfaces the traceback in `error` (still a `py` frame,
+//     not an `error` frame); a missing `code` is a protocol error.
+const pyExpr = await call(ws, { id: "py1", op: "py", code: "1 + 2 * 3" });
+check("py expression frame", pyExpr.meta.op === "py", JSON.stringify(pyExpr.meta));
+check("py expression result", pyExpr.meta.op === "py" && pyExpr.meta.result === "7" && pyExpr.meta.error === null, JSON.stringify(pyExpr.meta));
+check("py no binary frame", pyExpr.bytes === null || pyExpr.bytes === undefined, "text-only");
+
+const pyExec = await call(ws, { id: "py2", op: "py", code: "print('hi', 2*3)\nx=10\nprint(x+5)" });
+check("py exec stdout", pyExec.meta.op === "py" && pyExec.meta.stdout === "hi 6\n15\n" && pyExec.meta.result === null, JSON.stringify(pyExec.meta));
+
+const pySql = await call(ws, { id: "py3", op: "py", code: "df = sql('SELECT l_returnflag, count(*) AS c FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag')\nprint(type(df).__name__, df.shape[0])" });
+check("py sql helper returns pandas", pySql.meta.op === "py" && pySql.meta.error === null && pySql.meta.stdout.startsWith("DataFrame ") && pySql.meta.stdout.trim().endsWith("3"), JSON.stringify(pySql.meta));
+
+const pyErr = await call(ws, { id: "py4", op: "py", code: "x=[1,2,3]\nprint(x[10])" });
+check("py error carries traceback", pyErr.meta.op === "py" && pyErr.meta.result === null && pyErr.meta.error && /IndexError/.test(pyErr.meta.error), JSON.stringify(pyErr.meta));
+
+const pyNoCode = await call(ws, { id: "py5", op: "py", code: "" });
+check("py missing code protocol error", pyNoCode.meta.op === "error" && pyNoCode.meta.kind === "protocol", JSON.stringify(pyNoCode.meta));
+
 ws.close();
 if (failures === 0) {
   console.log("SMOKE OK");
