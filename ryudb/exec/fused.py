@@ -901,7 +901,7 @@ def _run_cpp(spec, child, engine, table) -> "cudf.DataFrame | None":
         col_ptrs_np, col_dtypes_np, gkey_idx_np, gkey_stride_np,
         pred_col, pred_op, pred_lit, agg_kind_np, agg_tok_start_np, agg_tok_len_np,
         tok_kind_np, tok_col_np, tok_lit_np, tok_op_np, acc_init,
-        int(strategy), int(n_groups), int(capacity), int(n),
+        int(strategy), np.int64(n_groups), int(capacity), int(n),
     )
     if overflow != 0:
         return None  # hash table filled -> cuDF fallback
@@ -1123,6 +1123,15 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     fact_keys: list[str] = []
     dim_keys: list[str] = []
     dim_key_table: str | None = None
+    # Semi-join strip state for the Q3 shape (group_spans with the dim group keys
+    # on a MIDDLE dim, and filter-only trailing dim(s) beyond it). When the strip
+    # fires, customer (and any further filter-only trailing dims) are pre-filtered
+    # into the group-key dim's frame and dropped from the chain so the existing
+    # CASE-2-spanning path fires. `pending_strip` is set at the gate below; the
+    # actual semi-join runs after the conjunct split (dim_conjuncts is needed).
+    pending_strip = False
+    semi_join_keyset: "cudf.Series | None" = None
+    semi_join_bridge: str | None = None
     for c in gkey_cols:
         t = col_to_table.get(c)
         if t is None:
@@ -1188,7 +1197,16 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
         # (the chain only carries the LAST dim's payload, so a middle-dim group
         # key is unreachable -> defer). Pure CASE 2 (no dim keys) skips this.
         if group_spans and dim_key_table != target_dim:
-            return None  # dim group keys on a non-terminus dim -> defer
+            # The dim group keys sit on a MIDDLE dim, but the chain only carries
+            # the terminus dim's payload -> the existing path can't form the
+            # group tail. Q3's shape: the dims beyond the group-key dim are
+            # FILTER-ONLY trailing dims (e.g. customer joined only for a WHERE),
+            # so they can be semi-joined into the group-key dim's frame and
+            # stripped, making the group-key dim the terminus. Set the intent
+            # here; the strip runs after the conjunct split (it needs the
+            # trailing dims' foldable predicates). If the tail turns out not to
+            # be filter-only, the strip defers.
+            pending_strip = True
     elif target_dim not in parent:
         return None  # group-key dim not reachable from fact -> defer
 
@@ -1316,6 +1334,76 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
     if dim_conjuncts and (has_left or full_outer):
         return None
 
+    # --- semi-join strip of filter-only trailing dims (the Q3 shape) ----------
+    # pending_strip is set at the gate when the dim group keys sit on a MIDDLE
+    # dim (not the chain terminus). If every dim beyond the group-key dim toward
+    # the terminus is a FILTER-ONLY trailing dim -- inner, contributes no group
+    # key and no agg measure, carries only a foldable single-table predicate --
+    # strip it: pre-filter the group-key dim's frame by the trailing dim's
+    # filtered key set (a cuDF isin semi-join, farthest dim inward) and drop it
+    # from the chain. The group-key dim becomes the terminus, so the existing
+    # CASE-2-spanning path (fact key + dim keys on the terminus) fires with no
+    # kernel change. A tail that isn't strictly filter-only defers -- the chain
+    # only carries the terminus payload, so a middle dim needed for its payload or
+    # group key is genuinely unreachable on this path.
+    if pending_strip:
+        if dim_key_table is None or has_left or full_outer:
+            return None
+        idx = next((j for j, d in enumerate(path_dims) if d[0] == dim_key_table), None)
+        if idx is None or idx >= len(path_dims) - 1:
+            return None  # group-key dim already the terminus -> nothing to strip
+        tail = path_dims[idx + 1:]
+        gkey_tabs = {col_to_table[c] for c in gkey_cols}
+        measure_tabs = {col_to_table[c]
+                        for af, _ in aggs
+                        if not (af.func == "COUNT" and isinstance(af.arg, Star))
+                        for c in af.arg.columns()}
+        for k, (t, _t_key, _probe) in enumerate(tail):
+            if path_left[idx + 1 + k] != 0:
+                return None  # outer tail stage -> can't strip (would drop null-pads)
+            if t in gkey_tabs:
+                return None  # trailing dim carries a group key -> genuinely needed
+            if t in measure_tabs:
+                return None  # trailing dim carries an agg measure -> genuinely needed
+            if t not in dim_conjuncts or not dim_conjuncts[t]:
+                return None  # no filter -> can't assume FK totality -> defer
+        # Build the trailing dims' filtered key sets, farthest inward, chaining
+        # isin so each dim is restricted to keys present in the dim beyond it.
+        # The closest result (tail[0]'s key set) semi-joins the group-key dim.
+        strip_scan = {s.table: s for s in scans}
+        key_set = None
+        for k in range(len(tail) - 1, -1, -1):
+            t, t_key, _probe = tail[k]
+            t_frame = engine._exec(strip_scan[t])
+            mask = eval_expr(_and_all(dim_conjuncts[t]), t_frame)
+            if isinstance(mask, cudf.Series):
+                t_filt = t_frame[mask]
+            else:
+                t_filt = t_frame if mask else t_frame.iloc[0:0]
+            t_filt = t_filt.reset_index(drop=True)
+            if key_set is not None:
+                farther_bridge = tail[k + 1][2]  # col on THIS dim joining to tail[k+1]
+                if farther_bridge not in t_filt.columns:
+                    return None
+                t_filt = t_filt[t_filt[farther_bridge].isin(key_set)].reset_index(drop=True)
+            if len(t_filt) == 0:
+                return _empty_result({"group_keys": group_keys, "aggs": aggs})
+            key_set = t_filt[t_key]
+        semi_join_bridge = tail[0][2]    # col on the group-key dim side joining to tail[0]
+        semi_join_keyset = key_set
+        # Truncate the chain to end at the group-key dim; drop the stripped dims
+        # from scans/scan_tables/dim_conjuncts so downstream sees a spanning plan
+        # with the group-key dim as the terminus. (dim_tables/scan_tables set
+        # above are not used past the conjunct split, so no recompute is needed.)
+        tail_tables = {t for t, _, _ in tail}
+        path_dims = path_dims[:idx + 1]
+        path_left = path_left[:idx + 1]
+        scans = [s for s in scans if s.table not in tail_tables]
+        scan_tables = [s.table for s in scans]
+        for t, _, _ in tail:
+            dim_conjuncts.pop(t, None)
+        target_dim = dim_key_table
+
     # Payloads: dim j bridges to dim j+1 via payload = next step's probe key (a
     # col of dim j). The last dim's payload = the group-key col (factorised to a
     # dense code on the host). A pure-star leg (next probe is a fact col, not a
@@ -1362,6 +1450,19 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
             else:
                 dframe = dim_frames[j] if mask else dim_frames[j].iloc[0:0]
             dim_frames[j] = dframe.reset_index(drop=True)
+            if len(dim_frames[j]) == 0:
+                return _empty_result({"group_keys": group_keys, "aggs": aggs})
+        # Semi-join from a stripped filter-only trailing dim (Q3): restrict the
+        # group-key dim's frame to keys present in the trailing dim's filtered
+        # set. Applied after the dim's own conjuncts (both AND); order-irrelevant.
+        # inner-only (outer tail stages defer above), so a miss drops the fact row
+        # exactly as the stripped inner join would have.
+        if dt == dim_key_table and semi_join_keyset is not None:
+            if semi_join_bridge not in dim_frames[j].columns:
+                return None  # projection pushdown dropped the bridge col -> defer
+            dim_frames[j] = dim_frames[j][
+                dim_frames[j][semi_join_bridge].isin(semi_join_keyset)
+            ].reset_index(drop=True)
             if len(dim_frames[j]) == 0:
                 return _empty_result({"group_keys": group_keys, "aggs": aggs})
     n = len(fact_frame)
@@ -1786,7 +1887,7 @@ def fused_join_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
             np.array(agg_tok_len, dtype=np.int32),
             np.array(tok_kind, dtype=np.int32), np.array(tok_col, dtype=np.int32),
             np.array(tok_lit, dtype=np.float64), np.array(tok_op, dtype=np.int32),
-            acc_init, int(strategy), int(capacity), int(n_groups), int(n),
+            acc_init, int(strategy), int(capacity), np.int64(n_groups), int(n),
             int(group_key_col), int(group_stride),
         )
     except Exception:  # noqa: BLE001 -- never let a C++ fault break correctness
@@ -2306,7 +2407,7 @@ def fused_scan_aggregate(node: Aggregate, engine) -> "cudf.DataFrame | None":
             acc_init,
             np.array(frame_ptrs, dtype=np.int64),
             np.array(frame_out_kind, dtype=np.int32),
-            int(strategy), int(n_groups), int(capacity),
+            int(strategy), np.int64(n_groups), int(capacity),
         )
     except _Defer as _e:
         import os as _os
