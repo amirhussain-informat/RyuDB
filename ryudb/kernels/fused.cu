@@ -184,10 +184,10 @@ static __device__ inline double atomic_max_d(double *addr, double val) {
     return __longlong_as_double(old);
 }
 
-__global__ void dense_kernel(Plan p, double *acc, int *seen, int n_groups, int nagg) {
+__global__ void dense_kernel(Plan p, double *acc, int *seen, long long n_groups, int nagg) {
     extern __shared__ double sh[];
     int t = threadIdx.x;
-    int nga = n_groups * nagg;
+    long long nga = (long long)n_groups * nagg;
     // Per-slot init by agg kind (slot a = k % nagg).
     for (int k = t; k < nga; k += blockDim.x) sh[k] = init_for_kind(p.agg_kind[k % nagg]);
     __syncthreads();
@@ -360,11 +360,11 @@ __global__ void build_ht_kernel(const long long *key, const long long *payload, 
 __global__ void probe_agg_kernel(Plan p, const long long **ht_key, const long long **ht_payload,
                                  const int *ht_cap, int n_joins, int first_probe_col,
                                  const int *left_per_stage,
-                                 double *acc, int *seen, int n_groups, int nagg,
+                                 double *acc, int *seen, long long n_groups, int nagg,
                                  int group_key_col, long long group_stride) {
     extern __shared__ double sh[];
     int t = threadIdx.x;
-    int nga = n_groups * nagg;
+    long long nga = (long long)n_groups * nagg;
     for (int k = t; k < nga; k += blockDim.x) sh[k] = init_for_kind(p.agg_kind[k % nagg]);
     __syncthreads();
     for (int i = blockIdx.x * blockDim.x + t; i < p.n; i += gridDim.x * blockDim.x) {
@@ -604,7 +604,7 @@ static T *np_dev(py::array_t<T> arr) {
 //   acc_init : float64 (n_groups*nagg for DENSE; empty for HASH) per-slot init
 //              (+inf for MIN, -inf for MAX, 0 otherwise). Empty -> memset 0.
 //   strategy  : int (0=DENSE,1=HASH)
-//   n_groups  : int (DENSE)   capacity : int (HASH, power of two)
+//   n_groups  : long long (DENSE)   capacity : int (HASH, power of two)
 //
 // Returns a tuple (overflow:int, n_out:int, keys:py::list[int64 arrays],
 //                  aggs:py::list[float64 arrays]).
@@ -622,7 +622,7 @@ py::tuple fused_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes
                     py::array_t<int> tok_kind, py::array_t<int> tok_col,
                     py::array_t<double> tok_lit, py::array_t<int> tok_op,
                     py::array_t<double> acc_init,
-                    int strategy, int n_groups, int capacity, int n_rows) {
+                    int strategy, long long n_groups, int capacity, int n_rows) {
     int ncol = (int)col_ptrs.shape(0);
     int nagg = (int)agg_kind.shape(0);
     int ngkey = (int)gkey_idx.shape(0);
@@ -668,11 +668,11 @@ py::tuple fused_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes
     int n_out = 0;
 
     if (strategy == STRAT_DENSE) {
-        int nga = n_groups * nagg;
+        long long nga = (long long)n_groups * nagg;
         double *acc = nullptr;
         int *seen = nullptr;
         check(cudaMalloc(&acc, sizeof(double) * nga), "malloc acc dense");
-        check(cudaMalloc(&seen, sizeof(int) * n_groups), "malloc seen");
+        check(cudaMalloc(&seen, sizeof(int) * (size_t)n_groups), "malloc seen");
         // Initialise accumulators per agg kind (+inf/-inf for MIN/MAX, 0 else).
         // acc_init is n_groups*nagg; if empty (shouldn't happen for DENSE) fall
         // back to a zero memset.
@@ -683,19 +683,19 @@ py::tuple fused_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes
         } else {
             check(cudaMemset(acc, 0, sizeof(double) * nga), "memset acc");
         }
-        check(cudaMemset(seen, 0, sizeof(int) * n_groups), "memset seen");
+        check(cudaMemset(seen, 0, sizeof(int) * (size_t)n_groups), "memset seen");
         size_t shbytes = sizeof(double) * nga;
         dense_kernel<<<blocks, THREADS, shbytes>>>(p, acc, seen, n_groups, nagg);
         check(cudaGetLastError(), "dense_kernel launch");
         check(cudaDeviceSynchronize(), "dense sync");
 
         std::vector<double> h_acc(nga);
-        std::vector<int> h_seen(n_groups);
+        std::vector<int> h_seen((size_t)n_groups);
         check(cudaMemcpy(h_acc.data(), acc, sizeof(double) * nga, cudaMemcpyDeviceToHost), "cp acc");
-        check(cudaMemcpy(h_seen.data(), seen, sizeof(int) * n_groups, cudaMemcpyDeviceToHost), "cp seen");
+        check(cudaMemcpy(h_seen.data(), seen, sizeof(int) * (size_t)n_groups, cudaMemcpyDeviceToHost), "cp seen");
 
         // Count occupied groups.
-        for (int g = 0; g < n_groups; g++)
+        for (long long g = 0; g < n_groups; g++)
             if (h_seen[g]) n_out++;
 
         // Decode group index -> per-key codes (row-major: stride-major order).
@@ -708,7 +708,7 @@ py::tuple fused_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes
             for (int j = 0; j < ngkey; j++) stride[j] = sp[j];
         }
         int row = 0;
-        for (int g = 0; g < n_groups; g++) {
+        for (long long g = 0; g < n_groups; g++) {
             if (!h_seen[g]) continue;
             long long rem = g;
             for (int j = 0; j < ngkey; j++) {
@@ -831,7 +831,7 @@ py::tuple fused_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_dtypes
 //   agg_kind,agg_tok_start,agg_tok_len : int32 (nagg)
 //   tok_kind:int32 (ntok) tok_col:int32 tok_lit:float64 tok_op:int32
 //   acc_init : float64 (n_groups*nagg) per-slot init
-//   n_groups : int (DENSE group count; n_dim_rows + 1 when any LEFT stage
+//   n_groups : long long (DENSE group count; n_dim_rows + 1 when any LEFT stage
 //              reserves slot 0 for the NULL group)   n_rows : int (fact row count)
 //   left_per_stage : int32 (n_joins) -- 1 where stage j preserves the fact side
 //              (LEFT/RIGHT outer with the dim as null-supplying side), 0 for inner
@@ -856,7 +856,7 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
                          py::array_t<int> tok_kind, py::array_t<int> tok_col,
                          py::array_t<double> tok_lit, py::array_t<int> tok_op,
                          py::array_t<double> acc_init,
-                         int strategy, int capacity, int n_groups, int n_rows,
+                         int strategy, int capacity, long long n_groups, int n_rows,
                          int group_key_col, long long group_stride) {
     int ncol = (int)col_ptrs.shape(0);
     int nagg = (int)agg_kind.shape(0);
@@ -955,11 +955,11 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
 
     if (strategy == STRAT_DENSE) {
         // --- DENSE accumulator (single int64 group key = code 0..n_groups-1) ---
-        int nga = n_groups * nagg;
+        long long nga = (long long)n_groups * nagg;
         double *acc = nullptr;
         int *seen = nullptr;
         check(cudaMalloc(&acc, sizeof(double) * nga), "malloc join acc");
-        check(cudaMalloc(&seen, sizeof(int) * n_groups), "malloc join seen");
+        check(cudaMalloc(&seen, sizeof(int) * (size_t)n_groups), "malloc join seen");
         auto init_info = acc_init.request();
         if (init_info.ndim > 0 && init_info.shape[0] > 0) {
             check(cudaMemcpy(acc, init_info.ptr, sizeof(double) * nga, cudaMemcpyHostToDevice),
@@ -967,7 +967,7 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
         } else {
             check(cudaMemset(acc, 0, sizeof(double) * nga), "memset join acc");
         }
-        check(cudaMemset(seen, 0, sizeof(int) * n_groups), "memset join seen");
+        check(cudaMemset(seen, 0, sizeof(int) * (size_t)n_groups), "memset join seen");
 
         size_t shbytes = sizeof(double) * nga;
         probe_agg_kernel<<<blocks, THREADS, shbytes>>>(
@@ -979,15 +979,15 @@ py::tuple fused_join_agg(py::array_t<long long> col_ptrs, py::array_t<int> col_d
 
         // --- read-out (single group key: code == group index g) ---
         std::vector<double> h_acc(nga);
-        std::vector<int> h_seen(n_groups);
+        std::vector<int> h_seen((size_t)n_groups);
         check(cudaMemcpy(h_acc.data(), acc, sizeof(double) * nga, cudaMemcpyDeviceToHost), "cp join acc");
-        check(cudaMemcpy(h_seen.data(), seen, sizeof(int) * n_groups, cudaMemcpyDeviceToHost), "cp join seen");
-        for (int g = 0; g < n_groups; g++)
+        check(cudaMemcpy(h_seen.data(), seen, sizeof(int) * (size_t)n_groups, cudaMemcpyDeviceToHost), "cp join seen");
+        for (long long g = 0; g < n_groups; g++)
             if (h_seen[g]) n_out++;
         std::vector<long long> h_keys(n_out);
         std::vector<std::vector<double>> h_aggs(nagg, std::vector<double>(n_out));
         int row = 0;
-        for (int g = 0; g < n_groups; g++) {
+        for (long long g = 0; g < n_groups; g++) {
             if (!h_seen[g]) continue;
             h_keys[row] = g;  // code == group index
             for (int a = 0; a < nagg; a++) h_aggs[a][row] = h_acc[g * nagg + a];
@@ -1216,10 +1216,10 @@ __device__ inline double page_eval_agg(const Plan &p, const PageSrc &s, int i, i
 // DENSE over pages. v1: ngkey == 0 (global, g == 0). Reuses the shared
 // accumulator + cross-block reduce from dense_kernel; only the column source
 // differs (PageSrc vs pre-materialised arrays).
-__global__ void page_dense_kernel(Plan p, PageSrc s, double *acc, int *seen, int n_groups, int nagg) {
+__global__ void page_dense_kernel(Plan p, PageSrc s, double *acc, int *seen, long long n_groups, int nagg) {
     extern __shared__ double sh[];
     int t = threadIdx.x;
-    int nga = n_groups * nagg;
+    long long nga = (long long)n_groups * nagg;
     for (int k = t; k < nga; k += blockDim.x) sh[k] = init_for_kind(p.agg_kind[k % nagg]);
     __syncthreads();
     for (int i = blockIdx.x * blockDim.x + t; i < p.n; i += gridDim.x * blockDim.x) {
@@ -1637,7 +1637,7 @@ void fused_scan_finalize(int pending_id) {
 //   (Plan descriptors as in fused_agg, minus col_ptrs/col_dtypes which are per-RG)
 //   acc_init   : float64 (n_groups*nagg for DENSE; empty for HASH)
 //   strategy   : 0=DENSE (global, n_groups==1), 1=HASH (single plain int64 key)
-//   n_groups   : DENSE group count   capacity : HASH power-of-two capacity
+//   n_groups   : long long (DENSE group count)   capacity : HASH power-of-two capacity
 //
 // Returns (overflow:int, n_out:int, keys:py::list, aggs:py::list, pending_id:int).
 //   overflow != 0 -> caller falls back to the cuDF path (correctness never
@@ -1660,7 +1660,7 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
                          py::array_t<double> tok_lit, py::array_t<int> tok_op,
                          py::array_t<double> acc_init,
                          py::array_t<long long> frame_ptrs, py::array_t<int> out_kind,
-                         int strategy, int n_groups, int capacity) {
+                         int strategy, long long n_groups, int capacity) {
     int nagg = (int)agg_kind.shape(0);
     int ngkey = (int)gkey_idx.shape(0);
     int ntok = (int)tok_kind.shape(0);
@@ -1737,15 +1737,15 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
     double *acc = nullptr; int *seen = nullptr;
     long long *key = nullptr; int *distinct = nullptr;
     if (strategy == STRAT_DENSE) {
-        int nga = n_groups * nagg;
+        long long nga = (long long)n_groups * nagg;
         check(dev_alloc_async((void **)&acc, sizeof(double) * nga, 0), "malloc acc");
-        check(dev_alloc_async((void **)&seen, sizeof(int) * n_groups, 0), "malloc seen");
+        check(dev_alloc_async((void **)&seen, sizeof(int) * (size_t)n_groups, 0), "malloc seen");
         auto ii = acc_init.request();
         if (ii.ndim > 0 && ii.shape[0] > 0)
             check(cudaMemcpyAsync(acc, ii.ptr, sizeof(double) * nga, cudaMemcpyHostToDevice, 0), "cp acc_init");
         else
             check(cudaMemsetAsync(acc, 0, sizeof(double) * nga, 0), "memset acc");
-        check(cudaMemsetAsync(seen, 0, sizeof(int) * n_groups, 0), "memset seen");
+        check(cudaMemsetAsync(seen, 0, sizeof(int) * (size_t)n_groups, 0), "memset seen");
     } else {
         check(dev_alloc_async((void **)&key, sizeof(long long) * capacity, 0), "malloc key");
         check(dev_alloc_async((void **)&acc, sizeof(double) * (size_t)capacity * nagg, 0), "malloc acc hash");
@@ -2080,7 +2080,7 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
             p.n = n;
             int blocks = (n + THREADS - 1) / THREADS; if (blocks > 65535) blocks = 65535;
             if (strategy == STRAT_DENSE) {
-                size_t shbytes = sizeof(double) * n_groups * nagg;
+                size_t shbytes = sizeof(double) * (size_t)n_groups * nagg;
                 page_dense_kernel<<<blocks, THREADS, shbytes, stream>>>(p, s, acc, seen, n_groups, nagg);
             } else {
                 page_hash_kernel<<<blocks, THREADS, 0, stream>>>(p, s, key, acc, capacity, nagg, distinct, d_overflow);
@@ -2175,18 +2175,18 @@ py::tuple fused_scan_agg(std::string path, int ncol, int nrg,
     // --- read-out (identical to fused_agg) ---
     if (overflow == 0) {
         if (strategy == STRAT_DENSE) {
-            int nga = n_groups * nagg;
-            std::vector<double> h_acc(nga); std::vector<int> h_seen(n_groups);
+            long long nga = (long long)n_groups * nagg;
+            std::vector<double> h_acc(nga); std::vector<int> h_seen((size_t)n_groups);
             check(cudaMemcpy(h_acc.data(), acc, sizeof(double) * nga, cudaMemcpyDeviceToHost), "cp acc ro");
-            check(cudaMemcpy(h_seen.data(), seen, sizeof(int) * n_groups, cudaMemcpyDeviceToHost), "cp seen ro");
-            for (int g = 0; g < n_groups; g++) if (h_seen[g]) n_out++;
+            check(cudaMemcpy(h_seen.data(), seen, sizeof(int) * (size_t)n_groups, cudaMemcpyDeviceToHost), "cp seen ro");
+            for (long long g = 0; g < n_groups; g++) if (h_seen[g]) n_out++;
             std::vector<std::vector<long long>> h_keys(ngkey, std::vector<long long>(n_out));
             std::vector<std::vector<double>> h_aggs(nagg, std::vector<double>(n_out));
             std::vector<long long> stride(ngkey);
             { auto sinfo = gkey_stride.request(); long long *sp = static_cast<long long *>(sinfo.ptr);
               for (int j = 0; j < ngkey; j++) stride[j] = sp[j]; }
             int row = 0;
-            for (int g = 0; g < n_groups; g++) {
+            for (long long g = 0; g < n_groups; g++) {
                 if (!h_seen[g]) continue;
                 long long rem = g;
                 for (int j = 0; j < ngkey; j++) { h_keys[j][row] = rem / stride[j]; rem = rem % stride[j]; }
